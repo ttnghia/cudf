@@ -2490,7 +2490,7 @@ JNIEXPORT jlong JNICALL Java_ai_rapids_cudf_ColumnView_applyBooleanMask(
     cudf::lists_column_view const boolean_mask_list_view =
         cudf::lists_column_view(*boolean_mask_list_column);
 
-    return release_as_jlong(cudf::lists::apply_boolean_mask(list_view, boolean_mask_list_view));
+    return release_as_jlong(cudf::lists::copy_if(list_view, boolean_mask_list_view));
   }
   CATCH_STD(env, 0);
 }

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022, NVIDIA CORPORATION.
+ * Copyright (c) 2022-2023, NVIDIA CORPORATION.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -57,7 +57,7 @@ namespace cudf::lists {
  * @param mr Device memory resource used to allocate the returned table's device memory
  * @return List column of the same type as `input`, containing filtered list rows
  */
-std::unique_ptr<column> apply_boolean_mask(
+std::unique_ptr<column> copy_if(
   lists_column_view const& input,
   lists_column_view const& boolean_mask,
   rmm::mr::device_memory_resource* mr = rmm::mr::get_current_device_resource());

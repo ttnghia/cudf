@@ -147,8 +147,8 @@ ConfigureBench(COPY_IF_ELSE_BENCH copying/copy_if_else.cpp)
 ConfigureBench(TRANSPOSE_BENCH transpose/transpose.cpp)
 
 # ##################################################################################################
-# * apply_boolean_mask benchmark ------------------------------------------------------------------
-ConfigureBench(APPLY_BOOLEAN_MASK_BENCH stream_compaction/apply_boolean_mask.cpp)
+# * copy_if benchmark ------------------------------------------------------------------
+ConfigureBench(COPY_IF_BENCH stream_compaction/copy_if.cpp)
 
 # ##################################################################################################
 # * stream_compaction benchmark -------------------------------------------------------------------

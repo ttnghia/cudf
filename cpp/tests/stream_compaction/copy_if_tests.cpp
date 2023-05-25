@@ -48,7 +48,7 @@ TEST_F(ApplyBooleanMask, NonNullBooleanMask)
   cudf::test::fixed_width_column_wrapper<double> col3_expected{{10, 70, 2}, {1, 0, 1}};
   cudf::table_view expected{{col1_expected, col2_expected, col3_expected}};
 
-  auto got = cudf::apply_boolean_mask(input, boolean_mask);
+  auto got = cudf::copy_if(input, boolean_mask);
 
   CUDF_TEST_EXPECT_TABLES_EQUAL(expected, got->view());
 }
@@ -67,7 +67,7 @@ TEST_F(ApplyBooleanMask, NullBooleanMask)
   cudf::test::fixed_width_column_wrapper<double> col3_expected{{70, 2}, {0, 1}};
   cudf::table_view expected{{col1_expected, col2_expected, col3_expected}};
 
-  auto got = cudf::apply_boolean_mask(input, boolean_mask);
+  auto got = cudf::copy_if(input, boolean_mask);
 
   CUDF_TEST_EXPECT_TABLES_EQUAL(expected, got->view());
 }
@@ -85,7 +85,7 @@ TEST_F(ApplyBooleanMask, EmptyMask)
   cudf::test::fixed_width_column_wrapper<double> col3_expected{};
   cudf::table_view expected{{col1_expected, col2_expected, col3_expected}};
 
-  auto got = cudf::apply_boolean_mask(input, boolean_mask);
+  auto got = cudf::copy_if(input, boolean_mask);
 
   CUDF_TEST_EXPECT_TABLES_EQUAL(expected, got->view());
 }
@@ -100,7 +100,7 @@ TEST_F(ApplyBooleanMask, WrongMaskType)
   cudf::test::fixed_width_column_wrapper<int16_t> boolean_mask{
     {true, false, true, false, true, false}};
 
-  EXPECT_THROW(cudf::apply_boolean_mask(input, boolean_mask), cudf::logic_error);
+  EXPECT_THROW(cudf::copy_if(input, boolean_mask), cudf::logic_error);
 }
 
 TEST_F(ApplyBooleanMask, MaskAndInputSizeMismatch)
@@ -112,7 +112,7 @@ TEST_F(ApplyBooleanMask, MaskAndInputSizeMismatch)
   cudf::table_view input{{col1, col2, col3}};
   cudf::test::fixed_width_column_wrapper<bool> boolean_mask{{true, false, true, false, true}};
 
-  EXPECT_THROW(cudf::apply_boolean_mask(input, boolean_mask), cudf::logic_error);
+  EXPECT_THROW(cudf::copy_if(input, boolean_mask), cudf::logic_error);
 }
 
 TEST_F(ApplyBooleanMask, StringColumnTest)
@@ -126,7 +126,7 @@ TEST_F(ApplyBooleanMask, StringColumnTest)
                                                    {1, 1, 1, 0, 1}};
   cudf::table_view expected{{col1_expected}};
 
-  auto got = cudf::apply_boolean_mask(input, boolean_mask);
+  auto got = cudf::copy_if(input, boolean_mask);
 
   CUDF_TEST_EXPECT_TABLES_EQUAL(expected, got->view());
 }
@@ -139,9 +139,8 @@ TEST_F(ApplyBooleanMask, withoutNullString)
   cudf::test::fixed_width_column_wrapper<bool> bool_filter{{1, 1, 0, 0, 1, 0, 0}};
   cudf::column_view bool_filter_col(bool_filter);
 
-  std::unique_ptr<cudf::table> filteredTable =
-    cudf::apply_boolean_mask(cudf_table_in_view, bool_filter_col);
-  cudf::table_view tableView = filteredTable->view();
+  std::unique_ptr<cudf::table> filteredTable = cudf::copy_if(cudf_table_in_view, bool_filter_col);
+  cudf::table_view tableView                 = filteredTable->view();
 
   cudf::test::strings_column_wrapper expect_col1({"d", "e", "k"});
   cudf::table_view expect_cudf_table_view{{expect_col1}};
@@ -162,9 +161,8 @@ TEST_F(ApplyBooleanMask, FixedPointColumnTest)
   cudf::test::fixed_width_column_wrapper<bool> bool_filter{{1, 1, 0, 0, 1, 0, 0}};
   cudf::column_view bool_filter_col(bool_filter);
 
-  std::unique_ptr<cudf::table> filteredTable =
-    cudf::apply_boolean_mask(cudf_table_in_view, bool_filter_col);
-  cudf::table_view tableView = filteredTable->view();
+  std::unique_ptr<cudf::table> filteredTable = cudf::copy_if(cudf_table_in_view, bool_filter_col);
+  cudf::table_view tableView                 = filteredTable->view();
 
   auto const expect_col1 = decimal32_wrapper{{10, 40, 2}, scale_type{-1}};
   auto const expect_col2 = decimal64_wrapper{{10, 40, 2}, scale_type{-10}};
@@ -198,9 +196,8 @@ TEST_F(ApplyBooleanMask, FixedPointLargeColumnTest)
   cudf::test::fixed_width_column_wrapper<bool> bool_filter(mask_data.begin(), mask_data.end());
   cudf::column_view bool_filter_col(bool_filter);
 
-  std::unique_ptr<cudf::table> filteredTable =
-    cudf::apply_boolean_mask(cudf_table_in_view, bool_filter_col);
-  cudf::table_view tableView = filteredTable->view();
+  std::unique_ptr<cudf::table> filteredTable = cudf::copy_if(cudf_table_in_view, bool_filter_col);
+  cudf::table_view tableView                 = filteredTable->view();
 
   std::vector<int32_t> expect_dec32_data;
   std::vector<int64_t> expect_dec64_data;
@@ -249,7 +246,7 @@ TEST_F(ApplyBooleanMask, NoNullInput)
   cudf::test::fixed_width_column_wrapper<int32_t> col_expected(
     {9526, 9347, 9569, 9807, 9279, 9691});
   cudf::table_view expected({col_expected});
-  auto got = cudf::apply_boolean_mask(input, mask);
+  auto got = cudf::copy_if(input, mask);
   CUDF_TEST_EXPECT_TABLES_EQUAL(expected, got->view());
 }
 
@@ -269,7 +266,7 @@ TEST_F(ApplyBooleanMask, CorrectNullCount)
     cudf::detail::make_counting_transform_iterator(0, [](auto i) { return (i % 277) == 0; });
   cudf::test::fixed_width_column_wrapper<bool> boolean_mask(seq3, seq3 + inputRows);
 
-  auto got     = cudf::apply_boolean_mask(input, boolean_mask);
+  auto got     = cudf::copy_if(input, boolean_mask);
   auto out_col = got->get_column(0).view();
   auto expected_null_count =
     cudf::detail::null_count(out_col.null_mask(), 0, out_col.size(), cudf::get_default_stream());
@@ -288,7 +285,7 @@ TEST_F(ApplyBooleanMask, StructFiltering)
 
   auto filter_mask = fixed_width_column_wrapper<bool>{{1, 1, 1, 1, 1, 0, 0, 0, 0, 0}};
 
-  auto filtered_table = cudf::apply_boolean_mask(cudf::table_view({struct_column}), filter_mask);
+  auto filtered_table         = cudf::copy_if(cudf::table_view({struct_column}), filter_mask);
   auto filtered_struct_column = filtered_table->get_column(0);
 
   // Compare against expected results.
@@ -323,7 +320,7 @@ TEST_F(ApplyBooleanMask, ListOfStructsFiltering)
   auto filter_mask = fixed_width_column_wrapper<bool>{{1, 0, 1, 0, 1}};
 
   auto filtered_table =
-    cudf::apply_boolean_mask(cudf::table_view({list_of_structs_column->view()}), filter_mask);
+    cudf::copy_if(cudf::table_view({list_of_structs_column->view()}), filter_mask);
   auto filtered_list_column = filtered_table->get_column(0);
 
   // Compare against expected values.
@@ -357,7 +354,7 @@ TEST_F(ApplyBooleanMask, StructOfListsFiltering)
   auto structs_column = structs_column_wrapper{{lists_column}};
 
   auto filter_mask    = fixed_width_column_wrapper<bool>{{1, 0, 1, 0, 1}};
-  auto filtered_table = cudf::apply_boolean_mask(cudf::table_view({structs_column}), filter_mask);
+  auto filtered_table = cudf::copy_if(cudf::table_view({structs_column}), filter_mask);
 
   auto filtered_lists_column = filtered_table->get_column(0);
 

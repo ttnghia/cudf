@@ -2953,7 +2953,7 @@ JNIEXPORT jlongArray JNICALL Java_ai_rapids_cudf_Table_filter(JNIEnv *env, jclas
     cudf::jni::auto_set_device(env);
     auto const input = reinterpret_cast<cudf::table_view const *>(input_jtable);
     auto const mask = reinterpret_cast<cudf::column_view const *>(mask_jcol);
-    return convert_table_for_return(env, cudf::apply_boolean_mask(*input, *mask));
+    return convert_table_for_return(env, cudf::copy_if(*input, *mask));
   }
   CATCH_STD(env, 0);
 }

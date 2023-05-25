@@ -14,7 +14,8 @@
  * limitations under the License.
  */
 
-#include <cudf/detail/copy_if.cuh>
+#include <cudf/copying.hpp>
+#include <cudf/detail/nvtx/ranges.hpp>
 #include <cudf/detail/stream_compaction.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/table/table_view.hpp>
@@ -24,6 +25,8 @@
 #include <thrust/iterator/constant_iterator.h>
 #include <thrust/scatter.h>
 #include <thrust/uninitialized_fill.h>
+
+#include <rmm/exec_policy.hpp>
 
 namespace cudf {
 namespace detail {
@@ -66,8 +69,8 @@ std::unique_ptr<table> stable_distinct(table_view const& input,
     return markers;
   }();
 
-  return cudf::detail::apply_boolean_mask(
-    input, cudf::device_span<bool const>(output_markers), stream, mr);
+  return cudf::detail::copy_if(
+    input, cudf::column_view{cudf::device_span<bool const>(output_markers)}, stream, mr);
 }
 
 }  // namespace detail

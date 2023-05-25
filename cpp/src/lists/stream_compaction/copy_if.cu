@@ -36,10 +36,10 @@
 namespace cudf::lists {
 namespace detail {
 
-std::unique_ptr<column> apply_boolean_mask(lists_column_view const& input,
-                                           lists_column_view const& boolean_mask,
-                                           rmm::cuda_stream_view stream,
-                                           rmm::mr::device_memory_resource* mr)
+std::unique_ptr<column> copy_if(lists_column_view const& input,
+                                lists_column_view const& boolean_mask,
+                                rmm::cuda_stream_view stream,
+                                rmm::mr::device_memory_resource* mr)
 {
   CUDF_EXPECTS(boolean_mask.child().type().id() == type_id::BOOL8, "Mask must be of type BOOL8.");
   CUDF_EXPECTS(input.size() == boolean_mask.size(),
@@ -54,7 +54,7 @@ std::unique_ptr<column> apply_boolean_mask(lists_column_view const& input,
 
   auto const make_filtered_child = [&] {
     auto filtered =
-      cudf::detail::apply_boolean_mask(
+      cudf::detail::copy_if(
         cudf::table_view{{input.get_sliced_child(stream)}}, boolean_mask_sliced_child, stream, mr)
         ->release();
     return std::move(filtered.front());
@@ -101,12 +101,12 @@ std::unique_ptr<column> apply_boolean_mask(lists_column_view const& input,
 }
 }  // namespace detail
 
-std::unique_ptr<column> apply_boolean_mask(lists_column_view const& input,
-                                           lists_column_view const& boolean_mask,
-                                           rmm::mr::device_memory_resource* mr)
+std::unique_ptr<column> copy_if(lists_column_view const& input,
+                                lists_column_view const& boolean_mask,
+                                rmm::mr::device_memory_resource* mr)
 {
   CUDF_FUNC_RANGE();
-  return detail::apply_boolean_mask(input, boolean_mask, cudf::get_default_stream(), mr);
+  return detail::copy_if(input, boolean_mask, cudf::get_default_stream(), mr);
 }
 
 }  // namespace cudf::lists

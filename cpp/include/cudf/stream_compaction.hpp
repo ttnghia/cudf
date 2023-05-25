@@ -201,7 +201,7 @@ std::unique_ptr<table> drop_nans(
  * @return Table containing copy of all rows of @p input passing
  * the filter defined by @p boolean_mask.
  */
-std::unique_ptr<table> apply_boolean_mask(
+std::unique_ptr<table> copy_if(
   table_view const& input,
   column_view const& boolean_mask,
   rmm::mr::device_memory_resource* mr = rmm::mr::get_current_device_resource());

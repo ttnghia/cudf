@@ -28,7 +28,7 @@ namespace cudf::test {
 
 using namespace iterators;
 using cudf::lists_column_view;
-using cudf::lists::apply_boolean_mask;
+using cudf::lists::copy_if;
 
 template <typename T>
 using lists    = lists_column_wrapper<T, int32_t>;
@@ -56,7 +56,7 @@ TYPED_TEST(ApplyBooleanMaskTypedTest, StraightLine)
 
   {
     // Unsliced.
-    auto filtered = apply_boolean_mask(lists_column_view{*input}, lists_column_view{filter});
+    auto filtered = copy_if(lists_column_view{*input}, lists_column_view{filter});
     auto expected = lists<T>{{0, 2}, {4}, {6, 8}, {0}, {2, 4}, {6}};
     CUDF_TEST_EXPECT_COLUMNS_EQUAL(*filtered, expected);
   }
@@ -65,7 +65,7 @@ TYPED_TEST(ApplyBooleanMaskTypedTest, StraightLine)
     auto sliced = cudf::slice(*input, {1, input->size()}).front();
     //           == lists_t {{4, 5}, {6, 7, 8, 9}, {0, 1}, {2, 3, 4, 5}, {6, 7}};
     auto filter   = filter_t{{0, 1}, {0, 1, 0, 1}, {1, 1}, {0, 1, 0, 1}, {0, 0}};
-    auto filtered = apply_boolean_mask(lists_column_view{sliced}, lists_column_view{filter});
+    auto filtered = copy_if(lists_column_view{sliced}, lists_column_view{filter});
     auto expected = lists<T>{{5}, {7, 9}, {0, 1}, {3, 5}, {}};
     CUDF_TEST_EXPECT_COLUMNS_EQUAL(*filtered, expected);
   }
@@ -88,7 +88,7 @@ TYPED_TEST(ApplyBooleanMaskTypedTest, NullElementsInTheListRows)
 
   {
     // Unsliced.
-    auto filtered = apply_boolean_mask(lists_column_view{*input}, lists_column_view{filter});
+    auto filtered = copy_if(lists_column_view{*input}, lists_column_view{filter});
     auto expected = lists<T>{{0, 2},
                              lists<T>{{X}, null_at(0)},
                              {6, 8},
@@ -102,7 +102,7 @@ TYPED_TEST(ApplyBooleanMaskTypedTest, NullElementsInTheListRows)
     auto sliced = cudf::slice(*input, {1, input->size()}).front();
     //           == lists_t {{X, 5}, {6, 7, 8, 9}, {0, 1}, {X, 3, 4, X}, {X, X}};
     auto filter   = filter_t{{0, 1}, {0, 1, 0, 1}, {1, 1}, {0, 1, 0, 1}, {0, 0}};
-    auto filtered = apply_boolean_mask(lists_column_view{sliced}, lists_column_view{filter});
+    auto filtered = copy_if(lists_column_view{sliced}, lists_column_view{filter});
     auto expected = lists<T>{{5}, {7, 9}, {0, 1}, lists<T>{{3, X}, null_at(1)}, {}};
     CUDF_TEST_EXPECT_COLUMNS_EQUAL(*filtered, expected);
   }
@@ -118,7 +118,7 @@ TYPED_TEST(ApplyBooleanMaskTypedTest, NullListRowsInTheInputColumn)
 
   {
     // Unsliced.
-    auto filtered = apply_boolean_mask(lists_column_view{*input}, lists_column_view{filter});
+    auto filtered = copy_if(lists_column_view{*input}, lists_column_view{filter});
     auto expected = lists<T>{{{0, 2}, {}, {6, 8}, {}, {2, 4}, {6}}, nulls_at({1, 3})};
     CUDF_TEST_EXPECT_COLUMNS_EQUAL(*filtered, expected);
   }
@@ -127,7 +127,7 @@ TYPED_TEST(ApplyBooleanMaskTypedTest, NullListRowsInTheInputColumn)
     auto sliced = cudf::slice(*input, {1, input->size()}).front();
     //           == lists_t{{{}, {6, 7, 8, 9}, {}, {2, 3, 4, 5}, {6, 7}}, nulls_at({0,2})};
     auto filter   = filter_t{{}, {0, 1, 0, 1}, {}, {0, 1, 0, 1}, {0, 0}};
-    auto filtered = apply_boolean_mask(lists_column_view{sliced}, lists_column_view{filter});
+    auto filtered = copy_if(lists_column_view{sliced}, lists_column_view{filter});
     auto expected = lists<T>{{{}, {7, 9}, {}, {3, 5}, {}}, nulls_at({0, 2})};
     CUDF_TEST_EXPECT_COLUMNS_EQUAL(*filtered, expected);
   }
@@ -136,7 +136,7 @@ TYPED_TEST(ApplyBooleanMaskTypedTest, NullListRowsInTheInputColumn)
     auto sliced = cudf::slice(*input, {2, input->size()}).front();
     //           == lists_t{{{6, 7, 8, 9}, {}, {2, 3, 4, 5}, {6, 7}}, null_at(1)};
     auto filter   = filter_t{{0, 1, 0, 1}, {}, {0, 1, 0, 1}, {0, 0}};
-    auto filtered = apply_boolean_mask(lists_column_view{sliced}, lists_column_view{filter});
+    auto filtered = copy_if(lists_column_view{sliced}, lists_column_view{filter});
     auto expected = lists<T>{{{7, 9}, {}, {3, 5}, {}}, null_at(1)};
     CUDF_TEST_EXPECT_COLUMNS_EQUAL(*filtered, expected);
   }
@@ -165,7 +165,7 @@ TYPED_TEST(ApplyBooleanMaskTypedTest, StructInput)
     // The input should now look as follows: (String child dropped for brevity.)
     // Input:                     {[0, 1], [2], [3, 4, 5], [], [6, 7], [], [8, 9]}
     auto const filter   = filter_t{{1, 1}, {0}, {0, 1, 0}, {}, {1, 0}, {}, {0, 1}};
-    auto const result   = apply_boolean_mask(lists_column_view{*input}, lists_column_view{filter});
+    auto const result   = copy_if(lists_column_view{*input}, lists_column_view{filter});
     auto const expected = [] {
       auto child_num               = fwcw{0, 1, 4, 6, 9};
       auto child_str               = strings{"0", "1", "4", "6", "9"};
@@ -185,9 +185,8 @@ TYPED_TEST(ApplyBooleanMaskTypedTest, StructInput)
     auto const sliced_input = cudf::slice(*input, {1, input->size()}).front();
     // The input should now look as follows: (String child dropped for brevity.)
     // Input:                   {[2], [3, 4, 5], [], [6, 7], [], [8, 9]}
-    auto const filter = filter_t{{0}, {0, 1, 0}, {}, {1, 0}, {}, {0, 1}};
-    auto const result =
-      apply_boolean_mask(lists_column_view{sliced_input}, lists_column_view{filter});
+    auto const filter   = filter_t{{0}, {0, 1, 0}, {}, {1, 0}, {}, {0, 1}};
+    auto const result   = copy_if(lists_column_view{sliced_input}, lists_column_view{filter});
     auto const expected = [] {
       auto child_num               = fwcw{4, 6, 9};
       auto child_str               = strings{"4", "6", "9"};
@@ -208,7 +207,7 @@ TEST_F(ApplyBooleanMaskTest, Trivial)
 {
   auto const input  = lists<int32_t>{};
   auto const filter = filter_t{};
-  auto const result = apply_boolean_mask(lists_column_view{input}, lists_column_view{filter});
+  auto const result = copy_if(lists_column_view{input}, lists_column_view{filter});
   CUDF_TEST_EXPECT_COLUMNS_EQUAL(*result, lists<int32_t>{});
 }
 
@@ -218,15 +217,13 @@ TEST_F(ApplyBooleanMaskTest, Failure)
     // Invalid mask type.
     auto const input  = lists<int32_t>{{1, 2, 3}, {4, 5, 6}};
     auto const filter = lists<int32_t>{{0, 0, 0}};
-    EXPECT_THROW(apply_boolean_mask(lists_column_view{input}, lists_column_view{filter}),
-                 cudf::logic_error);
+    EXPECT_THROW(copy_if(lists_column_view{input}, lists_column_view{filter}), cudf::logic_error);
   }
   {
     // Mismatched number of rows.
     auto const input  = lists<int32_t>{{1, 2, 3}, {4, 5, 6}};
     auto const filter = filter_t{{0, 0, 0}};
-    EXPECT_THROW(apply_boolean_mask(lists_column_view{input}, lists_column_view{filter}),
-                 cudf::logic_error);
+    EXPECT_THROW(copy_if(lists_column_view{input}, lists_column_view{filter}), cudf::logic_error);
   }
 }
 }  // namespace cudf::test

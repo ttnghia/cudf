@@ -59,8 +59,8 @@ void calculate_bandwidth(benchmark::State& state, cudf::size_type num_columns)
   int64_t const column_bytes_in    = column_bytes_out;  // we only read unmasked inputs
 
   int64_t const bytes_read =
-    (column_bytes_in + validity_bytes_in) * num_columns +   // reading columns
-    mask_size;                                              // reading boolean mask
+    (column_bytes_in + validity_bytes_in) * num_columns +  // reading columns
+    mask_size;                                             // reading boolean mask
   int64_t const bytes_written =
     (column_bytes_out + validity_bytes_out) * num_columns;  // writing columns
 
@@ -71,7 +71,7 @@ void calculate_bandwidth(benchmark::State& state, cudf::size_type num_columns)
 }  // namespace
 
 template <class T>
-void BM_apply_boolean_mask(benchmark::State& state, cudf::size_type num_columns)
+void BM_copy_if(benchmark::State& state, cudf::size_type num_columns)
 {
   const cudf::size_type column_size{static_cast<cudf::size_type>(state.range(0))};
   const cudf::size_type percent_true{static_cast<cudf::size_type>(state.range(1))};
@@ -88,22 +88,22 @@ void BM_apply_boolean_mask(benchmark::State& state, cudf::size_type num_columns)
 
   for (auto _ : state) {
     cuda_event_timer raii(state, true);
-    auto result = cudf::apply_boolean_mask(*source_table, mask->view());
+    auto result = cudf::copy_if(*source_table, mask->view());
   }
 
   calculate_bandwidth<T>(state, num_columns);
 }
 
 template <class T>
-class ApplyBooleanMask : public cudf::benchmark {
+class CopyIf : public cudf::benchmark {
  public:
   using TypeParam = T;
 };
 
-#define ABM_BENCHMARK_DEFINE(name, type, n_columns)                                  \
-  BENCHMARK_TEMPLATE_DEFINE_F(ApplyBooleanMask, name, type)(::benchmark::State & st) \
-  {                                                                                  \
-    BM_apply_boolean_mask<TypeParam>(st, n_columns);                                 \
+#define ABM_BENCHMARK_DEFINE(name, type, n_columns)                        \
+  BENCHMARK_TEMPLATE_DEFINE_F(CopyIf, name, type)(::benchmark::State & st) \
+  {                                                                        \
+    BM_copy_if<TypeParam>(st, n_columns);                                  \
   }
 
 ABM_BENCHMARK_DEFINE(float_1_col, float, 1);
@@ -111,14 +111,14 @@ ABM_BENCHMARK_DEFINE(float_2_col, float, 2);
 ABM_BENCHMARK_DEFINE(float_4_col, float, 4);
 
 // shmoo 1, 2, 4 column float across percentage true
-BENCHMARK_REGISTER_F(ApplyBooleanMask, float_1_col)->Apply(percent_range);
-BENCHMARK_REGISTER_F(ApplyBooleanMask, float_2_col)->Apply(percent_range);
-BENCHMARK_REGISTER_F(ApplyBooleanMask, float_4_col)->Apply(percent_range);
+BENCHMARK_REGISTER_F(CopyIf, float_1_col)->Apply(percent_range);
+BENCHMARK_REGISTER_F(CopyIf, float_2_col)->Apply(percent_range);
+BENCHMARK_REGISTER_F(CopyIf, float_4_col)->Apply(percent_range);
 
 // shmoo 1, 2, 4 column float across column sizes with 50% true
-BENCHMARK_REGISTER_F(ApplyBooleanMask, float_1_col)->Apply(size_range);
-BENCHMARK_REGISTER_F(ApplyBooleanMask, float_2_col)->Apply(size_range);
-BENCHMARK_REGISTER_F(ApplyBooleanMask, float_4_col)->Apply(size_range);
+BENCHMARK_REGISTER_F(CopyIf, float_1_col)->Apply(size_range);
+BENCHMARK_REGISTER_F(CopyIf, float_2_col)->Apply(size_range);
+BENCHMARK_REGISTER_F(CopyIf, float_4_col)->Apply(size_range);
 
 // spot benchmark other types
 ABM_BENCHMARK_DEFINE(int8_1_col, int8_t, 1);
@@ -126,8 +126,8 @@ ABM_BENCHMARK_DEFINE(int16_1_col, int16_t, 1);
 ABM_BENCHMARK_DEFINE(int32_1_col, int32_t, 1);
 ABM_BENCHMARK_DEFINE(int64_1_col, int64_t, 1);
 ABM_BENCHMARK_DEFINE(double_1_col, double, 1);
-BENCHMARK_REGISTER_F(ApplyBooleanMask, int8_1_col)->Args({tenM, fifty_percent});
-BENCHMARK_REGISTER_F(ApplyBooleanMask, int16_1_col)->Args({tenM, fifty_percent});
-BENCHMARK_REGISTER_F(ApplyBooleanMask, int32_1_col)->Args({tenM, fifty_percent});
-BENCHMARK_REGISTER_F(ApplyBooleanMask, int64_1_col)->Args({tenM, fifty_percent});
-BENCHMARK_REGISTER_F(ApplyBooleanMask, double_1_col)->Args({tenM, fifty_percent});
+BENCHMARK_REGISTER_F(CopyIf, int8_1_col)->Args({tenM, fifty_percent});
+BENCHMARK_REGISTER_F(CopyIf, int16_1_col)->Args({tenM, fifty_percent});
+BENCHMARK_REGISTER_F(CopyIf, int32_1_col)->Args({tenM, fifty_percent});
+BENCHMARK_REGISTER_F(CopyIf, int64_1_col)->Args({tenM, fifty_percent});
+BENCHMARK_REGISTER_F(CopyIf, double_1_col)->Args({tenM, fifty_percent});

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019-2022, NVIDIA CORPORATION.
+ * Copyright (c) 2019-2023, NVIDIA CORPORATION.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -32,7 +32,7 @@
 
 namespace {
 // Returns true if the mask is true and valid (non-null) for index i
-// This is the filter functor for apply_boolean_mask
+// This is the filter functor for copy_if
 template <bool has_nulls = true>
 struct boolean_mask_filter {
   boolean_mask_filter(cudf::column_device_view const& boolean_mask) : boolean_mask{boolean_mask} {}
@@ -62,10 +62,10 @@ namespace detail {
  *
  * calls copy_if() with the `boolean_mask_filter` functor.
  */
-std::unique_ptr<table> apply_boolean_mask(table_view const& input,
-                                          column_view const& boolean_mask,
-                                          rmm::cuda_stream_view stream,
-                                          rmm::mr::device_memory_resource* mr)
+std::unique_ptr<table> copy_if(table_view const& input,
+                               column_view const& boolean_mask,
+                               rmm::cuda_stream_view stream,
+                               rmm::mr::device_memory_resource* mr)
 {
   if (boolean_mask.is_empty()) { return empty_like(input); }
 
@@ -88,11 +88,11 @@ std::unique_ptr<table> apply_boolean_mask(table_view const& input,
 /*
  * Filters a table_view using a column_view of boolean values as a mask.
  */
-std::unique_ptr<table> apply_boolean_mask(table_view const& input,
-                                          column_view const& boolean_mask,
-                                          rmm::mr::device_memory_resource* mr)
+std::unique_ptr<table> copy_if(table_view const& input,
+                               column_view const& boolean_mask,
+                               rmm::mr::device_memory_resource* mr)
 {
   CUDF_FUNC_RANGE();
-  return detail::apply_boolean_mask(input, boolean_mask, cudf::get_default_stream(), mr);
+  return detail::copy_if(input, boolean_mask, cudf::get_default_stream(), mr);
 }
 }  // namespace cudf

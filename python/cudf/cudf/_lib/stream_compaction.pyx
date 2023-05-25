@@ -10,7 +10,7 @@ from libcpp.vector cimport vector
 from cudf._lib.column cimport Column
 from cudf._lib.cpp.column.column_view cimport column_view
 from cudf._lib.cpp.stream_compaction cimport (
-    apply_boolean_mask as cpp_apply_boolean_mask,
+    copy_if as cpp_copy_if,
     distinct_count as cpp_distinct_count,
     drop_nulls as cpp_drop_nulls,
     duplicate_keep_option,
@@ -92,7 +92,7 @@ def apply_boolean_mask(list columns, Column boolean_mask):
 
     with nogil:
         c_result = move(
-            cpp_apply_boolean_mask(
+            cpp_copy_if(
                 source_table_view,
                 boolean_mask_view
             )
