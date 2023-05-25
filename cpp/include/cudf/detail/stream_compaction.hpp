@@ -56,7 +56,7 @@ std::unique_ptr<table> drop_nans(table_view const& input,
  * @param[in] stream CUDA stream used for device memory operations and kernel launches.
  */
 std::unique_ptr<table> copy_if(table_view const& input,
-                               column_view const& boolean_mask,
+                               device_span<bool const> boolean_mask,
                                rmm::cuda_stream_view stream,
                                rmm::mr::device_memory_resource* mr);
 

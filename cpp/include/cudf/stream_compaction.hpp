@@ -17,6 +17,7 @@
 #pragma once
 
 #include <cudf/types.hpp>
+#include <cudf/utilities/span.hpp>
 
 #include <rmm/mr/device/per_device_resource.hpp>
 
@@ -183,27 +184,25 @@ std::unique_ptr<table> drop_nans(
 /**
  * @brief Filters `input` using `boolean_mask` of boolean values as a mask.
  *
- * Given an input `table_view` and a mask `column_view`, an element `i` from
+ * Given an input `table_view` and a boolean mask array, an element `i` from
  * each column_view of the `input` is copied to the corresponding output column
- * if the corresponding element `i` in the mask is non-null and `true`.
+ * only if the corresponding value `i` in the mask is `true`.
+ *
  * This operation is stable: the input order is preserved.
  *
- * @note if @p input.num_rows() is zero, there is no error, and an empty table
- * is returned.
+ * @note if @p input.num_rows() is zero, an empty table is returned.
  *
  * @throws cudf::logic_error if `input.num_rows() != boolean_mask.size()`.
- * @throws cudf::logic_error if `boolean_mask` is not `type_id::BOOL8` type.
  *
  * @param[in] input The input table_view to filter
- * @param[in] boolean_mask A nullable column_view of type type_id::BOOL8 used
- * as a mask to filter the `input`.
+ * @param[in] boolean_mask An array of boolean type used as a mask to filter `input`
  * @param[in] mr Device memory resource used to allocate the returned table's device memory
- * @return Table containing copy of all rows of @p input passing
- * the filter defined by @p boolean_mask.
+ * @return Table containing copy of all rows of @p input passing the filter defined by
+ *         @p boolean_mask.
  */
 std::unique_ptr<table> copy_if(
   table_view const& input,
-  column_view const& boolean_mask,
+  device_span<bool const> boolean_mask,
   rmm::mr::device_memory_resource* mr = rmm::mr::get_current_device_resource());
 
 /**

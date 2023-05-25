@@ -69,8 +69,7 @@ std::unique_ptr<table> stable_distinct(table_view const& input,
     return markers;
   }();
 
-  return cudf::detail::copy_if(
-    input, cudf::column_view{cudf::device_span<bool const>(output_markers)}, stream, mr);
+  return cudf::detail::copy_if(input, cudf::device_span<bool const>(output_markers), stream, mr);
 }
 
 }  // namespace detail
