@@ -96,7 +96,7 @@ void copy_buffer_data(string_policy const& buff, string_policy& new_buff)
 }  // namespace
 
 template <class string_policy>
-void column_buffer_base<string_policy>::create(size_type _size,
+void column_buffer_base<string_policy>::create(std::size_t _size,
                                                rmm::cuda_stream_view stream,
                                                rmm::mr::device_memory_resource* mr)
 {
@@ -116,6 +116,10 @@ void column_buffer_base<string_policy>::create(size_type _size,
     default: _data = create_data(type, size, stream, _mr); break;
   }
   if (is_nullable) {
+    // TODO: We should have a way to store a null mask for big buffer.
+    CUDF_EXPECTS(size < static_cast<std::size_t>(std::numeric_limits<size_type>::max()),
+                 "Cannot create a null mask for a buffer with more than 2^31 rows",
+                 std::overflow_error);
     _null_mask = cudf::detail::create_null_mask(
       size, mask_state::ALL_NULL, rmm::cuda_stream_view(stream), _mr);
   }
