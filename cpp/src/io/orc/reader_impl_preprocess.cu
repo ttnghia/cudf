@@ -696,8 +696,42 @@ void generate_offsets_for_list(host_span<list_buffer_data> buff_data, rmm::cuda_
 }
 
 struct column_size_fn {
-  std::size_t operator()(type_id type, size_type num_rows) const { return num_rows; }
+  static constexpr std::size_t validity_size(std::size_t num_rows, bool nullable)
+  {
+    return nullable ? (cudf::util::div_rounding_up_safe(num_rows, std::size_t{32}) * 4) : 0;
+  }
+
+  template <typename T>
+  std::size_t operator()(std::size_t num_rows, bool nullable) const
+  {
+    auto const element_size = sizeof(device_storage_type_t<T>);
+    return (element_size * num_rows) + validity_size(num_rows, nullable);
+  }
 };
+
+template <>
+std::size_t column_size_fn::operator()<list_view>(std::size_t num_rows, bool nullable) const
+{
+  // NOTE: Adding the + 1 offset here isn't strictly correct. There will only be 1 extra offset
+  // for the entire column, whereas this is adding an extra offset per stripe. So we will get a
+  // small over-estimate of the real size of the order:  # of stripes * 4 bytes. It seems better
+  // to overestimate size somewhat than to underestimate it and potentially generate lvl_chunks
+  // that are too large.
+  return sizeof(size_type) * (num_rows + 1) + validity_size(num_rows, nullable);
+}
+
+template <>
+std::size_t column_size_fn::operator()<string_view>(std::size_t num_rows, bool nullable) const
+{
+  // Same as lists.
+  return this->operator()<list_view>(num_rows, nullable);
+}
+
+template <>
+std::size_t column_size_fn::operator()<struct_view>(std::size_t num_rows, bool nullable) const
+{
+  return validity_size(num_rows, nullable);
+}
 
 }  // namespace
 
@@ -715,19 +749,24 @@ void reader::impl::compute_stripe_sizes()
                     });
   _file_itm_data->stripe_sizes.reserve(total_num_stripes);
 
-  std::size_t size{0};
   for (auto const& stripe_source_mapping : selected_stripes) {
     for (auto const& stripe : stripe_source_mapping.stripe_info) {
+      std::size_t size{0};
       // We ignore the root level.
       for (std::size_t level = 1; level < _selected_columns.num_levels(); ++level) {
         auto const& columns_level = _selected_columns.levels[level];
-        for (auto& col : columns_level) {
+        for (auto const& col : columns_level) {
+          // TODO: store col type
           auto const col_type =
             to_cudf_type(_metadata.get_col_type(col.id).kind,
                          _use_np_dtypes,
                          _timestamp_type.id(),
                          to_cudf_decimal_type(_decimal128_columns, _metadata, col.id));
-          size += column_size_fn{}(col_type, stripe.first->numberOfRows);
+          auto const str_size = 0;
+          auto const nullable = false;
+          size += str_size +
+                  type_dispatcher(
+                    data_type{col_type}, column_size_fn{}, stripe.first->numberOfRows, nullable);
         }
       }
       _file_itm_data->stripe_sizes.push_back(size);
