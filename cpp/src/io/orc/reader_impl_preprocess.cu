@@ -754,6 +754,7 @@ void reader::impl::compute_stripe_sizes()
                     });
   _file_itm_data->stripe_sizes.reserve(total_num_stripes);
 
+#if 1
   auto parse_column_statistics = [](auto const& raw_col_stats) {
     orc::column_statistics stats_internal;
     orc::ProtobufReader(reinterpret_cast<uint8_t const*>(raw_col_stats.c_str()),
@@ -761,14 +762,17 @@ void reader::impl::compute_stripe_sizes()
       .read(stats_internal);
     return column_statistics(std::move(stats_internal));
   };
+#endif
 
   for (auto const& stripe_source_mapping : selected_stripes) {
     // TODO: Check and handle for skipped stripes due to skip_rows.
     // We may need to update stripe_source_mapping to store stripe_idx.
     // This stores all statistics for all stripes in the current file source.
+    // TODO: Throw exception if we don't have stripe stats.
     auto const& raw_stripes_stats =
       _metadata.per_file_metadata[stripe_source_mapping.source_idx].md.stripeStats;
     std::vector<std::vector<column_statistics>> stripes_stats;
+#if 1
     for (auto const& raw_stripe_stats : raw_stripes_stats) {
       stripes_stats.emplace_back();
       for (auto const& raw_stats : raw_stripe_stats.colStats) {
@@ -777,6 +781,7 @@ void reader::impl::compute_stripe_sizes()
       }
     }
     // TODO: how to map to these stats?
+#endif
 
     size_t stripe_idx{0};  // TODO: store this in stripe_source_mapping
     for (auto const& stripe : stripe_source_mapping.stripe_info) {
@@ -787,10 +792,14 @@ void reader::impl::compute_stripe_sizes()
       for (std::size_t level = 0; level < _selected_columns.num_levels(); ++level) {
         auto const& columns_level = _selected_columns.levels[level];
         for (auto const& col : columns_level) {
-          auto const col_idx = _col_meta->orc_col_map[level][col.id];
-
           // TODO: how to map state to the correct column?
-          auto const& stats = stripes_stats[stripe_idx][col_idx];
+          printf("stripes_stats %d/%d, %d/%d\n",
+                 (int)stripe_idx,
+                 (int)stripes_stats.size(),
+                 (int)col.id,
+                 (int)stripes_stats[stripe_idx].size());
+
+          auto const& stats = stripes_stats[stripe_idx][col.id];
           stripe_idx++;
 
           auto const str_size =
