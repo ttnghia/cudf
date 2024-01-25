@@ -795,6 +795,7 @@ void reader::impl::compute_stripe_sizes()
 
           auto const str_size =
             stats.string_stats.has_value() ? stats.string_stats->sum.value_or(0) : 0;
+          auto const has_nulls = stats.has_null.value_or(false);
 
           // TODO: store col type
           auto const col_type =
@@ -802,10 +803,9 @@ void reader::impl::compute_stripe_sizes()
                          _use_np_dtypes,
                          _timestamp_type.id(),
                          to_cudf_decimal_type(_decimal128_columns, _metadata, col.id));
-          size += str_size + type_dispatcher(data_type{col_type},
-                                             column_size_fn{},
-                                             stripe.first->numberOfRows,
-                                             stats.has_null.value_or(false));
+          size += str_size +
+                  type_dispatcher(
+                    data_type{col_type}, column_size_fn{}, stripe.first->numberOfRows, has_nulls);
         }
       }
       _file_itm_data->stripe_sizes.push_back(size);
