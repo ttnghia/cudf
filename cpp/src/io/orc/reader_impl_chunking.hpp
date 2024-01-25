@@ -37,6 +37,8 @@ struct file_intermediate_data {
   int64_t rows_to_skip;
   size_type rows_to_read;
   std::vector<metadata::stripe_source_mapping> selected_stripes;
+
+  std::vector<std::size_t> stripe_sizes;
 };
 
 }  // namespace cudf::io::orc::detail

@@ -78,6 +78,11 @@ class reader::impl {
                     std::vector<std::vector<size_type>> const& stripes);
 
   /**
+   * @brief compute_stripe_sizes
+   */
+  void compute_stripe_sizes();
+
+  /**
    * @brief Create the output table metadata from file metadata.
    *
    * @return Columns' metadata to output with the table read from file

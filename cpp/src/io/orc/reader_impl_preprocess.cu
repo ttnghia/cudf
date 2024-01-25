@@ -695,7 +695,45 @@ void generate_offsets_for_list(host_span<list_buffer_data> buff_data, rmm::cuda_
   }
 }
 
+struct column_size_fn {
+  std::size_t operator()(type_id type, size_type num_rows) const { return num_rows; }
+};
+
 }  // namespace
+
+void reader::impl::compute_stripe_sizes()
+{
+  auto const& selected_stripes = _file_itm_data->selected_stripes;
+
+  // TODO: remove duplicate.
+  auto const total_num_stripes =
+    std::accumulate(selected_stripes.begin(),
+                    selected_stripes.end(),
+                    std::size_t{0},
+                    [](std::size_t sum, auto const& stripe_source_mapping) {
+                      return sum + stripe_source_mapping.stripe_info.size();
+                    });
+  _file_itm_data->stripe_sizes.reserve(total_num_stripes);
+
+  std::size_t size{0};
+  for (auto const& stripe_source_mapping : selected_stripes) {
+    for (auto const& stripe : stripe_source_mapping.stripe_info) {
+      // We ignore the root level.
+      for (std::size_t level = 1; level < _selected_columns.num_levels(); ++level) {
+        auto const& columns_level = _selected_columns.levels[level];
+        for (auto& col : columns_level) {
+          auto const col_type =
+            to_cudf_type(_metadata.get_col_type(col.id).kind,
+                         _use_np_dtypes,
+                         _timestamp_type.id(),
+                         to_cudf_decimal_type(_decimal128_columns, _metadata, col.id));
+          size += column_size_fn{}(col_type, stripe.first->numberOfRows);
+        }
+      }
+      _file_itm_data->stripe_sizes.push_back(size);
+    }
+  }
+}
 
 void reader::impl::prepare_data(uint64_t skip_rows,
                                 std::optional<size_type> const& num_rows_opt,
@@ -721,6 +759,9 @@ void reader::impl::prepare_data(uint64_t skip_rows,
 
   // If no rows or stripes to read, return empty columns
   if (rows_to_read == 0 || selected_stripes.empty()) { return; }
+
+  // TODO: comment.
+  compute_stripe_sizes();
 
   // Set up table for converting timestamp columns from local to UTC time
   auto const tz_table = [&, &selected_stripes = selected_stripes] {
