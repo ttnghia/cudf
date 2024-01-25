@@ -733,6 +733,11 @@ std::size_t column_size_fn::operator()<struct_view>(std::size_t num_rows, bool n
   return validity_size(num_rows, nullable);
 }
 
+struct cumulative_row_info {
+  uint32_t row_count;
+  std::size_t size_bytes;
+};
+
 }  // namespace
 
 void reader::impl::compute_stripe_sizes()
@@ -749,29 +754,69 @@ void reader::impl::compute_stripe_sizes()
                     });
   _file_itm_data->stripe_sizes.reserve(total_num_stripes);
 
+  auto parse_column_statistics = [](auto const& raw_col_stats) {
+    orc::column_statistics stats_internal;
+    orc::ProtobufReader(reinterpret_cast<uint8_t const*>(raw_col_stats.c_str()),
+                        raw_col_stats.size())
+      .read(stats_internal);
+    return column_statistics(std::move(stats_internal));
+  };
+
   for (auto const& stripe_source_mapping : selected_stripes) {
+    // TODO: Check and handle for skipped stripes due to skip_rows.
+    // We may need to update stripe_source_mapping to store stripe_idx.
+    // This stores all statistics for all stripes in the current file source.
+    auto const& raw_stripes_stats =
+      _metadata.per_file_metadata[stripe_source_mapping.source_idx].md.stripeStats;
+    std::vector<std::vector<column_statistics>> stripes_stats;
+    for (auto const& raw_stripe_stats : raw_stripes_stats) {
+      stripes_stats.emplace_back();
+      for (auto const& raw_stats : raw_stripe_stats.colStats) {
+        stripes_stats.back().emplace_back(
+          parse_column_statistics(std::string(raw_stats.cbegin(), raw_stats.cend())));
+      }
+    }
+    // TODO: how to map to these stats?
+
+    size_t stripe_idx{0};  // TODO: store this in stripe_source_mapping
     for (auto const& stripe : stripe_source_mapping.stripe_info) {
       std::size_t size{0};
+
       // We ignore the root level.
-      for (std::size_t level = 1; level < _selected_columns.num_levels(); ++level) {
+      // TODO: level 0?
+      for (std::size_t level = 0; level < _selected_columns.num_levels(); ++level) {
         auto const& columns_level = _selected_columns.levels[level];
         for (auto const& col : columns_level) {
+          auto const col_idx = _col_meta->orc_col_map[level][col.id];
+
+          // TODO: how to map state to the correct column?
+          auto const& stats = stripes_stats[stripe_idx][col_idx];
+          stripe_idx++;
+
+          auto const str_size =
+            stats.string_stats.has_value() ? stats.string_stats->sum.value_or(0) : 0;
+
           // TODO: store col type
           auto const col_type =
             to_cudf_type(_metadata.get_col_type(col.id).kind,
                          _use_np_dtypes,
                          _timestamp_type.id(),
                          to_cudf_decimal_type(_decimal128_columns, _metadata, col.id));
-          auto const str_size = 0;
-          auto const nullable = false;
-          size += str_size +
-                  type_dispatcher(
-                    data_type{col_type}, column_size_fn{}, stripe.first->numberOfRows, nullable);
+          size += str_size + type_dispatcher(data_type{col_type},
+                                             column_size_fn{},
+                                             stripe.first->numberOfRows,
+                                             stats.has_null.value_or(false));
         }
       }
       _file_itm_data->stripe_sizes.push_back(size);
     }
   }
+
+  int idx{0};
+  for (auto size : _file_itm_data->stripe_sizes) {
+    printf("stripe size: {%d, %lu}\n", idx++, size);
+  }
+  printf("\n\n");
 }
 
 void reader::impl::prepare_data(uint64_t skip_rows,
