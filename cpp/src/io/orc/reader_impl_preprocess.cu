@@ -754,7 +754,7 @@ void reader::impl::compute_stripe_sizes()
                     });
   _file_itm_data->stripe_sizes.reserve(total_num_stripes);
 
-  printf("line %d\n", __LINE__);
+  //  printf("line %d\n", __LINE__);
   fflush(stdout);
 
 #if 1
@@ -785,8 +785,14 @@ void reader::impl::compute_stripe_sizes()
     }
     // TODO: how to map to these stats?
 #endif
+    if (stripes_stats.size() == 0) {
+      // TODO: generate stats.
+      printf("no stats!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n");
+      fflush(stdout);
+      return;
+    }
 
-    printf("line %d\n", __LINE__);
+    //    printf("line %d\n", __LINE__);
     fflush(stdout);
 
     for (auto const& stripe : stripe_source_mapping.stripe_info) {
@@ -796,7 +802,7 @@ void reader::impl::compute_stripe_sizes()
       // We ignore the root level.
       // TODO: level 0?
       for (std::size_t level = 0; level < _selected_columns.num_levels(); ++level) {
-        printf("line %d\n", __LINE__);
+        //        printf("line %d\n", __LINE__);
         fflush(stdout);
 
         auto const& columns_level = _selected_columns.levels[level];
@@ -805,6 +811,14 @@ void reader::impl::compute_stripe_sizes()
           fflush(stdout);
 
           // TODO: how to map state to the correct column?
+          printf("stripes_stats %d/%d/%d\n",
+                 (int)stripe_idx,
+                 (int)stripes_stats.size(),
+                 (int)stripe_source_mapping.stripe_info.size());
+
+          //          printf("line %d\n", __LINE__);
+          fflush(stdout);
+
           printf("stripes_stats %d/%d/%d, %d/%d\n",
                  (int)stripe_idx,
                  (int)stripes_stats.size(),
@@ -812,12 +826,12 @@ void reader::impl::compute_stripe_sizes()
                  (int)col.id,
                  (int)stripes_stats[stripe_idx].size());
 
-          printf("line %d\n", __LINE__);
+          //          printf("line %d\n", __LINE__);
           fflush(stdout);
 
           auto const& stats = stripes_stats[stripe_idx][col.id];
 
-          printf("line %d\n", __LINE__);
+          //          printf("line %d\n", __LINE__);
           fflush(stdout);
 
           auto const str_size =
@@ -838,7 +852,7 @@ void reader::impl::compute_stripe_sizes()
                                              std::get<1>(stripe)->numberOfRows,
                                              has_nulls);
 
-          printf("line %d\n", __LINE__);
+          //          printf("line %d\n", __LINE__);
           fflush(stdout);
         }
       }
