@@ -392,9 +392,16 @@ TEST_F(OrcWriterTest, MultiColumn)
       .metadata(expected_metadata);
   cudf::io::write_orc(out_opts);
 
+  printf("written\n");
+  printf("line %d\n", __LINE__);
+  fflush(stdout);
+
   cudf::io::orc_reader_options in_opts =
     cudf::io::orc_reader_options::builder(cudf::io::source_info{filepath}).use_index(false);
   auto result = cudf::io::read_orc(in_opts);
+
+  printf("read\n");
+  fflush(stdout);
 
   CUDF_TEST_EXPECT_TABLES_EQUAL(expected, result.tbl->view());
   cudf::test::expect_metadata_equal(expected_metadata, result.metadata);

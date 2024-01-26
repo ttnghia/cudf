@@ -597,12 +597,15 @@ struct column_validity_info {
 };
 
 /**
+ * TODO
+ */
+using OrcStripeInfo = std::tuple<std::size_t, StripeInformation const*, StripeFooter const*>;
+
+/**
  * @brief A helper class for ORC file metadata. Provides some additional
  * convenience methods for initializing and accessing metadata.
  */
 class metadata {
-  using OrcStripeInfo = std::pair<StripeInformation const*, StripeFooter const*>;
-
  public:
   struct stripe_source_mapping {
     int source_idx;

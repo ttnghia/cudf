@@ -754,6 +754,9 @@ void reader::impl::compute_stripe_sizes()
                     });
   _file_itm_data->stripe_sizes.reserve(total_num_stripes);
 
+  printf("line %d\n", __LINE__);
+  fflush(stdout);
+
 #if 1
   auto parse_column_statistics = [](auto const& raw_col_stats) {
     orc::column_statistics stats_internal;
@@ -783,28 +786,46 @@ void reader::impl::compute_stripe_sizes()
     // TODO: how to map to these stats?
 #endif
 
-    size_t stripe_idx{0};  // TODO: store this in stripe_source_mapping
+    printf("line %d\n", __LINE__);
+    fflush(stdout);
+
     for (auto const& stripe : stripe_source_mapping.stripe_info) {
       std::size_t size{0};
+      auto const stripe_idx = std::get<0>(stripe);
 
       // We ignore the root level.
       // TODO: level 0?
       for (std::size_t level = 0; level < _selected_columns.num_levels(); ++level) {
+        printf("line %d\n", __LINE__);
+        fflush(stdout);
+
         auto const& columns_level = _selected_columns.levels[level];
         for (auto const& col : columns_level) {
+          printf("line %d\n", __LINE__);
+          fflush(stdout);
+
           // TODO: how to map state to the correct column?
-          printf("stripes_stats %d/%d, %d/%d\n",
+          printf("stripes_stats %d/%d/%d, %d/%d\n",
                  (int)stripe_idx,
                  (int)stripes_stats.size(),
+                 (int)stripe_source_mapping.stripe_info.size(),
                  (int)col.id,
                  (int)stripes_stats[stripe_idx].size());
 
+          printf("line %d\n", __LINE__);
+          fflush(stdout);
+
           auto const& stats = stripes_stats[stripe_idx][col.id];
-          stripe_idx++;
+
+          printf("line %d\n", __LINE__);
+          fflush(stdout);
 
           auto const str_size =
             stats.string_stats.has_value() ? stats.string_stats->sum.value_or(0) : 0;
           auto const has_nulls = stats.has_null.value_or(false);
+
+          printf("line %d\n", __LINE__);
+          fflush(stdout);
 
           // TODO: store col type
           auto const col_type =
@@ -812,9 +833,13 @@ void reader::impl::compute_stripe_sizes()
                          _use_np_dtypes,
                          _timestamp_type.id(),
                          to_cudf_decimal_type(_decimal128_columns, _metadata, col.id));
-          size += str_size +
-                  type_dispatcher(
-                    data_type{col_type}, column_size_fn{}, stripe.first->numberOfRows, has_nulls);
+          size += str_size + type_dispatcher(data_type{col_type},
+                                             column_size_fn{},
+                                             std::get<1>(stripe)->numberOfRows,
+                                             has_nulls);
+
+          printf("line %d\n", __LINE__);
+          fflush(stdout);
         }
       }
       _file_itm_data->stripe_sizes.push_back(size);
@@ -867,7 +892,7 @@ void reader::impl::prepare_data(uint64_t skip_rows,
 
     return has_timestamp_column
              ? cudf::detail::make_timezone_transition_table(
-                 {}, selected_stripes[0].stripe_info[0].second->writerTimezone, _stream)
+                 {}, std::get<2>(selected_stripes[0].stripe_info[0])->writerTimezone, _stream)
              : std::make_unique<cudf::table>();
   }();
 
@@ -962,8 +987,8 @@ void reader::impl::prepare_data(uint64_t skip_rows,
     for (auto const& stripe_source_mapping : selected_stripes) {
       // Iterate through the source files selected stripes
       for (auto const& stripe : stripe_source_mapping.stripe_info) {
-        auto const stripe_info   = stripe.first;
-        auto const stripe_footer = stripe.second;
+        auto const stripe_info   = std::get<1>(stripe);
+        auto const stripe_footer = std::get<2>(stripe);
 
         auto stream_count          = stream_info.size();
         auto const total_data_size = gather_stream_info(stripe_idx,

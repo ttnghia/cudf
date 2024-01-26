@@ -45,8 +45,6 @@ struct column_hierarchy {
  * to aggregate that metadata from all the files.
  */
 class aggregate_orc_metadata {
-  using OrcStripeInfo = std::pair<StripeInformation const*, StripeFooter const*>;
-
   /**
    * @brief Sums up the number of rows of each source
    */

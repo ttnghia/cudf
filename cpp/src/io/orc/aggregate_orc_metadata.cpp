@@ -186,7 +186,7 @@ aggregate_orc_metadata::select_stripes(
                                              per_file_metadata[src_file_idx].ff.stripes.size()),
           "Invalid stripe index");
         stripe_infos.push_back(
-          std::pair(&per_file_metadata[src_file_idx].ff.stripes[stripe_idx], nullptr));
+          std::tuple(stripe_idx, &per_file_metadata[src_file_idx].ff.stripes[stripe_idx], nullptr));
         rows_to_read += per_file_metadata[src_file_idx].ff.stripes[stripe_idx].numberOfRows;
       }
       selected_stripes_mapping.push_back({static_cast<int>(src_file_idx), stripe_infos});
@@ -205,8 +205,8 @@ aggregate_orc_metadata::select_stripes(
            ++stripe_idx) {
         count += per_file_metadata[src_file_idx].ff.stripes[stripe_idx].numberOfRows;
         if (count > rows_to_skip || count == 0) {
-          stripe_infos.push_back(
-            std::pair(&per_file_metadata[src_file_idx].ff.stripes[stripe_idx], nullptr));
+          stripe_infos.push_back(std::tuple(
+            stripe_idx, &per_file_metadata[src_file_idx].ff.stripes[stripe_idx], nullptr));
         } else {
           stripe_skip_rows = count;
         }
@@ -224,7 +224,7 @@ aggregate_orc_metadata::select_stripes(
     per_file_metadata[mapping.source_idx].stripefooters.resize(mapping.stripe_info.size());
 
     for (size_t i = 0; i < mapping.stripe_info.size(); i++) {
-      auto const stripe         = mapping.stripe_info[i].first;
+      auto const stripe         = std::get<1>(mapping.stripe_info[i]);
       auto const sf_comp_offset = stripe->offset + stripe->indexLength + stripe->dataLength;
       auto const sf_comp_length = stripe->footerLength;
       CUDF_EXPECTS(
@@ -236,7 +236,7 @@ aggregate_orc_metadata::select_stripes(
         {buffer->data(), buffer->size()}, stream);
       ProtobufReader(sf_data.data(), sf_data.size())
         .read(per_file_metadata[mapping.source_idx].stripefooters[i]);
-      mapping.stripe_info[i].second = &per_file_metadata[mapping.source_idx].stripefooters[i];
+      std::get<2>(mapping.stripe_info[i]) = &per_file_metadata[mapping.source_idx].stripefooters[i];
       if (stripe->indexLength == 0) { row_grp_idx_present = false; }
     }
   }
