@@ -185,6 +185,7 @@ aggregate_orc_metadata::select_stripes(
           stripe_idx >= 0 and stripe_idx < static_cast<decltype(stripe_idx)>(
                                              per_file_metadata[src_file_idx].ff.stripes.size()),
           "Invalid stripe index");
+
         stripe_infos.push_back(
           std::tuple(stripe_idx, &per_file_metadata[src_file_idx].ff.stripes[stripe_idx], nullptr));
         rows_to_read += per_file_metadata[src_file_idx].ff.stripes[stripe_idx].numberOfRows;
@@ -203,6 +204,9 @@ aggregate_orc_metadata::select_stripes(
       for (size_t stripe_idx = 0; stripe_idx < per_file_metadata[src_file_idx].ff.stripes.size() &&
                                   count < rows_to_skip + rows_to_read;
            ++stripe_idx) {
+        printf("per_file_metadata[src_file_idx].ff.stripes.size() = %d\n",
+               (int)per_file_metadata[src_file_idx].ff.stripes.size());
+
         count += per_file_metadata[src_file_idx].ff.stripes[stripe_idx].numberOfRows;
         if (count > rows_to_skip || count == 0) {
           stripe_infos.push_back(std::tuple(

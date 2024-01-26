@@ -1057,8 +1057,10 @@ void reader::impl::prepare_data(uint64_t skip_rows,
         }
 
         auto const num_rows_per_stripe = stripe_info->numberOfRows;
-        auto const rowgroup_id         = num_rowgroups;
-        auto stripe_num_rowgroups      = 0;
+        printf("num_rows_per_stripe: %d\n", num_rows_per_stripe);
+
+        auto const rowgroup_id    = num_rowgroups;
+        auto stripe_num_rowgroups = 0;
         if (use_index) {
           stripe_num_rowgroups = (num_rows_per_stripe + _metadata.get_row_index_stride() - 1) /
                                  _metadata.get_row_index_stride();
