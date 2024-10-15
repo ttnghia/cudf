@@ -1242,68 +1242,70 @@ public final class Table implements AutoCloseable {
   }
 
   private static Table gatherJSONColumns(Schema schema, TableWithMeta twm, int emptyRowCount) {
-    String[] neededColumns = schema.getColumnNames();
-    if (neededColumns == null || neededColumns.length == 0) {
-      return twm.releaseTable();
-    } else {
-      String[] foundNames = twm.getColumnNames();
-      HashMap<String, Integer> indices = new HashMap<>();
-      for (int i = 0; i < foundNames.length; i++) {
-        indices.put(foundNames[i], i);
-      }
-      // We might need to rearrange the columns to match what we want.
-      DType[] types = schema.getChildTypes();
-      ColumnVector[] columns = new ColumnVector[neededColumns.length];
-      try (Table tbl = twm.releaseTable()) {
-        int rowCount = tbl == null ? emptyRowCount : (int)tbl.getRowCount();
-        if (rowCount < 0) {
-          throw new IllegalStateException(
-              "No empty row count provided and the table read has no row count or columns");
+    try(NvtxRange range = new NvtxRange("gatherJSONColumns", NvtxColor.RED)) {
+      String[] neededColumns = schema.getColumnNames();
+      if (neededColumns == null || neededColumns.length == 0) {
+        return twm.releaseTable();
+      } else {
+        String[] foundNames = twm.getColumnNames();
+        HashMap<String, Integer> indices = new HashMap<>();
+        for (int i = 0; i < foundNames.length; i++) {
+          indices.put(foundNames[i], i);
         }
-        for (int i = 0; i < columns.length; i++) {
-          String neededColumnName = neededColumns[i];
-          Integer index = indices.get(neededColumnName);
-          if (index != null) {
-            if (schema.getChild(i).isStructOrHasStructDescendant()) {
-              DidViewChange gathered = gatherJSONColumns(schema.getChild(i), twm.getChild(index),
-                  tbl.getColumn(index));
-              if (gathered.noChangeNeeded) {
-                columns[i] = tbl.getColumn(index).incRefCount();
+        // We might need to rearrange the columns to match what we want.
+        DType[] types = schema.getChildTypes();
+        ColumnVector[] columns = new ColumnVector[neededColumns.length];
+        try (Table tbl = twm.releaseTable()) {
+          int rowCount = tbl == null ? emptyRowCount : (int) tbl.getRowCount();
+          if (rowCount < 0) {
+            throw new IllegalStateException(
+                "No empty row count provided and the table read has no row count or columns");
+          }
+          for (int i = 0; i < columns.length; i++) {
+            String neededColumnName = neededColumns[i];
+            Integer index = indices.get(neededColumnName);
+            if (index != null) {
+              if (schema.getChild(i).isStructOrHasStructDescendant()) {
+                DidViewChange gathered = gatherJSONColumns(schema.getChild(i), twm.getChild(index),
+                    tbl.getColumn(index));
+                if (gathered.noChangeNeeded) {
+                  columns[i] = tbl.getColumn(index).incRefCount();
+                } else {
+                  columns[i] = gathered.changeWasNeeded;
+                }
               } else {
-                columns[i] = gathered.changeWasNeeded;
+                columns[i] = tbl.getColumn(index).incRefCount();
               }
             } else {
-              columns[i] = tbl.getColumn(index).incRefCount();
-            }
-          } else {
-            if (types[i] == DType.LIST) {
-              Schema listSchema = schema.getChild(i);
-              Schema elementSchema = listSchema.getChild(0);
-              try (Scalar s = Scalar.listFromNull(elementSchema.asHostDataType())) {
-                columns[i] = ColumnVector.fromScalar(s, rowCount);
-              }
-            } else if (types[i] == DType.STRUCT) {
-              Schema structSchema = schema.getChild(i);
-              int numStructChildren = structSchema.getNumChildren();
-              DataType[] structChildrenTypes = new DataType[numStructChildren];
-              for (int j = 0; j < numStructChildren; j++) {
-                structChildrenTypes[j] = structSchema.getChild(j).asHostDataType();
-              }
-              try (Scalar s = Scalar.structFromNull(structChildrenTypes)) {
-                columns[i] = ColumnVector.fromScalar(s, rowCount);
-              }
-            } else {
-              try (Scalar s = Scalar.fromNull(types[i])) {
-                columns[i] = ColumnVector.fromScalar(s, rowCount);
+              if (types[i] == DType.LIST) {
+                Schema listSchema = schema.getChild(i);
+                Schema elementSchema = listSchema.getChild(0);
+                try (Scalar s = Scalar.listFromNull(elementSchema.asHostDataType())) {
+                  columns[i] = ColumnVector.fromScalar(s, rowCount);
+                }
+              } else if (types[i] == DType.STRUCT) {
+                Schema structSchema = schema.getChild(i);
+                int numStructChildren = structSchema.getNumChildren();
+                DataType[] structChildrenTypes = new DataType[numStructChildren];
+                for (int j = 0; j < numStructChildren; j++) {
+                  structChildrenTypes[j] = structSchema.getChild(j).asHostDataType();
+                }
+                try (Scalar s = Scalar.structFromNull(structChildrenTypes)) {
+                  columns[i] = ColumnVector.fromScalar(s, rowCount);
+                }
+              } else {
+                try (Scalar s = Scalar.fromNull(types[i])) {
+                  columns[i] = ColumnVector.fromScalar(s, rowCount);
+                }
               }
             }
           }
-        }
-        return new Table(columns);
-      } finally {
-        for (ColumnVector c: columns) {
-          if (c != null) {
-            c.close();
+          return new Table(columns);
+        } finally {
+          for (ColumnVector c : columns) {
+            if (c != null) {
+              c.close();
+            }
           }
         }
       }
@@ -1480,35 +1482,37 @@ public final class Table implements AutoCloseable {
    */
   public static Table readJSON(Schema schema, JSONOptions opts, HostMemoryBuffer buffer,
                                long offset, long len, int emptyRowCount) {
-    if (len <= 0) {
-      len = buffer.length - offset;
-    }
-    assert len > 0;
-    assert len <= buffer.length - offset;
-    assert offset >= 0 && offset < buffer.length;
-    // only prune the schema if one is provided
-    boolean cudfPruneSchema = schema.getColumnNames() != null &&
-        schema.getColumnNames().length != 0 &&
-        opts.shouldCudfPruneSchema();
-    try (TableWithMeta twm = new TableWithMeta(readJSON(
-            schema.getFlattenedNumChildren(), schema.getFlattenedColumnNames(),
-            schema.getFlattenedTypeIds(), schema.getFlattenedTypeScales(), null,
-            buffer.getAddress() + offset, len,
-            opts.isDayFirst(),
-            opts.isLines(),
-            opts.isRecoverWithNull(),
-            opts.isNormalizeSingleQuotes(),
-            opts.isNormalizeWhitespace(),
-            opts.isMixedTypesAsStrings(),
-            opts.keepStringQuotes(),
-            opts.strictValidation(),
-            opts.leadingZerosAllowed(),
-            opts.nonNumericNumbersAllowed(),
-            opts.unquotedControlChars(),
-            cudfPruneSchema,
-            opts.experimental(),
-            opts.getLineDelimiter()))) {
-      return gatherJSONColumns(schema, twm, emptyRowCount);
+    try(NvtxRange range = new NvtxRange("readJSON", NvtxColor.PURPLE)) {
+      if (len <= 0) {
+        len = buffer.length - offset;
+      }
+      assert len > 0;
+      assert len <= buffer.length - offset;
+      assert offset >= 0 && offset < buffer.length;
+      // only prune the schema if one is provided
+      boolean cudfPruneSchema = schema.getColumnNames() != null &&
+          schema.getColumnNames().length != 0 &&
+          opts.shouldCudfPruneSchema();
+      try (TableWithMeta twm = new TableWithMeta(readJSON(
+          schema.getFlattenedNumChildren(), schema.getFlattenedColumnNames(),
+          schema.getFlattenedTypeIds(), schema.getFlattenedTypeScales(), null,
+          buffer.getAddress() + offset, len,
+          opts.isDayFirst(),
+          opts.isLines(),
+          opts.isRecoverWithNull(),
+          opts.isNormalizeSingleQuotes(),
+          opts.isNormalizeWhitespace(),
+          opts.isMixedTypesAsStrings(),
+          opts.keepStringQuotes(),
+          opts.strictValidation(),
+          opts.leadingZerosAllowed(),
+          opts.nonNumericNumbersAllowed(),
+          opts.unquotedControlChars(),
+          cudfPruneSchema,
+          opts.experimental(),
+          opts.getLineDelimiter()))) {
+        return gatherJSONColumns(schema, twm, emptyRowCount);
+      }
     }
   }
 
@@ -1532,31 +1536,33 @@ public final class Table implements AutoCloseable {
    * @return the data parsed as a table on the GPU.
    */
   public static Table readJSON(Schema schema, JSONOptions opts, DataSource ds, int emptyRowCount) {
-    long dsHandle = DataSourceHelper.createWrapperDataSource(ds);
-    // only prune the schema if one is provided
-    boolean cudfPruneSchema = schema.getColumnNames() != null &&
-        schema.getColumnNames().length != 0 &&
-        opts.shouldCudfPruneSchema();
-    try (TableWithMeta twm = new TableWithMeta(readJSONFromDataSource(schema.getFlattenedNumChildren(),
-        schema.getFlattenedColumnNames(), schema.getFlattenedTypeIds(), schema.getFlattenedTypeScales(),
-        opts.isDayFirst(),
-        opts.isLines(),
-        opts.isRecoverWithNull(),
-        opts.isNormalizeSingleQuotes(),
-        opts.isNormalizeWhitespace(),
-        opts.isMixedTypesAsStrings(),
-        opts.keepStringQuotes(),
-        opts.strictValidation(),
-        opts.leadingZerosAllowed(),
-        opts.nonNumericNumbersAllowed(),
-        opts.unquotedControlChars(),
-        cudfPruneSchema,
-        opts.experimental(),
-        opts.getLineDelimiter(),
-        dsHandle))) {
-      return gatherJSONColumns(schema, twm, emptyRowCount);
-    } finally {
-      DataSourceHelper.destroyWrapperDataSource(dsHandle);
+    try(NvtxRange range = new NvtxRange("readJSON", NvtxColor.PURPLE)) {
+      long dsHandle = DataSourceHelper.createWrapperDataSource(ds);
+      // only prune the schema if one is provided
+      boolean cudfPruneSchema = schema.getColumnNames() != null &&
+          schema.getColumnNames().length != 0 &&
+          opts.shouldCudfPruneSchema();
+      try (TableWithMeta twm = new TableWithMeta(readJSONFromDataSource(schema.getFlattenedNumChildren(),
+          schema.getFlattenedColumnNames(), schema.getFlattenedTypeIds(), schema.getFlattenedTypeScales(),
+          opts.isDayFirst(),
+          opts.isLines(),
+          opts.isRecoverWithNull(),
+          opts.isNormalizeSingleQuotes(),
+          opts.isNormalizeWhitespace(),
+          opts.isMixedTypesAsStrings(),
+          opts.keepStringQuotes(),
+          opts.strictValidation(),
+          opts.leadingZerosAllowed(),
+          opts.nonNumericNumbersAllowed(),
+          opts.unquotedControlChars(),
+          cudfPruneSchema,
+          opts.experimental(),
+          opts.getLineDelimiter(),
+          dsHandle))) {
+        return gatherJSONColumns(schema, twm, emptyRowCount);
+      } finally {
+        DataSourceHelper.destroyWrapperDataSource(dsHandle);
+      }
     }
   }
 
