@@ -104,13 +104,24 @@ struct codec_exec_result {
 [[nodiscard]] bool is_device_decompression_supported(compression_type compression);
 
 /**
- * @brief Compress a host memory buffer.
+ * @brief Compress a host memory buffer using host (CPU) compression engine.
  *
  * @param compression Compression type
  * @param src The input host buffer to compress
  * @return Vector containing the compressed output
  */
-std::vector<uint8_t> compress(compression_type compression, host_span<uint8_t const> src);
+[[nodiscard]] std::vector<uint8_t> compress(compression_type compression,
+                                            host_span<uint8_t const> src);
+
+/**
+ * @brief Compress an array of host buffers using host (CPU) compression engine.
+ *
+ * @param compression Compression type
+ * @param inputs The input host buffers to compress
+ * @return An array of buffers containing the compressed data corresponding to each input buffer
+ */
+[[nodiscard]] std::vector<std::vector<uint8_t>> compress(
+  compression_type compression, host_span<host_span<uint8_t const> const> inputs);
 
 /**
  * @brief Compress device memory buffers.
@@ -128,17 +139,27 @@ void compress(compression_type compression,
               rmm::cuda_stream_view stream);
 
 /**
- * @brief Decompresses a host memory buffer.
+ * @brief Decompresses a host memory buffer using host (CPU) compression engine.
  *
  * @param compression Compression type
- * @param src The input host buffer to decompress
+ * @param input The input host buffer to decompress
  * @return Vector containing the decompressed output
  */
 [[nodiscard]] std::vector<uint8_t> decompress(compression_type compression,
-                                              host_span<uint8_t const> src);
+                                              host_span<uint8_t const> input);
 
 /**
- * @brief Decompresses a host memory buffer.
+ * @brief Decompresses an array of host memory buffers using host (CPU) compression engine.
+ *
+ * @param compression Compression type
+ * @param inputs The input host buffers to decompress
+ * @return Vectors containing the decompressed output corresponding to each input buffer
+ */
+[[nodiscard]] std::vector<std::vector<uint8_t>> decompress(
+  compression_type compression, host_span<host_span<uint8_t const> const> inputs);
+
+/**
+ * @brief Decompresses a host memory buffer using host (CPU) compression engine.
  *
  * @param compression Compression type
  * @param src The input host buffer to decompress
