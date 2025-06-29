@@ -15,6 +15,17 @@
 cmake_minimum_required(VERSION 3.30.4 FATAL_ERROR)
 
 include(../../../../cmake/rapids_config.cmake)
+
+set(CPPTRACE_GET_SYMBOLS_WITH_LIBDL ON)
+
+include(FetchContent)
+FetchContent_Declare(
+  cpptrace
+  GIT_REPOSITORY https://github.com/jeremy-rifkin/cpptrace.git
+  GIT_TAG v1.0.2 # <HASH or TAG>
+)
+FetchContent_MakeAvailable(cpptrace)
+
 include(rapids-cmake)
 include(rapids-cuda)
 include(rapids-find)
@@ -234,7 +245,11 @@ target_link_options(cudfjni PRIVATE "-Wl,--no-undefined")
 
 set(CUDF_ENABLE_ARROW_PARQUET ON)
 include(../../../../cpp/cmake/thirdparty/get_arrow.cmake)
-target_link_libraries(cudfjni PRIVATE ${ARROW_LIBRARIES})
+target_link_libraries(
+  cudfjni
+  PUBLIC cpptrace::cpptrace
+  PRIVATE ${ARROW_LIBRARIES}
+)
 
 if(USE_GDS)
   add_library(cufilejni src/CuFileJni.cpp)

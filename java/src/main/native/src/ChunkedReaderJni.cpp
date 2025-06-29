@@ -22,6 +22,8 @@
 #include <cudf/io/orc.hpp>
 #include <cudf/io/parquet.hpp>
 
+#include <cpptrace/from_current.hpp>
+
 #include <memory>
 #include <optional>
 
@@ -148,13 +150,43 @@ Java_ai_rapids_cudf_ParquetChunkedReader_createWithDataSource(JNIEnv* env,
 JNIEXPORT jboolean JNICALL Java_ai_rapids_cudf_ParquetChunkedReader_hasNext(JNIEnv* env,
                                                                             jclass,
                                                                             jlong handle)
+
 {
   JNI_NULL_CHECK(env, handle, "handle is null", false);
 
   try {
-    cudf::jni::auto_set_device(env);
-    auto const reader_ptr = reinterpret_cast<cudf::io::chunked_parquet_reader* const>(handle);
-    return reader_ptr->has_next();
+    CPPTRACE_TRY
+    {
+      cudf::jni::auto_set_device(env);
+      auto const reader_ptr = reinterpret_cast<cudf::io::chunked_parquet_reader* const>(handle);
+      auto has_next         = reader_ptr->has_next();
+
+      cudaError_t cuda_status = cudaGetLastError();
+      if (cuda_status != cudaSuccess) {
+        char buff[1024];
+        sprintf(buff,
+                "CUDA error: %s, file: %s, line: %d",
+                cudaGetErrorString(cuda_status),
+                __FILE__,
+                __LINE__);
+        fprintf(stderr, "%s\n", buff);
+        fprintf(stdout, "%s\n", buff);
+        fflush(stderr);
+        fflush(stdout);
+
+        throw cudf::cuda_error(buff, cuda_status);
+      }
+
+      return has_next;
+    }
+    CPPTRACE_CATCH(const std::exception& e)
+    {
+      std::cerr << "Exception: " << e.what() << std::endl;
+      cpptrace::from_current_exception().print(std::cerr);
+      fflush(stderr);
+      fflush(stdout);
+      throw;
+    }
   }
   CATCH_STD(env, false);
 }
@@ -166,10 +198,38 @@ JNIEXPORT jlongArray JNICALL Java_ai_rapids_cudf_ParquetChunkedReader_readChunk(
   JNI_NULL_CHECK(env, handle, "handle is null", nullptr);
 
   try {
-    cudf::jni::auto_set_device(env);
-    auto const reader_ptr = reinterpret_cast<cudf::io::chunked_parquet_reader* const>(handle);
-    auto chunk            = reader_ptr->read_chunk();
-    return chunk.tbl ? cudf::jni::convert_table_for_return(env, chunk.tbl) : nullptr;
+    CPPTRACE_TRY
+    {
+      cudf::jni::auto_set_device(env);
+      auto const reader_ptr = reinterpret_cast<cudf::io::chunked_parquet_reader* const>(handle);
+      auto chunk            = reader_ptr->read_chunk();
+
+      cudaError_t cuda_status = cudaGetLastError();
+      if (cuda_status != cudaSuccess) {
+        char buff[1024];
+        sprintf(buff,
+                "CUDA error: %s, file: %s, line: %d",
+                cudaGetErrorString(cuda_status),
+                __FILE__,
+                __LINE__);
+        fprintf(stderr, "%s\n", buff);
+        fprintf(stdout, "%s\n", buff);
+        fflush(stderr);
+        fflush(stdout);
+
+        throw cudf::cuda_error(buff, cuda_status);
+      }
+
+      return chunk.tbl ? cudf::jni::convert_table_for_return(env, chunk.tbl) : nullptr;
+    }
+    CPPTRACE_CATCH(const std::exception& e)
+    {
+      std::cerr << "Exception: " << e.what() << std::endl;
+      cpptrace::from_current_exception().print(std::cerr);
+      fflush(stderr);
+      fflush(stdout);
+      throw;
+    }
   }
   CATCH_STD(env, nullptr);
 }
