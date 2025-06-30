@@ -26,6 +26,7 @@
 
 #include <memory>
 #include <optional>
+#include <syncstream>
 
 // This file is for the code related to chunked reader (Parquet, ORC, etc.).
 
@@ -167,10 +168,10 @@ JNIEXPORT jboolean JNICALL Java_ai_rapids_cudf_ParquetChunkedReader_hasNext(JNIE
                 cudaGetErrorString(cuda_status),
                 __FILE__,
                 __LINE__);
-        fprintf(stderr, "%s\n", buff);
-        fprintf(stdout, "%s\n", buff);
-        fflush(stderr);
-        fflush(stdout);
+        std::osyncstream sync_out(std::cout);
+        std::osyncstream sync_err(std::cerr);
+        sync_out << buff << std::endl;
+        sync_err << buff << std::endl;
 
         throw cudf::cuda_error(buff, cuda_status);
       }
@@ -182,14 +183,14 @@ JNIEXPORT jboolean JNICALL Java_ai_rapids_cudf_ParquetChunkedReader_hasNext(JNIE
       if (cuda_status != cudaSuccess) {
         char buff[1024];
         sprintf(buff,
-                "CUDA error: %s, file: %s, line: %d",
+                "CUDA error after has_next: %s, file: %s, line: %d",
                 cudaGetErrorString(cuda_status),
                 __FILE__,
                 __LINE__);
-        fprintf(stderr, "%s\n", buff);
-        fprintf(stdout, "%s\n", buff);
-        fflush(stderr);
-        fflush(stdout);
+        std::osyncstream sync_out(std::cout);
+        std::osyncstream sync_err(std::cerr);
+        sync_out << buff << std::endl;
+        sync_err << buff << std::endl;
 
         throw cudf::cuda_error(buff, cuda_status);
       }
@@ -198,8 +199,12 @@ JNIEXPORT jboolean JNICALL Java_ai_rapids_cudf_ParquetChunkedReader_hasNext(JNIE
     }
     CPPTRACE_CATCH(const std::exception& e)
     {
+      std::cout << "Exception: " << e.what() << std::endl;
       std::cerr << "Exception: " << e.what() << std::endl;
-      cpptrace::from_current_exception().print(std::cerr);
+      std::osyncstream sync_out(std::cout);
+      std::osyncstream sync_err(std::cerr);
+      cpptrace::from_current_exception().print(sync_out);
+      cpptrace::from_current_exception().print(sync_err);
       fflush(stderr);
       fflush(stdout);
       throw;
@@ -227,10 +232,10 @@ JNIEXPORT jlongArray JNICALL Java_ai_rapids_cudf_ParquetChunkedReader_readChunk(
                 cudaGetErrorString(cuda_status),
                 __FILE__,
                 __LINE__);
-        fprintf(stderr, "%s\n", buff);
-        fprintf(stdout, "%s\n", buff);
-        fflush(stderr);
-        fflush(stdout);
+        std::osyncstream sync_out(std::cout);
+        std::osyncstream sync_err(std::cerr);
+        sync_out << buff << std::endl;
+        sync_err << buff << std::endl;
 
         throw cudf::cuda_error(buff, cuda_status);
       }
@@ -242,14 +247,14 @@ JNIEXPORT jlongArray JNICALL Java_ai_rapids_cudf_ParquetChunkedReader_readChunk(
       if (cuda_status != cudaSuccess) {
         char buff[1024];
         sprintf(buff,
-                "CUDA error: %s, file: %s, line: %d",
+                "CUDA error after read_chunk: %s, file: %s, line: %d",
                 cudaGetErrorString(cuda_status),
                 __FILE__,
                 __LINE__);
-        fprintf(stderr, "%s\n", buff);
-        fprintf(stdout, "%s\n", buff);
-        fflush(stderr);
-        fflush(stdout);
+        std::osyncstream sync_out(std::cout);
+        std::osyncstream sync_err(std::cerr);
+        sync_out << buff << std::endl;
+        sync_err << buff << std::endl;
 
         throw cudf::cuda_error(buff, cuda_status);
       }
@@ -258,8 +263,12 @@ JNIEXPORT jlongArray JNICALL Java_ai_rapids_cudf_ParquetChunkedReader_readChunk(
     }
     CPPTRACE_CATCH(const std::exception& e)
     {
+      std::cout << "Exception: " << e.what() << std::endl;
       std::cerr << "Exception: " << e.what() << std::endl;
-      cpptrace::from_current_exception().print(std::cerr);
+      std::osyncstream sync_out(std::cout);
+      std::osyncstream sync_err(std::cerr);
+      cpptrace::from_current_exception().print(sync_out);
+      cpptrace::from_current_exception().print(sync_err);
       fflush(stderr);
       fflush(stdout);
       throw;
