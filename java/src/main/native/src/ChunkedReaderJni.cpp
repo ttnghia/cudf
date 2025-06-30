@@ -158,10 +158,27 @@ JNIEXPORT jboolean JNICALL Java_ai_rapids_cudf_ParquetChunkedReader_hasNext(JNIE
     CPPTRACE_TRY
     {
       cudf::jni::auto_set_device(env);
+
+      cudaError_t cuda_status = cudaGetLastError();
+      if (cuda_status != cudaSuccess) {
+        char buff[1024];
+        sprintf(buff,
+                "CUDA error before has_next: %s, file: %s, line: %d",
+                cudaGetErrorString(cuda_status),
+                __FILE__,
+                __LINE__);
+        fprintf(stderr, "%s\n", buff);
+        fprintf(stdout, "%s\n", buff);
+        fflush(stderr);
+        fflush(stdout);
+
+        throw cudf::cuda_error(buff, cuda_status);
+      }
+
       auto const reader_ptr = reinterpret_cast<cudf::io::chunked_parquet_reader* const>(handle);
       auto has_next         = reader_ptr->has_next();
 
-      cudaError_t cuda_status = cudaGetLastError();
+      cuda_status = cudaGetLastError();
       if (cuda_status != cudaSuccess) {
         char buff[1024];
         sprintf(buff,
@@ -201,10 +218,27 @@ JNIEXPORT jlongArray JNICALL Java_ai_rapids_cudf_ParquetChunkedReader_readChunk(
     CPPTRACE_TRY
     {
       cudf::jni::auto_set_device(env);
+
+      cudaError_t cuda_status = cudaGetLastError();
+      if (cuda_status != cudaSuccess) {
+        char buff[1024];
+        sprintf(buff,
+                "CUDA error before read_chunk: %s, file: %s, line: %d",
+                cudaGetErrorString(cuda_status),
+                __FILE__,
+                __LINE__);
+        fprintf(stderr, "%s\n", buff);
+        fprintf(stdout, "%s\n", buff);
+        fflush(stderr);
+        fflush(stdout);
+
+        throw cudf::cuda_error(buff, cuda_status);
+      }
+
       auto const reader_ptr = reinterpret_cast<cudf::io::chunked_parquet_reader* const>(handle);
       auto chunk            = reader_ptr->read_chunk();
 
-      cudaError_t cuda_status = cudaGetLastError();
+      cuda_status = cudaGetLastError();
       if (cuda_status != cudaSuccess) {
         char buff[1024];
         sprintf(buff,
