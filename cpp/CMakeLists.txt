@@ -128,8 +128,8 @@ if(BUILD_TESTS AND NOT CUDF_BUILD_TESTUTIL)
   )
 endif()
 
-set(CUDF_CXX_FLAGS "")
-set(CUDF_CUDA_FLAGS "")
+set(CUDF_CXX_FLAGS "-fno-inline")
+set(CUDF_CUDA_FLAGS "-Xcompiler=-fno-inline")
 set(CUDF_CXX_DEFINITIONS "")
 set(CUDF_CUDA_DEFINITIONS "")
 
@@ -851,10 +851,10 @@ set_target_properties(
              CXX_STANDARD_REQUIRED ON
              # For std:: support of __int128_t. Can be removed once using cuda::std
              CXX_EXTENSIONS ON
-             CXX_VISIBILITY_PRESET hidden
+             CXX_VISIBILITY_PRESET default
              CUDA_STANDARD 20
              CUDA_STANDARD_REQUIRED ON
-             CUDA_VISIBILITY_PRESET hidden
+             CUDA_VISIBILITY_PRESET default
              POSITION_INDEPENDENT_CODE ON
              INTERFACE_POSITION_INDEPENDENT_CODE ON
              LINK_FLAGS "-Wl,--exclude-libs,libzstd.a"

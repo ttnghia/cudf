@@ -22,11 +22,52 @@
 #include <cudf/io/orc.hpp>
 #include <cudf/io/parquet.hpp>
 
+#include <cpptrace/exceptions.hpp>
+#include <cpptrace/formatting.hpp>
 #include <cpptrace/from_current.hpp>
+#include <cpptrace/utils.hpp>
+#include <dlfcn.h>
+#include <stdio.h>
 
+#include <fstream>
+#include <iostream>
 #include <memory>
 #include <optional>
+#include <sstream>
+#include <string>
 #include <syncstream>
+
+auto formatter =
+  cpptrace::formatter{}.header("Stack trace:").addresses(cpptrace::formatter::address_mode::object);
+
+void my_function_in_this_library()
+{
+  // This function is used to test the stacktrace
+  throw std::runtime_error("Test exception");
+}
+
+void print_base_address()
+{
+  if (0) {
+    std::ifstream maps("/proc/self/maps");
+    std::string line;
+    while (std::getline(maps, line)) {
+      if (line.find("cudf") != std::string::npos) {
+        std::cout << "maps_content: " << line << std::endl;
+        std::cerr << "maps_content: " << line << std::endl;
+      }
+    }
+  }
+
+  Dl_info info;
+  if (dladdr((void*)&my_function_in_this_library, &info)) {
+    printf("Function: %s\n", info.dli_sname);
+    printf("Library path: %s\n", info.dli_fname);
+    printf("Base address: %p\n", info.dli_fbase);
+  } else {
+    printf("dladdr failed\n");
+  }
+}
 
 // This file is for the code related to chunked reader (Parquet, ORC, etc.).
 
@@ -155,6 +196,8 @@ JNIEXPORT jboolean JNICALL Java_ai_rapids_cudf_ParquetChunkedReader_hasNext(JNIE
 {
   JNI_NULL_CHECK(env, handle, "handle is null", false);
 
+  cpptrace::absorb_trace_exceptions(false);
+
   try {
     CPPTRACE_TRY
     {
@@ -199,12 +242,15 @@ JNIEXPORT jboolean JNICALL Java_ai_rapids_cudf_ParquetChunkedReader_hasNext(JNIE
     }
     CPPTRACE_CATCH(const std::exception& e)
     {
+      print_base_address();
+
       std::cout << "Exception: " << e.what() << std::endl;
       std::cerr << "Exception: " << e.what() << std::endl;
       std::osyncstream sync_out(std::cout);
       std::osyncstream sync_err(std::cerr);
-      cpptrace::from_current_exception().print(sync_out);
-      cpptrace::from_current_exception().print(sync_err);
+      formatter.print(sync_out, cpptrace::from_current_exception());
+      formatter.print(sync_err, cpptrace::from_current_exception());
+
       fflush(stderr);
       fflush(stdout);
       throw;
@@ -218,6 +264,7 @@ JNIEXPORT jlongArray JNICALL Java_ai_rapids_cudf_ParquetChunkedReader_readChunk(
                                                                                 jlong handle)
 {
   JNI_NULL_CHECK(env, handle, "handle is null", nullptr);
+  cpptrace::absorb_trace_exceptions(false);
 
   try {
     CPPTRACE_TRY
@@ -263,12 +310,15 @@ JNIEXPORT jlongArray JNICALL Java_ai_rapids_cudf_ParquetChunkedReader_readChunk(
     }
     CPPTRACE_CATCH(const std::exception& e)
     {
+      print_base_address();
+
       std::cout << "Exception: " << e.what() << std::endl;
       std::cerr << "Exception: " << e.what() << std::endl;
       std::osyncstream sync_out(std::cout);
       std::osyncstream sync_err(std::cerr);
-      cpptrace::from_current_exception().print(sync_out);
-      cpptrace::from_current_exception().print(sync_err);
+      formatter.print(sync_out, cpptrace::from_current_exception());
+      formatter.print(sync_err, cpptrace::from_current_exception());
+
       fflush(stderr);
       fflush(stdout);
       throw;

@@ -16,7 +16,7 @@ cmake_minimum_required(VERSION 3.30.4 FATAL_ERROR)
 
 include(../../../../cmake/rapids_config.cmake)
 
-set(CPPTRACE_GET_SYMBOLS_WITH_LIBDL ON)
+set(CPPTRACE_GET_SYMBOLS_WITH_LIBDWARF ON)
 
 include(FetchContent)
 FetchContent_Declare(
