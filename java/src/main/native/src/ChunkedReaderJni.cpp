@@ -37,8 +37,9 @@
 #include <string>
 #include <syncstream>
 
-auto formatter =
-  cpptrace::formatter{}.header("Stack trace:").addresses(cpptrace::formatter::address_mode::object);
+namespace {
+auto formatter = cpptrace::formatter{}.header("Stack trace:");
+// .addresses(cpptrace::formatter::address_mode::object)
 
 void my_function_in_this_library()
 {
@@ -68,6 +69,7 @@ void print_base_address()
     printf("dladdr failed\n");
   }
 }
+}  // namespace
 
 // This file is for the code related to chunked reader (Parquet, ORC, etc.).
 

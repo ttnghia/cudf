@@ -61,8 +61,55 @@
 #include <arrow/c/bridge.h>
 #include <arrow/io/api.h>
 #include <arrow/ipc/api.h>
+#include <cpptrace/exceptions.hpp>
+#include <cpptrace/formatting.hpp>
+#include <cpptrace/from_current.hpp>
+#include <cpptrace/utils.hpp>
+#include <dlfcn.h>
+#include <stdio.h>
 
 #include <algorithm>
+#include <fstream>
+#include <iostream>
+#include <memory>
+#include <optional>
+#include <sstream>
+#include <string>
+#include <syncstream>
+
+namespace {
+auto formatter = cpptrace::formatter{}.header("Stack trace:");
+// .addresses(cpptrace::formatter::address_mode::object)
+
+void my_function_in_this_library()
+{
+  // This function is used to test the stacktrace
+  throw std::runtime_error("Test exception");
+}
+
+void print_base_address()
+{
+  if (0) {
+    std::ifstream maps("/proc/self/maps");
+    std::string line;
+    while (std::getline(maps, line)) {
+      if (line.find("cudf") != std::string::npos) {
+        std::cout << "maps_content: " << line << std::endl;
+        std::cerr << "maps_content: " << line << std::endl;
+      }
+    }
+  }
+
+  Dl_info info;
+  if (dladdr((void*)&my_function_in_this_library, &info)) {
+    printf("Function: %s\n", info.dli_sname);
+    printf("Library path: %s\n", info.dli_fname);
+    printf("Base address: %p\n", info.dli_fbase);
+  } else {
+    printf("dladdr failed\n");
+  }
+}
+}  // namespace
 
 namespace cudf {
 namespace jni {
@@ -1233,35 +1280,56 @@ JNIEXPORT jlongArray JNICALL Java_ai_rapids_cudf_Table_orderBy(JNIEnv* env,
   JNI_NULL_CHECK(env, j_are_nulls_smallest, "null order array is null", NULL);
 
   try {
-    cudf::jni::auto_set_device(env);
-    cudf::jni::native_jpointerArray<cudf::column_view> n_sort_keys_columns(env,
-                                                                           j_sort_keys_columns);
-    jsize num_columns = n_sort_keys_columns.size();
-    const cudf::jni::native_jbooleanArray n_is_descending(env, j_is_descending);
-    jsize num_columns_is_desc = n_is_descending.size();
+    CPPTRACE_TRY
+    {
+      cudf::jni::auto_set_device(env);
+      cudf::jni::native_jpointerArray<cudf::column_view> n_sort_keys_columns(env,
+                                                                             j_sort_keys_columns);
+      jsize num_columns = n_sort_keys_columns.size();
+      const cudf::jni::native_jbooleanArray n_is_descending(env, j_is_descending);
+      jsize num_columns_is_desc = n_is_descending.size();
 
-    JNI_ARG_CHECK(
-      env, num_columns_is_desc == num_columns, "columns and is_descending lengths don't match", 0);
+      JNI_ARG_CHECK(env,
+                    num_columns_is_desc == num_columns,
+                    "columns and is_descending lengths don't match",
+                    0);
 
-    const cudf::jni::native_jbooleanArray n_are_nulls_smallest(env, j_are_nulls_smallest);
-    jsize num_columns_null_smallest = n_are_nulls_smallest.size();
+      const cudf::jni::native_jbooleanArray n_are_nulls_smallest(env, j_are_nulls_smallest);
+      jsize num_columns_null_smallest = n_are_nulls_smallest.size();
 
-    JNI_ARG_CHECK(env,
-                  num_columns_null_smallest == num_columns,
-                  "columns and areNullsSmallest lengths don't match",
-                  0);
+      JNI_ARG_CHECK(env,
+                    num_columns_null_smallest == num_columns,
+                    "columns and areNullsSmallest lengths don't match",
+                    0);
 
-    std::vector<cudf::order> order =
-      n_is_descending.transform_if_else(cudf::order::DESCENDING, cudf::order::ASCENDING);
+      std::vector<cudf::order> order =
+        n_is_descending.transform_if_else(cudf::order::DESCENDING, cudf::order::ASCENDING);
 
-    std::vector<cudf::null_order> null_order =
-      n_are_nulls_smallest.transform_if_else(cudf::null_order::BEFORE, cudf::null_order::AFTER);
+      std::vector<cudf::null_order> null_order =
+        n_are_nulls_smallest.transform_if_else(cudf::null_order::BEFORE, cudf::null_order::AFTER);
 
-    std::vector<cudf::column_view> sort_keys = n_sort_keys_columns.get_dereferenced();
-    auto sorted_col = cudf::sorted_order(cudf::table_view{sort_keys}, order, null_order);
+      std::vector<cudf::column_view> sort_keys = n_sort_keys_columns.get_dereferenced();
+      auto sorted_col = cudf::sorted_order(cudf::table_view{sort_keys}, order, null_order);
 
-    auto const input_table = reinterpret_cast<cudf::table_view const*>(j_input_table);
-    return convert_table_for_return(env, cudf::gather(*input_table, sorted_col->view()));
+      auto const input_table = reinterpret_cast<cudf::table_view const*>(j_input_table);
+      return convert_table_for_return(env, cudf::gather(*input_table, sorted_col->view()));
+    }
+
+    CPPTRACE_CATCH(const std::exception& e)
+    {
+      print_base_address();
+
+      std::cout << "Exception: " << e.what() << std::endl;
+      std::cerr << "Exception: " << e.what() << std::endl;
+      std::osyncstream sync_out(std::cout);
+      std::osyncstream sync_err(std::cerr);
+      formatter.print(sync_out, cpptrace::from_current_exception());
+      formatter.print(sync_err, cpptrace::from_current_exception());
+
+      fflush(stderr);
+      fflush(stdout);
+      throw;
+    }
   }
   CATCH_STD(env, NULL);
 }
@@ -3699,20 +3767,38 @@ JNIEXPORT jlongArray JNICALL Java_ai_rapids_cudf_Table_partition(JNIEnv* env,
   JNI_ARG_CHECK(env, number_of_partitions > 0, "number_of_partitions is zero", NULL);
 
   try {
-    cudf::jni::auto_set_device(env);
-    auto const n_input_table = reinterpret_cast<cudf::table_view const*>(input_table);
-    auto const n_part_column = reinterpret_cast<cudf::column_view const*>(partition_column);
+    CPPTRACE_TRY
+    {
+      cudf::jni::auto_set_device(env);
+      auto const n_input_table = reinterpret_cast<cudf::table_view const*>(input_table);
+      auto const n_part_column = reinterpret_cast<cudf::column_view const*>(partition_column);
 
-    auto [partitioned_table, partition_offsets] =
-      cudf::partition(*n_input_table, *n_part_column, number_of_partitions);
+      auto [partitioned_table, partition_offsets] =
+        cudf::partition(*n_input_table, *n_part_column, number_of_partitions);
 
-    // for what ever reason partition returns the length of the result at then
-    // end and hash partition/round robin do not, so skip the last entry for
-    // consistency
-    cudf::jni::native_jintArray n_output_offsets(env, output_offsets);
-    std::copy(partition_offsets.begin(), partition_offsets.end() - 1, n_output_offsets.begin());
+      // for what ever reason partition returns the length of the result at then
+      // end and hash partition/round robin do not, so skip the last entry for
+      // consistency
+      cudf::jni::native_jintArray n_output_offsets(env, output_offsets);
+      std::copy(partition_offsets.begin(), partition_offsets.end() - 1, n_output_offsets.begin());
 
-    return convert_table_for_return(env, partitioned_table);
+      return convert_table_for_return(env, partitioned_table);
+    }
+    CPPTRACE_CATCH(const std::exception& e)
+    {
+      print_base_address();
+
+      std::cout << "Exception: " << e.what() << std::endl;
+      std::cerr << "Exception: " << e.what() << std::endl;
+      std::osyncstream sync_out(std::cout);
+      std::osyncstream sync_err(std::cerr);
+      formatter.print(sync_out, cpptrace::from_current_exception());
+      formatter.print(sync_err, cpptrace::from_current_exception());
+
+      fflush(stderr);
+      fflush(stdout);
+      throw;
+    }
   }
   CATCH_STD(env, NULL);
 }
@@ -3798,64 +3884,85 @@ Java_ai_rapids_cudf_Table_groupByAggregate(JNIEnv* env,
   JNI_NULL_CHECK(env, agg_instances, "agg_instances are null", NULL);
 
   try {
-    cudf::jni::auto_set_device(env);
-    cudf::table_view* n_input_table = reinterpret_cast<cudf::table_view*>(input_table);
-    cudf::jni::native_jintArray n_keys(env, keys);
-    cudf::jni::native_jintArray n_values(env, aggregate_column_indices);
-    cudf::jni::native_jpointerArray<cudf::aggregation> n_agg_instances(env, agg_instances);
-    std::vector<cudf::column_view> n_keys_cols;
-    n_keys_cols.reserve(n_keys.size());
-    for (int i = 0; i < n_keys.size(); i++) {
-      n_keys_cols.push_back(n_input_table->column(n_keys[i]));
-    }
-
-    cudf::table_view n_keys_table(n_keys_cols);
-    auto column_order    = cudf::jni::resolve_column_order(env, jkeys_sort_desc, n_keys.size());
-    auto null_precedence = cudf::jni::resolve_null_precedence(env, jkeys_null_first, n_keys.size());
-    cudf::groupby::groupby grouper(
-      n_keys_table,
-      ignore_null_keys ? cudf::null_policy::EXCLUDE : cudf::null_policy::INCLUDE,
-      jkey_sorted ? cudf::sorted::YES : cudf::sorted::NO,
-      column_order,
-      null_precedence);
-
-    // Aggregates are passed in already grouped by column, so we just need to fill it in
-    // as we go.
-    std::vector<cudf::groupby::aggregation_request> requests;
-
-    int previous_index = -1;
-    for (int i = 0; i < n_values.size(); i++) {
-      cudf::groupby::aggregation_request req;
-      int col_index = n_values[i];
-
-      cudf::groupby_aggregation* agg = dynamic_cast<cudf::groupby_aggregation*>(n_agg_instances[i]);
-      JNI_ARG_CHECK(
-        env, agg != nullptr, "aggregation is not an instance of groupby_aggregation", nullptr);
-      std::unique_ptr<cudf::groupby_aggregation> cloned(
-        dynamic_cast<cudf::groupby_aggregation*>(agg->clone().release()));
-
-      if (col_index == previous_index) {
-        requests.back().aggregations.push_back(std::move(cloned));
-      } else {
-        req.values = n_input_table->column(col_index);
-        req.aggregations.push_back(std::move(cloned));
-        requests.push_back(std::move(req));
+    CPPTRACE_TRY
+    {
+      cudf::jni::auto_set_device(env);
+      cudf::table_view* n_input_table = reinterpret_cast<cudf::table_view*>(input_table);
+      cudf::jni::native_jintArray n_keys(env, keys);
+      cudf::jni::native_jintArray n_values(env, aggregate_column_indices);
+      cudf::jni::native_jpointerArray<cudf::aggregation> n_agg_instances(env, agg_instances);
+      std::vector<cudf::column_view> n_keys_cols;
+      n_keys_cols.reserve(n_keys.size());
+      for (int i = 0; i < n_keys.size(); i++) {
+        n_keys_cols.push_back(n_input_table->column(n_keys[i]));
       }
-      previous_index = col_index;
-    }
 
-    std::pair<std::unique_ptr<cudf::table>, std::vector<cudf::groupby::aggregation_result>> result =
-      grouper.aggregate(requests);
+      cudf::table_view n_keys_table(n_keys_cols);
+      auto column_order = cudf::jni::resolve_column_order(env, jkeys_sort_desc, n_keys.size());
+      auto null_precedence =
+        cudf::jni::resolve_null_precedence(env, jkeys_null_first, n_keys.size());
+      cudf::groupby::groupby grouper(
+        n_keys_table,
+        ignore_null_keys ? cudf::null_policy::EXCLUDE : cudf::null_policy::INCLUDE,
+        jkey_sorted ? cudf::sorted::YES : cudf::sorted::NO,
+        column_order,
+        null_precedence);
 
-    std::vector<std::unique_ptr<cudf::column>> result_columns;
-    int agg_result_size = result.second.size();
-    for (int agg_result_index = 0; agg_result_index < agg_result_size; agg_result_index++) {
-      int col_agg_size = result.second[agg_result_index].results.size();
-      for (int col_agg_index = 0; col_agg_index < col_agg_size; col_agg_index++) {
-        result_columns.push_back(std::move(result.second[agg_result_index].results[col_agg_index]));
+      // Aggregates are passed in already grouped by column, so we just need to fill it in
+      // as we go.
+      std::vector<cudf::groupby::aggregation_request> requests;
+
+      int previous_index = -1;
+      for (int i = 0; i < n_values.size(); i++) {
+        cudf::groupby::aggregation_request req;
+        int col_index = n_values[i];
+
+        cudf::groupby_aggregation* agg =
+          dynamic_cast<cudf::groupby_aggregation*>(n_agg_instances[i]);
+        JNI_ARG_CHECK(
+          env, agg != nullptr, "aggregation is not an instance of groupby_aggregation", nullptr);
+        std::unique_ptr<cudf::groupby_aggregation> cloned(
+          dynamic_cast<cudf::groupby_aggregation*>(agg->clone().release()));
+
+        if (col_index == previous_index) {
+          requests.back().aggregations.push_back(std::move(cloned));
+        } else {
+          req.values = n_input_table->column(col_index);
+          req.aggregations.push_back(std::move(cloned));
+          requests.push_back(std::move(req));
+        }
+        previous_index = col_index;
       }
+
+      std::pair<std::unique_ptr<cudf::table>, std::vector<cudf::groupby::aggregation_result>>
+        result = grouper.aggregate(requests);
+
+      std::vector<std::unique_ptr<cudf::column>> result_columns;
+      int agg_result_size = result.second.size();
+      for (int agg_result_index = 0; agg_result_index < agg_result_size; agg_result_index++) {
+        int col_agg_size = result.second[agg_result_index].results.size();
+        for (int col_agg_index = 0; col_agg_index < col_agg_size; col_agg_index++) {
+          result_columns.push_back(
+            std::move(result.second[agg_result_index].results[col_agg_index]));
+        }
+      }
+      return convert_table_for_return(env, result.first, std::move(result_columns));
     }
-    return convert_table_for_return(env, result.first, std::move(result_columns));
+    CPPTRACE_CATCH(const std::exception& e)
+    {
+      print_base_address();
+
+      std::cout << "Exception: " << e.what() << std::endl;
+      std::cerr << "Exception: " << e.what() << std::endl;
+      std::osyncstream sync_out(std::cout);
+      std::osyncstream sync_err(std::cerr);
+      formatter.print(sync_out, cpptrace::from_current_exception());
+      formatter.print(sync_err, cpptrace::from_current_exception());
+
+      fflush(stderr);
+      fflush(stdout);
+      throw;
+    }
   }
   CATCH_STD(env, NULL);
 }
