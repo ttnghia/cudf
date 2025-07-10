@@ -336,6 +336,17 @@ std::pair<bool, std::future<void>> reader::impl::read_column_chunks()
                                    _stream)};
 }
 
+namespace {
+__attribute__((noinline)) void sync_stream_1(rmm::cuda_stream_view stream) { stream.synchronize(); }
+
+__attribute__((noinline)) void sync_stream_2(rmm::cuda_stream_view stream) { stream.synchronize(); }
+
+__attribute__((noinline)) void sync_stream_3(rmm::cuda_stream_view stream) { stream.synchronize(); }
+
+__attribute__((noinline)) void sync_stream_4(rmm::cuda_stream_view stream) { stream.synchronize(); }
+
+}  // namespace
+
 void reader::impl::read_compressed_data()
 {
   auto& pass = *_pass_itm_data;
@@ -350,14 +361,22 @@ void reader::impl::read_compressed_data()
 
   read_chunks_tasks.wait();
 
+  sync_stream_2(_stream);
+
   // Process dataset chunk pages into output columns
   auto const total_pages = _has_page_index ? count_page_headers_with_pgidx(chunks, _stream)
                                            : count_page_headers(chunks, _stream);
   if (total_pages <= 0) { return; }
+
+  sync_stream_3(_stream);
+
   rmm::device_uvector<PageInfo> unsorted_pages(total_pages, _stream);
 
   // decoding of column/page information
   decode_page_headers(pass, unsorted_pages, _has_page_index, _stream);
+
+  sync_stream_4(_stream);
+
   CUDF_EXPECTS(pass.page_offsets.size() - 1 == static_cast<size_t>(_input_columns.size()),
                "Encountered page_offsets / num_columns mismatch");
 }
@@ -391,6 +410,8 @@ void reader::impl::preprocess_file(read_mode mode)
                                  _expr_conv.get_converted_expr(),
                                  _stream);
 
+  sync_stream_1(_stream);
+
   // Inclusive scan the number of rows per source
   if (not _expr_conv.get_converted_expr().has_value() and mode == read_mode::CHUNKED_READ) {
     _file_itm_data.exclusive_sum_num_rows_per_source.resize(
@@ -409,7 +430,12 @@ void reader::impl::preprocess_file(read_mode mode)
       not _input_columns.empty()) {
     // fills in chunk information without physically loading or decompressing
     // the associated data
+
+    sync_stream_2(_stream);
+
     create_global_chunk_info();
+
+    sync_stream_3(_stream);
 
     // compute schedule of input reads.
     compute_input_passes();

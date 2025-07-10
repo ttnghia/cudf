@@ -583,8 +583,16 @@ reader::impl::impl(std::size_t chunk_read_limit,
   _expr_conv = named_to_reference_converter(options.get_filter(), metadata);
 }
 
+namespace {
+__attribute__((noinline)) void sync_stream_1(rmm::cuda_stream_view stream) { stream.synchronize(); }
+
+__attribute__((noinline)) void sync_stream_2(rmm::cuda_stream_view stream) { stream.synchronize(); }
+}  // namespace
+
 void reader::impl::prepare_data(read_mode mode)
 {
+  sync_stream_1(_stream);
+
   // if we have not preprocessed at the whole-file level, do that now
   if (!_file_preprocessed) {
     // setup file level information
@@ -596,7 +604,10 @@ void reader::impl::prepare_data(read_mode mode)
 
   // handle any chunking work (ratcheting through the subpasses and chunks within
   // our current pass) if in bounds
-  if (_file_itm_data._current_input_pass < _file_itm_data.num_passes()) { handle_chunking(mode); }
+  if (_file_itm_data._current_input_pass < _file_itm_data.num_passes()) {
+    sync_stream_2(_stream);
+    handle_chunking(mode);
+  }
 }
 
 void reader::impl::populate_metadata(table_metadata& out_metadata)

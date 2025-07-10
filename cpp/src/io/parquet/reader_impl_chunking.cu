@@ -48,6 +48,16 @@ constexpr size_t minimum_subpass_expected_size = 200 * 1024 * 1024;
 // data vs uncompressed data.
 constexpr float input_limit_compression_reserve = 0.3f;
 
+__attribute__((noinline)) void sync_stream_1(rmm::cuda_stream_view stream) { stream.synchronize(); }
+
+__attribute__((noinline)) void sync_stream_2(rmm::cuda_stream_view stream) { stream.synchronize(); }
+
+__attribute__((noinline)) void sync_stream_3(rmm::cuda_stream_view stream) { stream.synchronize(); }
+
+__attribute__((noinline)) void sync_stream_4(rmm::cuda_stream_view stream) { stream.synchronize(); }
+
+__attribute__((noinline)) void sync_stream_5(rmm::cuda_stream_view stream) { stream.synchronize(); }
+
 }  // namespace
 
 void reader::impl::handle_chunking(read_mode mode)
@@ -57,6 +67,8 @@ void reader::impl::handle_chunking(read_mode mode)
     // setup the next pass
     setup_next_pass(mode);
   }
+
+  sync_stream_1(_stream);
 
   auto& pass = *_pass_itm_data;
 
@@ -73,6 +85,8 @@ void reader::impl::handle_chunking(read_mode mode)
     // release the old subpass (will free memory)
     pass.subpass.reset();
 
+    sync_stream_2(_stream);
+
     // otherwise we are done with the pass entirely
     if (pass.processed_rows == pass.num_rows) {
       // release the old pass
@@ -82,11 +96,13 @@ void reader::impl::handle_chunking(read_mode mode)
       // no more passes. we are absolutely done with this file.
       if (_file_itm_data._current_input_pass == _file_itm_data.num_passes()) { return; }
 
+      sync_stream_3(_stream);
       // setup the next pass
       setup_next_pass(mode);
     }
   }
 
+  sync_stream_4(_stream);
   // setup the next sub pass
   setup_next_subpass(mode);
 }
@@ -123,6 +139,8 @@ void reader::impl::setup_next_pass(read_mode mode)
     auto chunk_start = _file_itm_data.chunks.begin() + (row_group_start * chunks_per_rowgroup);
     auto chunk_end   = _file_itm_data.chunks.begin() + (row_group_end * chunks_per_rowgroup);
 
+    sync_stream_1(_stream);
+
     pass.chunks = cudf::detail::hostdevice_vector<ColumnChunkDesc>(num_chunks, _stream);
     std::copy(chunk_start, chunk_end, pass.chunks.begin());
 
@@ -149,9 +167,12 @@ void reader::impl::setup_next_pass(read_mode mode)
       pass.num_rows = pass_end_row - pass_start_row;
     }
 
+    sync_stream_2(_stream);
     // load page information for the chunk. this retrieves the compressed bytes for all the
     // pages, and their headers (which we can access without decompressing)
     read_compressed_data();
+
+    sync_stream_3(_stream);
 
     // detect malformed columns.
     // - we have seen some cases in the wild where we have a row group containing N
@@ -164,6 +185,8 @@ void reader::impl::setup_next_pass(read_mode mode)
       pass.chunks,
       uses_custom_row_bounds(mode) ? std::nullopt : std::make_optional(pass.num_rows),
       _stream);
+
+    sync_stream_4(_stream);
 
     // Get the decompressed size of dictionary pages to help estimate memory usage
     auto const decomp_dict_data_size = std::accumulate(
@@ -183,6 +206,8 @@ void reader::impl::setup_next_pass(read_mode mode)
     pass.base_mem_size =
       decomp_dict_data_size +
       thrust::reduce(rmm::exec_policy(_stream), chunk_iter, chunk_iter + pass.chunks.size());
+
+    sync_stream_5(_stream);
 
     // if we are doing subpass reading, generate more accurate num_row estimates for list columns.
     // this helps us to generate more accurate subpass splits.
