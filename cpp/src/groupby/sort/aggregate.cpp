@@ -104,6 +104,7 @@ struct aggregate_result_functor final : store_result_functor {
 template <>
 void aggregate_result_functor::operator()<aggregation::COUNT_VALID>(aggregation const& agg)
 {
+  cudf::scoped_range ragg{"aggregation::COUNT_VALID"};
   if (cache.has_result(values, agg)) return;
 
   cache.add_result(
@@ -119,6 +120,7 @@ void aggregate_result_functor::operator()<aggregation::COUNT_VALID>(aggregation 
 template <>
 void aggregate_result_functor::operator()<aggregation::COUNT_ALL>(aggregation const& agg)
 {
+  cudf::scoped_range ragg{"aggregation::COUNT_ALL"};
   if (cache.has_result(values, agg)) return;
 
   cache.add_result(
@@ -142,6 +144,7 @@ void aggregate_result_functor::operator()<aggregation::HISTOGRAM>(aggregation co
 template <>
 void aggregate_result_functor::operator()<aggregation::SUM>(aggregation const& agg)
 {
+  cudf::scoped_range ragg{"aggregation::SUM"};
   if (cache.has_result(values, agg)) return;
 
   cache.add_result(
@@ -274,6 +277,7 @@ void aggregate_result_functor::operator()<aggregation::MAX>(aggregation const& a
 template <>
 void aggregate_result_functor::operator()<aggregation::MEAN>(aggregation const& agg)
 {
+  cudf::scoped_range ragg{"aggregation::MEAN"};
   if (cache.has_result(values, agg)) return;
 
   auto sum_agg   = make_sum_aggregation();
