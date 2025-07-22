@@ -19,6 +19,7 @@
 #include <cudf/column/column_view.hpp>
 #include <cudf/detail/aggregation/aggregation.hpp>
 #include <cudf/detail/null_mask.hpp>
+#include <cudf/detail/nvtx/ranges.hpp>
 #include <cudf/dictionary/detail/iterator.cuh>
 #include <cudf/dictionary/dictionary_column_view.hpp>
 #include <cudf/utilities/memory_resource.hpp>
@@ -122,8 +123,7 @@ struct m2_functor {
   }
 
   template <typename T, typename... Args>
-  std::unique_ptr<column> operator()(Args&&...)
-    requires(!std::is_arithmetic_v<T>)
+  std::unique_ptr<column> operator()(Args&&...) requires(!std::is_arithmetic_v<T>)
   {
     CUDF_FAIL("Only numeric types are supported in M2 groupby aggregation");
   }
@@ -137,6 +137,7 @@ std::unique_ptr<column> group_m2(column_view const& values,
                                  rmm::cuda_stream_view stream,
                                  rmm::device_async_resource_ref mr)
 {
+  CUDF_FUNC_RANGE();
   auto values_type = cudf::is_dictionary(values.type())
                        ? dictionary_column_view(values).keys().type()
                        : values.type();
