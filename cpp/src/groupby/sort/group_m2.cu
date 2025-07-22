@@ -138,6 +138,7 @@ std::unique_ptr<column> group_m2(column_view const& values,
                                  rmm::device_async_resource_ref mr)
 {
   CUDF_FUNC_RANGE();
+
   auto values_type = cudf::is_dictionary(values.type())
                        ? dictionary_column_view(values).keys().type()
                        : values.type();

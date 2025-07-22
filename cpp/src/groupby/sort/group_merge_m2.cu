@@ -16,6 +16,7 @@
 
 #include <cudf/column/column_factories.hpp>
 #include <cudf/detail/aggregation/aggregation.hpp>
+#include <cudf/detail/nvtx/ranges.hpp>
 #include <cudf/detail/valid_if.cuh>
 #include <cudf/structs/structs_column_view.hpp>
 #include <cudf/utilities/span.hpp>
@@ -136,6 +137,8 @@ std::unique_ptr<column> group_merge_m2(column_view const& values,
                                        rmm::cuda_stream_view stream,
                                        rmm::device_async_resource_ref mr)
 {
+  CUDF_FUNC_RANGE();
+
   CUDF_EXPECTS(values.type().id() == type_id::STRUCT,
                "Input to `group_merge_m2` must be a structs column.");
   CUDF_EXPECTS(values.num_children() == 3,
