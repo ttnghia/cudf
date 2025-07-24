@@ -31,6 +31,7 @@
 #include <cudf/detail/scatter.hpp>
 #include <cudf/detail/sequence.hpp>
 #include <cudf/detail/sorting.hpp>
+#include <cudf/detail/utilities/vector_factories.hpp>
 #include <cudf/strings/string_view.hpp>
 #include <cudf/table/experimental/row_operators.cuh>
 #include <cudf/table/table_device_view.cuh>
@@ -357,7 +358,7 @@ void sort_groupby_helper::compute_arrange_map(Equal const& d_row_equal,
     cudf::detail::cuco_allocator<char>{rmm::mr::polymorphic_allocator<char>{}, stream},
     stream.value()};
 
-  auto counts        = rmm::device_uvector<size_type>(num_keys, stream);
+  auto counts        = rmm::device_uvector<size_type>(num_keys + 1, stream);
   auto key_indices   = rmm::device_uvector<size_type>(num_keys, stream);
   auto local_indices = rmm::device_uvector<size_type>(num_keys, stream);
   thrust::uninitialized_fill(rmm::exec_policy_nosync(stream), counts.begin(), counts.end(), 0);
@@ -378,18 +379,34 @@ void sort_groupby_helper::compute_arrange_map(Equal const& d_row_equal,
       local_indices[idx]   = local_idx;
     });
 
-  auto unique_key_indices = rmm::device_uvector<size_type>(num_keys, stream);
-  auto const keys_end     = set.retrieve_all(unique_key_indices.begin(), stream.value());
-  unique_key_indices.resize(std::distance(unique_key_indices.begin(), keys_end), stream);
+  auto h_counts = cudf::detail::make_std_vector(counts, stream);
+  printf("h_counts: \n");
+  for (auto i : h_counts) {
+    printf("%d, ", i);
+  }
+  printf("\n\n\n");
 
-  auto offsets = rmm::device_uvector<size_type>(unique_key_indices.size() + 1, stream);
-  thrust::transform(rmm::exec_policy_nosync(stream),
-                    unique_key_indices.begin(),
-                    unique_key_indices.end(),
-                    offsets.begin(),
-                    [counts = counts.begin()] __device__(auto const idx) { return counts[idx]; });
+  auto h_key_indices = cudf::detail::make_std_vector(key_indices, stream);
+  printf("key_indices: \n");
+  for (auto i : h_key_indices) {
+    printf("%d, ", i);
+  }
+  printf("\n\n\n");
+  auto h_local_indices = cudf::detail::make_std_vector(local_indices, stream);
+  printf("local_indices: \n");
+  for (auto i : h_local_indices) {
+    printf("%d, ", i);
+  }
+  printf("\n\n\n");
+
   thrust::exclusive_scan(
-    rmm::exec_policy_nosync(stream), offsets.begin(), offsets.end(), offsets.begin());
+    rmm::exec_policy_nosync(stream), counts.begin(), counts.end(), counts.begin());
+  auto h_offsets = cudf::detail::make_std_vector(counts, stream);
+  printf("h_offsets: \n");
+  for (auto i : h_offsets) {
+    printf("%d, ", i);
+  }
+  printf("\n\n\n");
 
   _key_arranged_map = std::make_unique<index_vector>(num_keys, stream);
   thrust::for_each(rmm::exec_policy_nosync(stream),
@@ -398,7 +415,7 @@ void sort_groupby_helper::compute_arrange_map(Equal const& d_row_equal,
                    [arranged_map  = _key_arranged_map->begin(),
                     key_indices   = key_indices.begin(),
                     local_indices = local_indices.begin(),
-                    offsets       = offsets.begin()] __device__(size_type const idx) {
+                    offsets       = counts.begin()] __device__(size_type const idx) {
                      auto const offset        = offsets[key_indices[idx]];
                      auto const global_idx    = offset + local_indices[idx];
                      arranged_map[global_idx] = idx;
