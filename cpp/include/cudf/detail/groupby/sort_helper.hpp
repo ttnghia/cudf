@@ -121,7 +121,8 @@ struct sort_groupby_helper {
   /**
    * @brief Get the number of groups in `keys`
    */
-  size_type num_groups(rmm::cuda_stream_view stream) { return group_offsets(stream).size() - 1; }
+  size_type num_groups(
+    rmm::cuda_stream_view stream);  //  { return group_offsets(stream).size() - 1; }
 
   /**
    * @brief check if the groupby keys are presorted
@@ -180,7 +181,11 @@ struct sort_groupby_helper {
    */
   index_vector const& group_labels(rmm::cuda_stream_view stream);
 
+  device_span<size_type const> key_indices(rmm::cuda_stream_view stream);
+
   device_span<size_type const> key_arranged_map(rmm::cuda_stream_view stream);
+
+  void prepare_key_arranged_map(rmm::cuda_stream_view stream);
 
   template <typename Equal, typename Hash>
   void compute_arrange_map(Equal const& d_row_equal,
@@ -218,6 +223,10 @@ struct sort_groupby_helper {
    */
   column_view keys_bitmask_column(rmm::cuda_stream_view stream);
 
+  index_vector_ptr _key_gather_map;  ///< xxx
+  size_type _num_unique_keys;
+
+  index_vector_ptr _key_indices;       ///< Map from values to their row indices in `keys`
   index_vector_ptr _key_arranged_map;  ///< Map of indices to arrange `keys` together
   column_ptr _key_sorted_order;        ///< Indices to produce _keys in sorted order
   column_ptr _unsorted_keys_labels;    ///< Group labels for unsorted _keys

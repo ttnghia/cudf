@@ -308,9 +308,18 @@ void aggregate_result_functor::operator()<aggregation::M2>(aggregation const& ag
 {
   if (cache.has_result(values, agg)) return;
 
-  auto const mean_agg = make_mean_aggregation();
-  operator()<aggregation::MEAN>(*mean_agg);
-  auto const mean_result = cache.get_result(values, *mean_agg);
+  cache.add_result(values,
+                   agg,
+                   detail::group_m2_new(values,
+                                        helper.key_indices(stream),
+                                        helper.key_arranged_map(stream),
+                                        helper.num_groups(stream),
+                                        stream,
+                                        mr));
+
+  //  auto const mean_agg = make_mean_aggregation();
+  //  operator()<aggregation::MEAN>(*mean_agg);
+  //  auto const mean_result = cache.get_result(values, *mean_agg);
 
   //  auto const map = helper.key_arranged_map(stream);
   //  auto h_m       = cudf::detail::make_std_vector(map, stream);
@@ -328,10 +337,11 @@ void aggregate_result_functor::operator()<aggregation::M2>(aggregation const& ag
   //      bug.");
   //  }
 
-  cache.add_result(
-    values,
-    agg,
-    detail::group_m2(get_grouped_values(), mean_result, helper.group_labels(stream), stream, mr));
+  //  cache.add_result(
+  //    values,
+  //    agg,
+  //    detail::group_m2(get_grouped_values(), mean_result, helper.group_labels(stream), stream,
+  //    mr));
 }
 
 template <>

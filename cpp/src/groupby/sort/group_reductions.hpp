@@ -269,6 +269,13 @@ std::unique_ptr<column> group_m2(column_view const& values,
                                  rmm::cuda_stream_view stream,
                                  rmm::device_async_resource_ref mr);
 
+std::unique_ptr<column> group_m2_new(column_view const& values,
+                                     cudf::device_span<size_type const> key_indices,
+                                     cudf::device_span<size_type const> key_arranged_map,
+                                     cudf::size_type num_groups,
+                                     rmm::cuda_stream_view stream,
+                                     rmm::device_async_resource_ref mr);
+
 /**
  * @brief Internal API to calculate groupwise variance
  *
