@@ -379,34 +379,35 @@ void sort_groupby_helper::compute_arrange_map(Equal const& d_row_equal,
       local_indices[idx]   = local_idx;
     });
 
-  auto h_counts = cudf::detail::make_std_vector(counts, stream);
-  printf("h_counts: \n");
-  for (auto i : h_counts) {
-    printf("%d, ", i);
-  }
-  printf("\n\n\n");
-
-  auto h_key_indices = cudf::detail::make_std_vector(key_indices, stream);
-  printf("key_indices: \n");
-  for (auto i : h_key_indices) {
-    printf("%d, ", i);
-  }
-  printf("\n\n\n");
-  auto h_local_indices = cudf::detail::make_std_vector(local_indices, stream);
-  printf("local_indices: \n");
-  for (auto i : h_local_indices) {
-    printf("%d, ", i);
-  }
-  printf("\n\n\n");
+  //  auto h_counts = cudf::detail::make_std_vector(counts, stream);
+  //  printf("h_counts: \n");
+  //  for (auto i : h_counts) {
+  //    printf("%d, ", i);
+  //  }
+  //  printf("\n\n\n");
+  //
+  //  auto h_key_indices = cudf::detail::make_std_vector(key_indices, stream);
+  //  printf("key_indices: \n");
+  //  for (auto i : h_key_indices) {
+  //    printf("%d, ", i);
+  //  }
+  //  printf("\n\n\n");
+  //  auto h_local_indices = cudf::detail::make_std_vector(local_indices, stream);
+  //  printf("local_indices: \n");
+  //  for (auto i : h_local_indices) {
+  //    printf("%d, ", i);
+  //  }
+  //  printf("\n\n\n");
 
   thrust::exclusive_scan(
     rmm::exec_policy_nosync(stream), counts.begin(), counts.end(), counts.begin());
-  auto h_offsets = cudf::detail::make_std_vector(counts, stream);
-  printf("h_offsets: \n");
-  for (auto i : h_offsets) {
-    printf("%d, ", i);
-  }
-  printf("\n\n\n");
+
+  //  auto h_offsets = cudf::detail::make_std_vector(counts, stream);
+  //  printf("h_offsets: \n");
+  //  for (auto i : h_offsets) {
+  //    printf("%d, ", i);
+  //  }
+  //  printf("\n\n\n");
 
   _key_arranged_map = std::make_unique<index_vector>(num_keys, stream);
   thrust::for_each(rmm::exec_policy_nosync(stream),

@@ -312,20 +312,21 @@ void aggregate_result_functor::operator()<aggregation::M2>(aggregation const& ag
   operator()<aggregation::MEAN>(*mean_agg);
   auto const mean_result = cache.get_result(values, *mean_agg);
 
-  auto const map = helper.key_arranged_map(stream);
-  auto h_m       = cudf::detail::make_std_vector(map, stream);
-  printf("map: \n");
-  std::set<int> s;
-  for (auto i : h_m) {
-    printf("%d, ", i);
-    s.insert(i);
-  }
-  printf("\n\n\n");
-  printf("map size: %d, set size: %d\n", (int)h_m.size(), (int)s.size());
-  if (h_m.size() != s.size()) {
-    throw cudf::logic_error(
-      "The key-arranged map for groupby is not unique. This is unexpected and indicates a bug.");
-  }
+  //  auto const map = helper.key_arranged_map(stream);
+  //  auto h_m       = cudf::detail::make_std_vector(map, stream);
+  //  printf("map: \n");
+  //  std::set<int> s;
+  //  for (auto i : h_m) {
+  //    printf("%d, ", i);
+  //    s.insert(i);
+  //  }
+  //  printf("\n\n\n");
+  //  printf("map size: %d, set size: %d\n", (int)h_m.size(), (int)s.size());
+  //  if (h_m.size() != s.size()) {
+  //    throw cudf::logic_error(
+  //      "The key-arranged map for groupby is not unique. This is unexpected and indicates a
+  //      bug.");
+  //  }
 
   cache.add_result(
     values,
