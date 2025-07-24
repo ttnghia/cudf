@@ -183,6 +183,8 @@ struct sort_groupby_helper {
 
   device_span<size_type const> key_indices(rmm::cuda_stream_view stream);
 
+  device_span<size_type const> unique_key_indices(rmm::cuda_stream_view stream);
+
   device_span<size_type const> key_arranged_map(rmm::cuda_stream_view stream);
 
   void prepare_key_arranged_map(rmm::cuda_stream_view stream);
@@ -226,12 +228,13 @@ struct sort_groupby_helper {
   index_vector_ptr _key_gather_map;  ///< xxx
   size_type _num_unique_keys;
 
-  index_vector_ptr _key_indices;       ///< Map from values to their row indices in `keys`
-  index_vector_ptr _key_arranged_map;  ///< Map of indices to arrange `keys` together
-  column_ptr _key_sorted_order;        ///< Indices to produce _keys in sorted order
-  column_ptr _unsorted_keys_labels;    ///< Group labels for unsorted _keys
-  column_ptr _keys_bitmask_column;     ///< Column representing rows with one or more nulls values
-  table_view _keys;                    ///< Input keys to sort by
+  index_vector_ptr _unique_key_indices;  ///< Map from values to row indices in the unique `keys`
+  index_vector_ptr _key_indices;         ///< Map from values to row indices in input `keys`
+  index_vector_ptr _key_arranged_map;    ///< Map of indices to arrange `keys` together
+  column_ptr _key_sorted_order;          ///< Indices to produce _keys in sorted order
+  column_ptr _unsorted_keys_labels;      ///< Group labels for unsorted _keys
+  column_ptr _keys_bitmask_column;       ///< Column representing rows with one or more nulls values
+  table_view _keys;                      ///< Input keys to sort by
 
   index_vector_ptr
     _group_offsets;  ///< Indices into sorted _keys indicating starting index of each groups

@@ -131,50 +131,36 @@ struct m2_functor {
 };
 
 template <typename InputType, typename ResultType>
-struct m2_transform_new {
-  InputType const* values_iter;
-  ResultType const* d_means;
-  size_type const* d_group_labels;
-
-  __device__ ResultType operator()(size_type const idx) const noexcept
-  {
-    auto const x         = static_cast<ResultType>(values_iter[idx]);
-    auto const group_idx = d_group_labels[idx];
-    auto const mean      = d_means[group_idx];
-    auto const diff      = x - mean;
-    return diff * diff;
-  }
-};
-
-template <typename InputType, typename ResultType>
-void compute_m2_fn_new(rmm::device_uvector<InputType> const& values,
-                       rmm::device_uvector<size_type> const& group_labels,
+void compute_m2_fn_new(InputType const* values,
+                       cudf::device_span<size_type const> unique_key_indices,
                        ResultType const* d_means,
                        ResultType* d_result,
                        rmm::cuda_stream_view stream)
 {
-  auto m2_fn =
-    m2_transform_new<InputType, ResultType>{values.begin(), d_means, group_labels.data()};
   auto const itr = thrust::counting_iterator<size_type>(0);
-  // Using a temporary buffer for intermediate transform results instead of
-  // using the transform-iterator directly in thrust::reduce_by_key
-  // improves compile-time significantly.
-  auto m2_vals = rmm::device_uvector<ResultType>(values.size(), stream);
-  thrust::transform(rmm::exec_policy(stream), itr, itr + values.size(), m2_vals.begin(), m2_fn);
+  thrust::for_each(rmm::exec_policy_nosync(stream),
+                   itr,
+                   itr + static_cast<size_type>(unique_key_indices.size()),
+                   [d_result, d_means, key_indices = unique_key_indices.begin(), values] __device__(
+                     size_type idx) {
+                     auto const x         = static_cast<ResultType>(values[idx]);
+                     auto const group_idx = key_indices[idx];
+                     auto const mean      = d_means[group_idx];
+                     auto const diff      = x - mean;
+                     auto const d2        = diff * diff;
 
-  thrust::reduce_by_key(rmm::exec_policy_nosync(stream),
-                        group_labels.begin(),
-                        group_labels.end(),
-                        m2_vals.begin(),
-                        thrust::make_discard_iterator(),
-                        d_result);
+                     auto ref = cuda::atomic_ref<ResultType, cuda::thread_scope_device>{
+                       d_result[key_indices[idx]]};
+                     ref.fetch_add(d2, cuda::memory_order_relaxed);
+                   });
+
   stream.synchronize();
 }
 
 struct m2_functor_new {
   template <typename T>
   std::unique_ptr<column> operator()(column_view const& values,
-                                     cudf::device_span<size_type const> key_indices,
+                                     cudf::device_span<size_type const> unique_key_indices,
                                      cudf::device_span<size_type const> key_arranged_map,
                                      cudf::size_type num_groups,
                                      rmm::cuda_stream_view stream,
@@ -184,29 +170,32 @@ struct m2_functor_new {
     using result_type = cudf::detail::target_type_t<T, aggregation::Kind::M2>;
     auto result       = make_numeric_column(
       data_type(type_to_id<result_type>()), num_groups, mask_state::UNALLOCATED, stream, mr);
+    auto const rv = result->mutable_view();
+    thrust::uninitialized_fill(
+      rmm::exec_policy_nosync(stream), rv.begin<result_type>(), rv.end<result_type>(), 0.0);
 
     if (num_groups == 0) { return result; }
 
-    rmm::device_uvector<size_type> group_labels(values.size(), stream);
-    rmm::device_uvector<T> grouped_values(values.size(), stream);
-
-    {
-      cudf::scoped_range range{"gather value"};
-
-      thrust::for_each(rmm::exec_policy_nosync(stream),
-                       thrust::make_counting_iterator<size_type>(0),
-                       thrust::make_counting_iterator<size_type>(values.size()),
-                       [values           = values.begin<T>(),
-                        labels           = group_labels.begin(),
-                        grouped_values   = grouped_values.begin(),
-                        key_indices      = key_indices.begin(),
-                        key_arranged_map = key_arranged_map.begin()] __device__(size_type idx) {
-                         auto const grouped_idx = key_arranged_map[idx];
-                         labels[idx]            = key_indices[grouped_idx];
-                         grouped_values[idx]    = static_cast<T>(values[grouped_idx]);
-                       });
-      stream.synchronize();
-    }
+    //    rmm::device_uvector<size_type> group_labels(values.size(), stream);
+    //    rmm::device_uvector<T> grouped_values(values.size(), stream);
+    //    {
+    //      cudf::scoped_range range{"gather value"};
+    //
+    //      thrust::for_each(rmm::exec_policy_nosync(stream),
+    //                       thrust::make_counting_iterator<size_type>(0),
+    //                       thrust::make_counting_iterator<size_type>(values.size()),
+    //                       [values           = values.begin<T>(),
+    //                        labels           = group_labels.begin(),
+    //                        grouped_values   = grouped_values.begin(),
+    //                        key_indices      = key_indices.begin(),
+    //                        key_arranged_map = key_arranged_map.begin()] __device__(size_type idx)
+    //                        {
+    //                         auto const grouped_idx = key_arranged_map[idx];
+    //                         labels[idx]            = key_indices[grouped_idx];
+    //                         grouped_values[idx]    = static_cast<T>(values[grouped_idx]);
+    //                       });
+    //      stream.synchronize();
+    //    }
 
     //    auto h_l = cudf::detail::make_std_vector(group_labels, stream);
     //    printf("group_labels: \n");
@@ -230,24 +219,48 @@ struct m2_functor_new {
 
       {
         cudf::scoped_range range{"count"};
-        thrust::reduce_by_key(rmm::exec_policy_nosync(stream),
-                              group_labels.begin(),
-                              group_labels.end(),
-                              thrust::make_constant_iterator(1),
-                              thrust::make_discard_iterator(),
-                              count.begin());
+        //        thrust::reduce_by_key(rmm::exec_policy_nosync(stream),
+        //                              group_labels.begin(),
+        //                              group_labels.end(),
+        //                              thrust::make_constant_iterator(1),
+        //                              thrust::make_discard_iterator(),
+        //                              count.begin());
+        thrust::uninitialized_fill(rmm::exec_policy_nosync(stream), count.begin(), count.end(), 0);
+        thrust::for_each(rmm::exec_policy_nosync(stream),
+                         thrust::make_counting_iterator(0),
+                         thrust::make_counting_iterator(values.size()),
+                         [count       = count.begin(),
+                          key_indices = unique_key_indices.begin()] __device__(size_type idx) {
+                           auto ref = cuda::atomic_ref<int64_t, cuda::thread_scope_device>{
+                             count[key_indices[idx]]};
+                           ref.fetch_add(int64_t{1}, cuda::memory_order_relaxed);
+                         });
+
         stream.synchronize();
       }
       {
         cudf::scoped_range range{"sum"};
-        thrust::reduce_by_key(rmm::exec_policy_nosync(stream),
-                              group_labels.begin(),
-                              group_labels.end(),
-                              grouped_values.begin(),
-                              thrust::make_discard_iterator(),
-                              sum.begin(),
-                              cuda::std::equal_to{},
-                              cuda::std::plus<double>{});
+        thrust::uninitialized_fill(rmm::exec_policy_nosync(stream), sum.begin(), sum.end(), 0.0);
+
+        thrust::for_each(
+          rmm::exec_policy_nosync(stream),
+          thrust::make_counting_iterator(0),
+          thrust::make_counting_iterator(values.size()),
+          [values      = values.begin<T>(),
+           sum         = sum.begin(),
+           key_indices = unique_key_indices.begin()] __device__(size_type idx) {
+            auto ref = cuda::atomic_ref<double, cuda::thread_scope_device>{sum[key_indices[idx]]};
+            ref.fetch_add(values[idx], cuda::memory_order_relaxed);
+          });
+
+        //        thrust::reduce_by_key(rmm::exec_policy_nosync(stream),
+        //                              group_labels.begin(),
+        //                              group_labels.end(),
+        //                              grouped_values.begin(),
+        //                              thrust::make_discard_iterator(),
+        //                              sum.begin(),
+        //                              cuda::std::equal_to{},
+        //                              cuda::std::plus<double>{});
         stream.synchronize();
       }
       {
@@ -266,7 +279,7 @@ struct m2_functor_new {
 
     {
       cudf::scoped_range range{"comp m2"};
-      compute_m2_fn_new(grouped_values, group_labels, mean.begin(), d_result, stream);
+      compute_m2_fn_new(values.begin<T>(), unique_key_indices, mean.begin(), d_result, stream);
     }
     return result;
   }
@@ -297,7 +310,7 @@ std::unique_ptr<column> group_m2(column_view const& values,
 }
 
 std::unique_ptr<column> group_m2_new(column_view const& values,
-                                     cudf::device_span<size_type const> key_indices,
+                                     cudf::device_span<size_type const> unique_key_indices,
                                      cudf::device_span<size_type const> key_arranged_map,
                                      cudf::size_type num_groups,
                                      rmm::cuda_stream_view stream,
@@ -309,8 +322,14 @@ std::unique_ptr<column> group_m2_new(column_view const& values,
                        ? dictionary_column_view(values).keys().type()
                        : values.type();
 
-  return type_dispatcher(
-    values_type, m2_functor_new{}, values, key_indices, key_arranged_map, num_groups, stream, mr);
+  return type_dispatcher(values_type,
+                         m2_functor_new{},
+                         values,
+                         unique_key_indices,
+                         key_arranged_map,
+                         num_groups,
+                         stream,
+                         mr);
 }
 
 }  // namespace detail

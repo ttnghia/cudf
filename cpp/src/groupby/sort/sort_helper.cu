@@ -368,8 +368,9 @@ void sort_groupby_helper::compute_arrange_map(Equal const& d_row_equal,
     cudf::detail::cuco_allocator<char>{rmm::mr::polymorphic_allocator<char>{}, stream},
     stream.value()};
 
-  auto counts        = rmm::device_uvector<size_type>(num_keys + 1, stream);
-  _key_indices       = std::make_unique<index_vector>(num_keys, stream);
+  auto counts  = rmm::device_uvector<size_type>(num_keys + 1, stream);
+  _key_indices = std::make_unique<index_vector>(num_keys, stream);
+
   auto local_indices = rmm::device_uvector<size_type>(num_keys, stream);
   thrust::uninitialized_fill(rmm::exec_policy_nosync(stream), counts.begin(), counts.end(), 0);
 
@@ -412,6 +413,29 @@ void sort_groupby_helper::compute_arrange_map(Equal const& d_row_equal,
 
     stream.synchronize();
   }
+
+  _unique_key_indices = std::make_unique<index_vector>(num_keys, stream);
+  {
+    cudf::scoped_range range{"unique_key_indices"};
+    rmm::device_uvector<size_type> global_to_compact(num_keys, stream);
+    thrust::uninitialized_fill(
+      rmm::exec_policy_nosync(stream), global_to_compact.begin(), global_to_compact.end(), -1);
+    thrust::for_each(rmm::exec_policy_nosync(stream),
+                     thrust::make_counting_iterator(0),
+                     thrust::make_counting_iterator(_num_unique_keys),
+                     [global_to_compact = global_to_compact.begin(),
+                      key_gather_map = _key_gather_map->begin()] __device__(size_type const idx) {
+                       global_to_compact[key_gather_map[idx]] = idx;
+                     });
+
+    thrust::transform(rmm::exec_policy_nosync(stream),
+                      _key_indices->begin(),
+                      _key_indices->end(),
+                      _unique_key_indices->begin(),
+                      [global_to_compact = global_to_compact.begin()] __device__(
+                        size_type const idx) { return global_to_compact[idx]; });
+  }
+
   //  auto h_gm = cudf::detail::make_std_vector(*_key_gather_map, stream);
   //  printf("_key_gather_map (size: %d): \n", _num_unique_keys);
   //  for (auto i : h_gm) {
@@ -471,6 +495,12 @@ device_span<size_type const> sort_groupby_helper::key_indices(rmm::cuda_stream_v
 {
   if (!_key_indices) { prepare_key_arranged_map(stream); }
   return device_span<size_type const>{_key_indices->data(), _key_indices->size()};
+}
+
+device_span<size_type const> sort_groupby_helper::unique_key_indices(rmm::cuda_stream_view stream)
+{
+  if (!_unique_key_indices) { prepare_key_arranged_map(stream); }
+  return device_span<size_type const>{_unique_key_indices->data(), _unique_key_indices->size()};
 }
 
 device_span<size_type const> sort_groupby_helper::key_arranged_map(rmm::cuda_stream_view stream)
