@@ -15,11 +15,13 @@
  */
 
 #include "common_utils.cuh"
+#include "groupby/hash/helpers.cuh"
 #include "stream_compaction/stream_compaction_common.cuh"
 
 #include <cudf/column/column_factories.hpp>
 #include <cudf/copying.hpp>
 #include <cudf/detail/copy.hpp>
+#include <cudf/detail/cuco_helpers.hpp>
 #include <cudf/detail/gather.cuh>
 #include <cudf/detail/gather.hpp>
 #include <cudf/detail/groupby/sort_helper.hpp>
@@ -38,6 +40,7 @@
 #include <rmm/cuda_stream_view.hpp>
 #include <rmm/exec_policy.hpp>
 
+#include <cuco/static_set.cuh>
 #include <cuda/functional>
 #include <cuda/std/iterator>
 #include <thrust/iterator/counting_iterator.h>
@@ -333,6 +336,99 @@ std::unique_ptr<table> sort_groupby_helper::sorted_keys(rmm::cuda_stream_view st
                               cudf::detail::negative_index_policy::NOT_ALLOWED,
                               stream,
                               mr);
+}
+
+template <typename Equal, typename Hash>
+void sort_groupby_helper::compute_arrange_map(Equal const& d_row_equal,
+                                              Hash const& d_row_hash,
+                                              rmm::cuda_stream_view stream)
+{
+  auto const num_keys = static_cast<int64_t>(_keys.num_rows());
+
+  auto set = cuco::static_set{
+    cuco::extent<int64_t>{num_keys},
+    cudf::detail::CUCO_DESIRED_LOAD_FACTOR,  // 50% load factor
+    cuco::empty_key{cudf::detail::CUDF_SIZE_TYPE_SENTINEL},
+    d_row_equal,
+    cudf::groupby::detail::hash::probing_scheme_t{d_row_hash},
+    // {d_row_hash},
+    cuco::thread_scope_device,
+    cuco::storage<cudf::groupby::detail::hash::GROUPBY_BUCKET_SIZE>{},
+    cudf::detail::cuco_allocator<char>{rmm::mr::polymorphic_allocator<char>{}, stream},
+    stream.value()};
+
+  auto counts        = rmm::device_uvector<size_type>(num_keys, stream);
+  auto key_indices   = rmm::device_uvector<size_type>(num_keys, stream);
+  auto local_indices = rmm::device_uvector<size_type>(num_keys, stream);
+  thrust::uninitialized_fill(rmm::exec_policy_nosync(stream), counts.begin(), counts.end(), 0);
+
+  auto set_ref = set.ref(cuco::op::insert_and_find);
+  thrust::for_each(
+    rmm::exec_policy_nosync(stream),
+    thrust::make_counting_iterator(0),
+    thrust::make_counting_iterator(_keys.num_rows()),
+    [set_ref,
+     counts        = counts.begin(),
+     key_indices   = key_indices.begin(),
+     local_indices = local_indices.begin()] __device__(size_type const idx) mutable {
+      auto const [inserted_idx_ptr, success] = set_ref.insert_and_find(idx);
+      auto ref = cuda::atomic_ref<size_type, cuda::thread_scope_device>{counts[*inserted_idx_ptr]};
+      auto const local_idx = ref.fetch_add(size_type{1}, cuda::memory_order_relaxed);
+      key_indices[idx]     = *inserted_idx_ptr;
+      local_indices[idx]   = local_idx;
+    });
+
+  auto unique_key_indices = rmm::device_uvector<size_type>(num_keys, stream);
+  auto const keys_end     = set.retrieve_all(unique_key_indices.begin(), stream.value());
+  unique_key_indices.resize(std::distance(unique_key_indices.begin(), keys_end), stream);
+
+  auto offsets = rmm::device_uvector<size_type>(unique_key_indices.size() + 1, stream);
+  thrust::transform(rmm::exec_policy_nosync(stream),
+                    unique_key_indices.begin(),
+                    unique_key_indices.end(),
+                    offsets.begin(),
+                    [counts = counts.begin()] __device__(auto const idx) { return counts[idx]; });
+  thrust::exclusive_scan(
+    rmm::exec_policy_nosync(stream), offsets.begin(), offsets.end(), offsets.begin());
+
+  _key_arranged_map = std::make_unique<index_vector>(num_keys, stream);
+  thrust::for_each(rmm::exec_policy_nosync(stream),
+                   thrust::make_counting_iterator(0),
+                   thrust::make_counting_iterator(_keys.num_rows()),
+                   [arranged_map  = _key_arranged_map->begin(),
+                    key_indices   = key_indices.begin(),
+                    local_indices = local_indices.begin(),
+                    offsets       = offsets.begin()] __device__(size_type const idx) {
+                     auto const offset        = offsets[key_indices[idx]];
+                     auto const global_idx    = offset + local_indices[idx];
+                     arranged_map[global_idx] = idx;
+                   });
+}
+
+device_span<size_type const> sort_groupby_helper::key_arranged_map(rmm::cuda_stream_view stream)
+{
+  CUDF_FUNC_RANGE();
+
+  if (_key_arranged_map) {
+    return device_span<size_type const>{_key_arranged_map->data(), _key_arranged_map->size()};
+  }
+
+  auto const null_keys_are_equal = null_equality::EQUAL;
+  auto const has_null            = nullate::DYNAMIC{cudf::has_nested_nulls(_keys)};
+
+  auto preprocessed_keys = cudf::experimental::row::hash::preprocessed_table::create(_keys, stream);
+  auto const comparator  = cudf::experimental::row::equality::self_comparator{preprocessed_keys};
+  auto const row_hash    = cudf::experimental::row::hash::row_hasher{std::move(preprocessed_keys)};
+  auto const d_row_hash  = row_hash.device_hasher(has_null);
+
+  if (cudf::detail::has_nested_columns(_keys)) {
+    auto const d_row_equal = comparator.equal_to<true>(has_null, null_keys_are_equal);
+    compute_arrange_map(d_row_equal, d_row_hash, stream);
+  } else {
+    auto const d_row_equal = comparator.equal_to<false>(has_null, null_keys_are_equal);
+    compute_arrange_map(d_row_equal, d_row_hash, stream);
+  }
+  return device_span<size_type const>{_key_arranged_map->data(), _key_arranged_map->size()};
 }
 
 }  // namespace sort
