@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019-2025, NVIDIA CORPORATION.
+ * Copyright (c) 2019-2024, NVIDIA CORPORATION.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -44,23 +44,32 @@ namespace {
  * @brief List of aggregation operations that can be computed with a hash-based
  * implementation.
  */
-auto constexpr hash_aggregations = std::array{aggregation::SUM,
-                                              aggregation::PRODUCT,
-                                              aggregation::MIN,
-                                              aggregation::MAX,
-                                              aggregation::COUNT_VALID,
-                                              aggregation::COUNT_ALL,
-                                              aggregation::ARGMIN,
-                                              aggregation::ARGMAX,
-                                              aggregation::SUM_OF_SQUARES,
-                                              aggregation::MEAN,
-                                              aggregation::STD,
-                                              aggregation::VARIANCE,
-                                              aggregation::M2};
+constexpr std::array<aggregation::Kind, 12> hash_aggregations{aggregation::SUM,
+                                                              aggregation::PRODUCT,
+                                                              aggregation::MIN,
+                                                              aggregation::MAX,
+                                                              aggregation::COUNT_VALID,
+                                                              aggregation::COUNT_ALL,
+                                                              aggregation::ARGMIN,
+                                                              aggregation::ARGMAX,
+                                                              aggregation::SUM_OF_SQUARES,
+                                                              aggregation::MEAN,
+                                                              aggregation::STD,
+                                                              aggregation::VARIANCE};
 
-// Could be hash: SUM, PRODUCT, MIN, MAX, COUNT_VALID, COUNT_ALL, ANY, ALL
+// Could be hash: SUM, PRODUCT, MIN, MAX, COUNT_VALID, COUNT_ALL, ANY, ALL,
 // Compound: MEAN(SUM, COUNT_VALID), VARIANCE, STD(MEAN (SUM, COUNT_VALID), COUNT_VALID),
-// ARGMAX, ARGMIN, M2(SUM, COUNT_VALID)
+// ARGMAX, ARGMIN
+
+// TODO replace with std::find in C++20 onwards.
+template <class T, size_t N>
+constexpr bool array_contains(std::array<T, N> const& haystack, T needle)
+{
+  for (auto const& val : haystack) {
+    if (val == needle) return true;
+  }
+  return false;
+}
 
 /**
  * @brief Indicates whether the specified aggregation operation can be computed
@@ -72,8 +81,7 @@ auto constexpr hash_aggregations = std::array{aggregation::SUM,
  */
 bool constexpr is_hash_aggregation(aggregation::Kind t)
 {
-  return std::find(hash_aggregations.begin(), hash_aggregations.end(), t) !=
-         hash_aggregations.end();
+  return array_contains(hash_aggregations, t);
 }
 
 std::unique_ptr<table> dispatch_groupby(table_view const& keys,
