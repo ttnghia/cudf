@@ -21,7 +21,6 @@
 #include <cudf/column/column_factories.hpp>
 #include <cudf/copying.hpp>
 #include <cudf/detail/copy.hpp>
-#include <cudf/detail/copy_if.cuh>
 #include <cudf/detail/cuco_helpers.hpp>
 #include <cudf/detail/gather.cuh>
 #include <cudf/detail/gather.hpp>
@@ -314,8 +313,13 @@ std::unique_ptr<table> sort_groupby_helper::unique_keys(rmm::cuda_stream_view st
 {
   CUDF_FUNC_RANGE();
 
-  if (!_unique_keys) { prepare_key_arranged_map(stream); }
-  return std::move(_unique_keys);
+  if (!_key_gather_map) { prepare_key_arranged_map(stream); }
+  return cudf::detail::gather(_keys,
+                              _key_gather_map->begin(),
+                              _key_gather_map->begin() + _num_unique_keys,
+                              out_of_bounds_policy::DONT_CHECK,
+                              stream,
+                              mr);
 
   auto idx_data = key_sort_order(stream).data<size_type>();
 
@@ -390,62 +394,29 @@ void sort_groupby_helper::compute_arrange_map(Equal const& d_row_equal,
     stream.synchronize();
   }
 
+  _key_gather_map = std::make_unique<index_vector>(num_keys, stream);
   {
     cudf::scoped_range range{"key gather map"};
 
-#if 0
-    auto _key_gather_map = std::make_unique<index_vector>(num_keys, stream);
-
-    rmm::device_scalar<size_type> d_num_selected_out(0, stream);
-
-    size_t temp_storage_bytes = 0;
-    cub::DeviceSelect::If(
-      nullptr,
-      temp_storage_bytes,
+    auto const keys_end = thrust::copy_if(
+      rmm::exec_policy_nosync(stream),
       thrust::make_counting_iterator(0),
+      thrust::make_counting_iterator(_keys.num_rows()),
       _key_gather_map->begin(),
-      d_num_selected_out.data(),
-      num_keys,
-      [counts = counts.begin()] __device__(size_type const idx) { return counts[idx] > 0; },
-      stream.value());
-    stream.synchronize();
+      [counts = counts.begin()] __device__(size_type const idx) { return counts[idx] > 0; });
 
-    auto tmp = rmm::device_buffer(temp_storage_bytes, stream);
-    cub::DeviceSelect::If(
-      tmp.data(),
-      temp_storage_bytes,
-      thrust::make_counting_iterator(0),
-      _key_gather_map->begin(),
-      d_num_selected_out.data(),
-      num_keys,
-      [counts = counts.begin()] __device__(size_type const idx) { return counts[idx] > 0; },
-      stream.value());
-    stream.synchronize();
+    // _key_gather_map->resize(cuda::std::distance(_key_gather_map->begin(), keys_end), stream);
 
-
-    //    auto const keys_end = thrust::copy_if(
-    //      rmm::exec_policy_nosync(stream),
-    //      thrust::make_counting_iterator(0),
-    //      thrust::make_counting_iterator(_keys.num_rows()),
-    //      _key_gather_map->begin(),
-    //      [counts = counts.begin()] __device__(size_type const idx) { return counts[idx] > 0; });
-
-    //    _key_gather_map->resize(cuda::std::distance(_key_gather_map->begin(), keys_end), stream);
-
-    //    _num_unique_keys =
-    //      static_cast<size_type>(cuda::std::distance(_key_gather_map->begin(), keys_end));
-    _num_unique_keys = d_num_selected_out.value(stream);
-#endif
-    _unique_keys = cudf::detail::copy_if(
-      _keys,
-      [counts = counts.begin()] __device__(size_type const idx) { return counts[idx] > 0; },
-      stream,
-      cudf::get_current_device_resource_ref());
+    _num_unique_keys =
+      static_cast<size_type>(cuda::std::distance(_key_gather_map->begin(), keys_end));
 
     stream.synchronize();
   }
-
-  //  printf("_key_gather_map (size: %d): \n", _unique_keys->num_rows());
+  //  auto h_gm = cudf::detail::make_std_vector(*_key_gather_map, stream);
+  //  printf("_key_gather_map (size: %d): \n", _num_unique_keys);
+  //  for (auto i : h_gm) {
+  //    printf("%d, ", i);
+  //  }
   //  printf("\n\n\n");
 
   //  auto h_counts = cudf::detail::make_std_vector(counts, stream);
@@ -510,8 +481,8 @@ device_span<size_type const> sort_groupby_helper::key_arranged_map(rmm::cuda_str
 
 size_type sort_groupby_helper::num_groups(rmm::cuda_stream_view stream)
 {
-  if (!_unique_keys) { prepare_key_arranged_map(stream); }
-  return _unique_keys->num_rows();
+  if (!_key_gather_map) { prepare_key_arranged_map(stream); }
+  return _num_unique_keys;
 }
 
 void sort_groupby_helper::prepare_key_arranged_map(rmm::cuda_stream_view stream)

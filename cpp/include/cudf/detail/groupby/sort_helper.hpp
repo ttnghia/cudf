@@ -223,10 +223,8 @@ struct sort_groupby_helper {
    */
   column_view keys_bitmask_column(rmm::cuda_stream_view stream);
 
-  //  index_vector_ptr _key_gather_map;  ///< xxx
-  //  size_type _num_unique_keys;
-
-  std::unique_ptr<table> _unique_keys;  ///< Cached unique keys table
+  index_vector_ptr _key_gather_map;  ///< xxx
+  size_type _num_unique_keys;
 
   index_vector_ptr _key_indices;       ///< Map from values to their row indices in `keys`
   index_vector_ptr _key_arranged_map;  ///< Map of indices to arrange `keys` together
