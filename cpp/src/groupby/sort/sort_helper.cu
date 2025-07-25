@@ -392,7 +392,7 @@ void sort_groupby_helper::compute_arrange_map(Equal const& d_row_equal,
         key_indices[idx]     = *inserted_idx_ptr;
         local_indices[idx]   = local_idx;
       });
-    stream.synchronize();
+    //    stream.synchronize();
   }
 
   _key_gather_map = std::make_unique<index_vector>(num_keys, stream);
@@ -411,7 +411,7 @@ void sort_groupby_helper::compute_arrange_map(Equal const& d_row_equal,
     _num_unique_keys =
       static_cast<size_type>(cuda::std::distance(_key_gather_map->begin(), keys_end));
 
-    stream.synchronize();
+    //    stream.synchronize();
   }
 
   _unique_key_indices = std::make_unique<index_vector>(num_keys, stream);
@@ -487,7 +487,7 @@ void sort_groupby_helper::compute_arrange_map(Equal const& d_row_equal,
                        auto const global_idx    = offset + local_indices[idx];
                        arranged_map[global_idx] = idx;
                      });
-    stream.synchronize();
+    //    stream.synchronize();
   }
 }
 

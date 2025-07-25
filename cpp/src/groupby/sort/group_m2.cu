@@ -154,7 +154,7 @@ void compute_m2_fn_new(InputType const* values,
                      ref.fetch_add(d2, cuda::memory_order_relaxed);
                    });
 
-  stream.synchronize();
+  //  stream.synchronize();
 }
 
 struct m2_functor_new {
@@ -236,7 +236,7 @@ struct m2_functor_new {
                            ref.fetch_add(int64_t{1}, cuda::memory_order_relaxed);
                          });
 
-        stream.synchronize();
+        //        stream.synchronize();
       }
       {
         cudf::scoped_range range{"sum"};
@@ -261,7 +261,7 @@ struct m2_functor_new {
         //                              sum.begin(),
         //                              cuda::std::equal_to{},
         //                              cuda::std::plus<double>{});
-        stream.synchronize();
+        //        stream.synchronize();
       }
       {
         cudf::scoped_range range{"mean"};
@@ -271,7 +271,7 @@ struct m2_functor_new {
                           count.begin(),
                           mean.begin(),
                           [] __device__(double s, int64_t c) { return c == 0 ? 0.0 : s / c; });
-        stream.synchronize();
+        //        stream.synchronize();
       }
     }
 
