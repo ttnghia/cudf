@@ -24,6 +24,7 @@
 #include <cudf/detail/aggregation/result_cache.hpp>
 #include <cudf/detail/binaryop.hpp>
 #include <cudf/detail/gather.hpp>
+#include <cudf/detail/nvtx/ranges.hpp>
 #include <cudf/detail/unary.hpp>
 #include <cudf/types.hpp>
 #include <cudf/utilities/span.hpp>
@@ -131,6 +132,7 @@ void hash_compound_agg_finalizer<SetType>::visit(cudf::detail::max_aggregation c
 template <typename SetType>
 void hash_compound_agg_finalizer<SetType>::visit(cudf::detail::mean_aggregation const& agg)
 {
+  cudf::scoped_range range{"mean_aggregation"};
   if (dense_results->has_result(col, agg)) return;
 
   auto sum_agg   = make_sum_aggregation();
@@ -153,6 +155,8 @@ void hash_compound_agg_finalizer<SetType>::visit(cudf::detail::mean_aggregation 
 template <typename SetType>
 void hash_compound_agg_finalizer<SetType>::visit(cudf::detail::var_aggregation const& agg)
 {
+  cudf::scoped_range range{"var_aggregation"};
+
   if (dense_results->has_result(col, agg)) return;
 
   auto sum_agg   = make_sum_aggregation();

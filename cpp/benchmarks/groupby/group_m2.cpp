@@ -51,7 +51,8 @@ void groupby_m2_helper(nvbench::state& state,
   // Vector of 1 request
   std::vector<cudf::groupby::aggregation_request> requests(1);
   requests.back().values = values->view();
-  requests.back().aggregations.push_back(cudf::make_m2_aggregation<cudf::groupby_aggregation>());
+  requests.back().aggregations.push_back(
+    cudf::make_variance_aggregation<cudf::groupby_aggregation>());
 
   auto const mem_stats_logger = cudf::memory_stats_logger();
   state.set_cuda_stream(nvbench::make_cuda_stream_view(cudf::get_default_stream().value()));

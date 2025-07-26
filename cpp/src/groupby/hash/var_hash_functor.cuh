@@ -62,8 +62,7 @@ struct var_hash_functor {
   template <typename Source>
   __device__ void operator()(column_device_view const& source,
                              size_type source_index,
-                             size_type target_index) noexcept
-    requires(!is_supported<Source>())
+                             size_type target_index) noexcept requires(!is_supported<Source>())
   {
     CUDF_UNREACHABLE("Invalid source type for std, var aggregation combination.");
   }
@@ -71,8 +70,7 @@ struct var_hash_functor {
   template <typename Source>
   __device__ void operator()(column_device_view const& source,
                              size_type source_index,
-                             size_type target_index) noexcept
-    requires(is_supported<Source>())
+                             size_type target_index) noexcept requires(is_supported<Source>())
   {
     using Target    = cudf::detail::target_type_t<Source, aggregation::VARIANCE>;
     using SumType   = cudf::detail::target_type_t<Source, aggregation::SUM>;
@@ -80,11 +78,12 @@ struct var_hash_functor {
 
     if (source.is_null(source_index)) return;
     CountType group_size = count.element<CountType>(target_index);
-    if (group_size == 0 or group_size - ddof <= 0) return;
+    if (group_size == 0) return;
 
     auto x        = static_cast<Target>(source.element<Source>(source_index));
     auto mean     = static_cast<Target>(sum.element<SumType>(target_index)) / group_size;
-    Target result = (x - mean) * (x - mean) / (group_size - ddof);
+    auto diff     = x - mean;
+    Target result = diff * diff;
     cuda::atomic_ref<Target, cuda::thread_scope_device> ref{target.element<Target>(target_index)};
     ref.fetch_add(result, cuda::std::memory_order_relaxed);
     // STD sqrt is applied in finalize()
