@@ -21,7 +21,6 @@
 #include "single_pass_functors.cuh"
 
 #include <cudf/aggregation.hpp>
-#include <cudf/detail/nvtx/ranges.hpp>
 #include <cudf/detail/utilities/cuda.cuh>
 #include <cudf/detail/utilities/cuda.hpp>
 #include <cudf/detail/utilities/grid_1d.cuh>
@@ -301,7 +300,6 @@ void compute_shared_memory_aggs(cudf::size_type grid_size,
                                 cudf::aggregation::Kind const* d_agg_kinds,
                                 rmm::cuda_stream_view stream)
 {
-  cudf::scoped_range range{"compute_shared_memory_aggs"};
   // For each aggregation, need one offset determining where the aggregation is
   // performed, another indicating the validity of the aggregation
   auto const offsets_size = compute_shmem_offsets_size(output_values.num_columns());
