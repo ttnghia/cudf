@@ -396,23 +396,58 @@ void sort_groupby_helper::compute_arrange_map(Equal const& d_row_equal,
   }
 
   _key_gather_map = std::make_unique<index_vector>(num_keys, stream);
+  rmm::device_uvector<size_type> key_offsets(counts.size(), stream);
   {
     cudf::scoped_range range{"key gather map"};
 
-    auto const keys_end = thrust::copy_if(
+    thrust::transform(
       rmm::exec_policy_nosync(stream),
-      thrust::make_counting_iterator(0),
-      thrust::make_counting_iterator(_keys.num_rows()),
-      _key_gather_map->begin(),
-      [counts = counts.begin()] __device__(size_type const idx) { return counts[idx] > 0; });
+      counts.begin(),
+      counts.end(),
+      key_offsets.begin(),
+      [] __device__(size_type const count) -> size_type { return count > 0 ? 1 : 0; });
+
+    thrust::exclusive_scan(
+      rmm::exec_policy_nosync(stream), key_offsets.begin(), key_offsets.end(), key_offsets.begin());
+    thrust::for_each(rmm::exec_policy_nosync(stream),
+                     thrust::make_counting_iterator(0),
+                     thrust::make_counting_iterator(_keys.num_rows()),
+                     [gather_map  = _key_gather_map->begin(),
+                      counts      = counts.begin(),
+                      key_offsets = key_offsets.begin()] __device__(size_type const idx) {
+                       auto const count = counts[idx];
+                       if (count > 0) {
+                         auto const offset  = key_offsets[idx];
+                         gather_map[offset] = idx;
+                       }
+                     });
+
+    //    auto const keys_end = thrust::copy_if(
+    //      rmm::exec_policy_nosync(stream),
+    //      thrust::make_counting_iterator(0),
+    //      thrust::make_counting_iterator(_keys.num_rows()),
+    //      _key_gather_map->begin(),
+    //      [counts = counts.begin()] __device__(size_type const idx) { return counts[idx] > 0; });
 
     // _key_gather_map->resize(cuda::std::distance(_key_gather_map->begin(), keys_end), stream);
 
-    _num_unique_keys =
-      static_cast<size_type>(cuda::std::distance(_key_gather_map->begin(), keys_end));
+    // CUDF_CUDA_TRY(cudaMemcpyAsync(&_num_unique_keys,
+    //                               key_offsets.data() + key_offsets.size() - 1,
+    //                               sizeof(size_type),
+    //                               cudaMemcpyDeviceToHost,
+    //                               stream.value()));
+
+    //    _num_unique_keys =
+    //      static_cast<size_type>(cuda::std::distance(_key_gather_map->begin(), keys_end));
 
     stream.synchronize();
   }
+  CUDF_CUDA_TRY(cudaMemcpyAsync(&_num_unique_keys,
+                                key_offsets.data() + key_offsets.size() - 1,
+                                sizeof(size_type),
+                                cudaMemcpyDeviceToHost,
+                                stream.value()));
+  stream.synchronize();
 
   _unique_key_indices = std::make_unique<index_vector>(num_keys, stream);
   {
