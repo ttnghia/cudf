@@ -55,6 +55,9 @@
 #include <tuple>
 
 namespace cudf {
+namespace detail {
+void copy_kernel(void* dst, void const* src, std::size_t size, rmm::cuda_stream_view stream);
+}
 namespace groupby {
 namespace detail {
 namespace sort {
@@ -442,12 +445,96 @@ void sort_groupby_helper::compute_arrange_map(Equal const& d_row_equal,
 
     stream.synchronize();
   }
-  CUDF_CUDA_TRY(cudaMemcpyAsync(&_num_unique_keys,
-                                key_offsets.data() + key_offsets.size() - 1,
-                                sizeof(size_type),
-                                cudaMemcpyDeviceToHost,
-                                stream.value()));
+
+  rmm::device_scalar<size_type> _tmp(0, stream);
   stream.synchronize();
+  {
+    cudf::scoped_range range{"test D=>D"};
+
+    CUDF_CUDA_TRY(cudaMemcpyAsync(_tmp.data(),
+                                  key_offsets.data() + key_offsets.size() - 1,
+                                  sizeof(size_type),
+                                  cudaMemcpyDefault,
+                                  stream.value()));
+    stream.synchronize();
+  }
+
+  cudf::set_allocate_host_as_pinned_threshold(0);
+  auto pinned = cudf::detail::make_pinned_vector_async<size_type>(1, stream);
+
+  stream.synchronize();
+  {
+    cudf::scoped_range range{"test copy kernel"};
+
+    cudf::detail::copy_kernel(
+      _tmp.data(), key_offsets.data() + key_offsets.size() - 1, sizeof(size_type), stream);
+    stream.synchronize();
+  }
+  {
+    cudf::scoped_range range{"copy D=>H"};
+    CUDF_CUDA_TRY(cudaMemcpyAsync(&_num_unique_keys,
+                                  key_offsets.data() + key_offsets.size() - 1,
+                                  sizeof(size_type),
+                                  cudaMemcpyDeviceToHost,
+                                  stream.value()));
+    stream.synchronize();
+  }
+
+  {
+    cudf::scoped_range range{"copy D=>Pinned"};
+    CUDF_CUDA_TRY(cudaMemcpyAsync(pinned.data(),
+                                  key_offsets.data() + key_offsets.size() - 1,
+                                  sizeof(size_type),
+                                  cudaMemcpyDeviceToHost,
+                                  stream.value()));
+    stream.synchronize();
+  }
+
+  {
+    cudf::scoped_range range{"copy batch D=>H"};
+    cudaMemcpyAttributes attr_batch = {cudaMemcpySrcAccessOrderStream, /*srcAccessOrder*/
+                                       {cudaMemLocationTypeDevice, 0}, /*srcLocHint*/
+                                       {cudaMemLocationTypeHost, 0},   /*dstLocHint*/
+                                       cudaMemcpyFlagPreferOverlapWithCompute /*flags*/};
+    size_t attrIdx_batch            = 0;
+    size_t failIdx_batch            = 99;
+    size_t memSize_batch            = sizeof(size_type);
+    auto src                        = key_offsets.data() + key_offsets.size() - 1;
+    auto dst                        = &_num_unique_keys;
+    CUDF_CUDA_TRY(cudaMemcpyBatchAsync(&dst,
+                                       &src,
+                                       &memSize_batch /*sizes*/,
+                                       (size_t)1 /*count*/,
+                                       &attr_batch /*attrs*/,
+                                       &attrIdx_batch /*attrsIdxs*/,
+                                       1 /*numAttrs*/,
+                                       &failIdx_batch /*failIdx*/,
+                                       stream.value()));
+    stream.synchronize();
+  }
+
+  {
+    cudf::scoped_range range{"batch D=>Pinned"};
+    cudaMemcpyAttributes attr_batch = {cudaMemcpySrcAccessOrderStream, /*srcAccessOrder*/
+                                       {cudaMemLocationTypeDevice, 0}, /*srcLocHint*/
+                                       {cudaMemLocationTypeHost, 0},   /*dstLocHint*/
+                                       cudaMemcpyFlagPreferOverlapWithCompute /*flags*/};
+    size_t attrIdx_batch            = 0;
+    size_t failIdx_batch            = 99;
+    size_t memSize_batch            = sizeof(size_type);
+    auto src                        = key_offsets.data() + key_offsets.size() - 1;
+    auto dst                        = pinned.data();
+    CUDF_CUDA_TRY(cudaMemcpyBatchAsync(&dst,
+                                       &src,
+                                       &memSize_batch /*sizes*/,
+                                       (size_t)1 /*count*/,
+                                       &attr_batch /*attrs*/,
+                                       &attrIdx_batch /*attrsIdxs*/,
+                                       1 /*numAttrs*/,
+                                       &failIdx_batch /*failIdx*/,
+                                       stream.value()));
+    stream.synchronize();
+  }
 
   _unique_key_indices = std::make_unique<index_vector>(num_keys, stream);
   {
