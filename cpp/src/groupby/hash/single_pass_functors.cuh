@@ -212,13 +212,18 @@ struct global_memory_fallback_fn {
   {
   }
 
-  __device__ void operator()(cudf::size_type i)
+  __device__ void operator()(int64_t i)
   {
-    auto const block_id = (i % stride) / GROUPBY_BLOCK_SIZE;
+    auto const num_rows = input_values.num_rows();
+    auto const row_idx  = static_cast<size_type>(i % num_rows);
+
+    auto const block_id = (row_idx % stride) / GROUPBY_BLOCK_SIZE;
     if (block_cardinality[block_id] >= GROUPBY_CARDINALITY_THRESHOLD and
-        (not skip_rows_with_nulls or cudf::bit_is_set(row_bitmask, i))) {
-      auto const result = set.insert_and_find(i);
-      cudf::detail::aggregate_row(output_values, *result.first, input_values, i, aggs);
+        (not skip_rows_with_nulls or cudf::bit_is_set(row_bitmask, row_idx))) {
+      auto const result  = set.insert_and_find(row_idx);
+      auto const col_idx = static_cast<size_type>(i / num_rows);
+      cudf::detail::aggregate_row(
+        col_idx, output_values, *result.first, input_values, row_idx, aggs);
     }
   }
 };
@@ -289,12 +294,16 @@ struct compute_single_pass_aggs_fn {
   {
   }
 
-  __device__ void operator()(size_type i)
+  __device__ void operator()(int64_t i)
   {
-    if (not skip_rows_with_nulls or cudf::bit_is_set(row_bitmask, i)) {
-      auto const result = set.insert_and_find(i);
+    auto const num_rows = input_values.num_rows();
+    auto const row_idx  = static_cast<size_type>(i % num_rows);
 
-      cudf::detail::aggregate_row(output_values, *result.first, input_values, i, aggs);
+    if (not skip_rows_with_nulls or cudf::bit_is_set(row_bitmask, row_idx)) {
+      auto const result  = set.insert_and_find(row_idx);
+      auto const col_idx = static_cast<size_type>(i / num_rows);
+      cudf::detail::aggregate_row(
+        col_idx, output_values, *result.first, input_values, row_idx, aggs);
     }
   }
 };
