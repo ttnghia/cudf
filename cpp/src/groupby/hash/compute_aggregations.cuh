@@ -25,6 +25,9 @@
 #include "single_pass_functors.cuh"
 
 #include <cudf/detail/aggregation/result_cache.hpp>
+#include <cudf/detail/utilities/cuda.cuh>
+#include <cudf/detail/utilities/cuda.hpp>
+#include <cudf/detail/utilities/grid_1d.cuh>
 #include <cudf/detail/utilities/vector_factories.hpp>
 #include <cudf/groupby.hpp>
 #include <cudf/table/table_device_view.cuh>
@@ -45,6 +48,31 @@
 #include <vector>
 
 namespace cudf::groupby::detail::hash {
+template <typename SetType>
+CUDF_KERNEL void gm_fallback_kernel(int64_t total_size,
+                                    size_type num_rows,
+                                    SetType set,
+                                    table_device_view input_values,
+                                    mutable_table_device_view output_values,
+                                    aggregation::Kind const* __restrict__ aggs,
+                                    cudf::size_type* block_cardinality,
+                                    cudf::size_type stride,
+                                    bitmask_type const* __restrict__ row_bitmask,
+                                    bool skip_rows_with_nulls)
+{
+  auto i = cudf::detail::grid_1d::global_thread_id();
+  if (i >= total_size) return;
+
+  auto const row_idx  = static_cast<size_type>(i % num_rows);
+  auto const block_id = (row_idx % stride) / GROUPBY_BLOCK_SIZE;
+  if (block_cardinality[block_id] >= GROUPBY_CARDINALITY_THRESHOLD and
+      (not skip_rows_with_nulls or cudf::bit_is_set(row_bitmask, row_idx))) {
+    auto const result  = set.insert_and_find(row_idx);
+    auto const col_idx = static_cast<size_type>(i / num_rows);
+    cudf::detail::aggregate_row(col_idx, output_values, *result.first, input_values, row_idx, aggs);
+  }
+}
+
 /**
  * @brief Computes all aggregations from `requests` that require a single pass
  * over the data and stores the results in `sparse_results`
@@ -171,18 +199,21 @@ rmm::device_uvector<cudf::size_type> compute_aggregations(
   // the temporary aggregation results. In these situations, we must fall back to a global memory
   // aggregator to process the remaining aggregation requests.
   if (needs_fallback) {
-    auto const stride = GROUPBY_BLOCK_SIZE * grid_size;
-    thrust::for_each_n(rmm::exec_policy_nosync(stream),
-                       thrust::make_counting_iterator(int64_t{0}),
-                       num_rows * static_cast<int64_t>(flattened_values.num_columns()),
-                       global_memory_fallback_fn{global_set_ref,
-                                                 *d_values,
-                                                 *d_sparse_table,
-                                                 d_agg_kinds.data(),
-                                                 block_cardinality.data(),
-                                                 stride,
-                                                 row_bitmask,
-                                                 skip_rows_with_nulls});
+    auto const stride     = GROUPBY_BLOCK_SIZE * grid_size;
+    auto const total_size = num_rows * static_cast<int64_t>(flattened_values.num_columns());
+    cudf::detail::grid_1d grid{total_size, GROUPBY_BLOCK_SIZE};
+    gm_fallback_kernel<<<grid.num_blocks, GROUPBY_BLOCK_SIZE, 0, stream.value()>>>(
+      total_size,
+      num_rows,
+      global_set_ref,
+      *d_values,
+      *d_sparse_table,
+      d_agg_kinds.data(),
+      block_cardinality.data(),
+      stride,
+      row_bitmask,
+      skip_rows_with_nulls);
+
     extract_populated_keys(global_set, populated_keys, stream);
   }
 
