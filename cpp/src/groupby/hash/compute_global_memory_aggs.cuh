@@ -72,7 +72,7 @@ rmm::device_uvector<cudf::size_type> compute_global_memory_aggs(
   thrust::for_each_n(
     rmm::exec_policy_nosync(stream),
     thrust::make_counting_iterator(int64_t{0}),
-    num_rows * flattened_values.num_columns(),
+    num_rows * static_cast<int64_t>(flattened_values.num_columns()),
     hash::compute_single_pass_aggs_fn{
       global_set_ref, *d_values, *d_sparse_table, d_agg_kinds, row_bitmask, skip_rows_with_nulls});
   extract_populated_keys(global_set, populated_keys, stream);
