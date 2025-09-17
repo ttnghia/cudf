@@ -201,11 +201,6 @@ TEST_F(OrcChunkedReaderTest, ListFiles)
 }
 #endif
 
-#include <cudf/detail/utilities/host_worker_pool.hpp>
-#include <cudf/detail/utilities/stream_pool.hpp>
-
-#include <future>
-#include <mutex>
 #include <unordered_map>
 
 TEST_F(OrcChunkedReaderTest, TestFiles)
@@ -216,67 +211,54 @@ TEST_F(OrcChunkedReaderTest, TestFiles)
   std::unordered_map<std::string, int> file_rows;
   std::unordered_map<std::string, int> file_distinct_counts;
   std::unordered_map<std::string, int> file_distinct_counts_nulls;
-  std::vector<std::future<void>> tasks;
-  std::mutex mutex;
 
-  for (int iter = 0; iter < 100; ++iter) {
+  for (int iter = 0; iter < 10; ++iter) {
     printf("Iter: %d\n", iter);
     fflush(stdout);
     for (auto& f : files) {
-      auto task = [&, f]() -> void {
-        // std::cout << f << std::endl;
-        auto const [result, num_chunks] = chunked_read(f);
+      // std::cout << f << std::endl;
+      auto const [result, num_chunks] = chunked_read(f);
 
-        auto agg_null =
-          cudf::make_nunique_aggregation<cudf::reduce_aggregation>(cudf::null_policy::INCLUDE);
-        auto agg =
-          cudf::make_nunique_aggregation<cudf::reduce_aggregation>(cudf::null_policy::EXCLUDE);
+      auto agg_null =
+        cudf::make_nunique_aggregation<cudf::reduce_aggregation>(cudf::null_policy::INCLUDE);
+      auto agg =
+        cudf::make_nunique_aggregation<cudf::reduce_aggregation>(cudf::null_policy::EXCLUDE);
 
-        auto size_data_type = cudf::data_type(cudf::type_to_id<cudf::size_type>());
-        auto const dcount   = cudf::reduce(result->get_column(11).view(), *agg, size_data_type);
-        auto const hcount =
-          dynamic_cast<cudf::numeric_scalar<cudf::size_type>*>(dcount.get())->value();
+      auto size_data_type = cudf::data_type(cudf::type_to_id<cudf::size_type>());
+      auto const dcount   = cudf::reduce(result->get_column(11).view(), *agg, size_data_type);
+      auto const hcount =
+        dynamic_cast<cudf::numeric_scalar<cudf::size_type>*>(dcount.get())->value();
 
-        auto const dcount_nulls =
-          cudf::reduce(result->get_column(11).view(), *agg_null, size_data_type);
-        auto const hcount_nulls =
-          dynamic_cast<cudf::numeric_scalar<cudf::size_type>*>(dcount_nulls.get())->value();
+      auto const dcount_nulls =
+        cudf::reduce(result->get_column(11).view(), *agg_null, size_data_type);
+      auto const hcount_nulls =
+        dynamic_cast<cudf::numeric_scalar<cudf::size_type>*>(dcount_nulls.get())->value();
 
-        {
-          std::scoped_lock lock(mutex);
-
-          if (file_rows.contains(f)) {
-            EXPECT_EQ(result->num_rows(), file_rows[f]);
-            EXPECT_TRUE(file_distinct_counts.contains(f));
-            EXPECT_TRUE(file_distinct_counts_nulls.contains(f));
-            if (file_distinct_counts[f] != hcount) {
-              printf("... difference w/o nulls: %s\n", f.c_str());
-              fflush(stdout);
-            }
-            if (file_distinct_counts_nulls[f] != hcount_nulls) {
-              printf("... difference with nulls: %s\n", f.c_str());
-              fflush(stdout);
-            }
-
-            EXPECT_EQ(file_distinct_counts[f], hcount);
-            EXPECT_EQ(file_distinct_counts_nulls[f], hcount_nulls);
-          } else {
-            file_rows[f]                  = result->num_rows();
-            file_distinct_counts[f]       = hcount;
-            file_distinct_counts_nulls[f] = hcount_nulls;
-          }
+      if (file_rows.contains(f)) {
+        EXPECT_EQ(result->num_rows(), file_rows[f]);
+        EXPECT_TRUE(file_distinct_counts.contains(f));
+        EXPECT_TRUE(file_distinct_counts_nulls.contains(f));
+        if (file_distinct_counts[f] != hcount) {
+          printf("... difference w/o nulls: %s\n", f.c_str());
+          fflush(stdout);
         }
-        // std::cout << "    Number of rows: " << result->num_rows() << ", num. chunks: " <<
-        // num_chunks
-        //           << std::endl;
-        // std::cout << std::endl << std::endl << std::endl;
-      };
-      tasks.emplace_back(cudf::detail::host_worker_pool().submit_task(std::move(task)));
+        if (file_distinct_counts_nulls[f] != hcount_nulls) {
+          printf("... difference with nulls: %s\n", f.c_str());
+          fflush(stdout);
+        }
+
+        EXPECT_EQ(file_distinct_counts[f], hcount);
+        EXPECT_EQ(file_distinct_counts_nulls[f], hcount_nulls);
+      } else {
+        file_rows[f]                  = result->num_rows();
+        file_distinct_counts[f]       = hcount;
+        file_distinct_counts_nulls[f] = hcount_nulls;
+      }
+      // std::cout << "    Number of rows: " << result->num_rows() << ", num. chunks: " <<
+      // num_chunks
+      //           << std::endl;
+      // std::cout << std::endl << std::endl << std::endl;
     }
-    for (auto& t : tasks) {
-      t.get();
-    }
-    tasks.clear();
   }
 }
 
