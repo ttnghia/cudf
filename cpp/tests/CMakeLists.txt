@@ -315,7 +315,7 @@ ConfigureTest(
   PERCENT 30 EXTRA_LIBS ${ARROW_LIBRARIES}
 )
 ConfigureTest(
-  ORC_TEST io/orc_chunked_reader_test.cu io/orc_test.cpp
+  ORC_TEST io/orc_chunked_reader_test.cu
   GPUS 1
   PERCENT 100
 )
