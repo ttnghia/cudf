@@ -15,7 +15,6 @@
  */
 
 #include <cudf/detail/stream_compaction.hpp>
-#include <cudf/null_mask.hpp>
 #include <cudf/reduction/detail/reduction_functions.hpp>
 #include <cudf/scalar/scalar_factories.hpp>
 #include <cudf/utilities/memory_resource.hpp>
@@ -30,16 +29,20 @@ namespace {
 
 struct count_scalar_fn {
   template <typename T>
-  requires(cudf::is_numeric_not_bool<T>()) std::unique_ptr<cudf::scalar> operator()(
-    size_type count, rmm::cuda_stream_view stream, rmm::device_async_resource_ref mr) const
+    requires(cudf::is_numeric_not_bool<T>())
+  std::unique_ptr<cudf::scalar> operator()(size_type count,
+                                           rmm::cuda_stream_view stream,
+                                           rmm::device_async_resource_ref mr) const
   {
     auto const value = static_cast<T>(count);
     return cudf::make_fixed_width_scalar<T>(value, stream, mr);
   }
 
   template <typename T>
-  requires(not cudf::is_numeric_not_bool<T>()) std::unique_ptr<cudf::scalar> operator()(
-    size_type, rmm::cuda_stream_view, rmm::device_async_resource_ref) const
+    requires(not cudf::is_numeric_not_bool<T>())
+  std::unique_ptr<cudf::scalar> operator()(size_type,
+                                           rmm::cuda_stream_view,
+                                           rmm::device_async_resource_ref) const
   {
     CUDF_FAIL("COUNT is not supported for boolean or non-numeric types", std::invalid_argument);
   }
@@ -52,19 +55,6 @@ std::unique_ptr<cudf::scalar> count(column_view const& col,
                                     rmm::cuda_stream_view stream,
                                     rmm::device_async_resource_ref mr)
 {
-  auto const null_count_1 = col.null_count();
-  auto const null_count_2 = cudf::null_count(col.null_mask(), 0, col.size(), stream);
-  if (null_count_1 != null_count_2) {
-    printf("Null count NOT MATCHED: %d vs %d (size: %d)\n", null_count_1, null_count_2, col.size());
-    fflush(stdout);
-    throw cudf::logic_error("Null count NOT MATCHED: " + std::to_string(null_count_1) + " vs " +
-                            std::to_string(null_count_2) + " (size: " + std::to_string(col.size()) +
-                            ")");
-  } else {
-    printf("Null count correct: %d (size: %d)\n", null_count_1, col.size());
-    fflush(stdout);
-  }
-
   auto const count = col.size() - (null_handling == null_policy::EXCLUDE ? col.null_count() : 0);
   return cudf::type_dispatcher(output_dtype, count_scalar_fn{}, count, stream, mr);
 }
