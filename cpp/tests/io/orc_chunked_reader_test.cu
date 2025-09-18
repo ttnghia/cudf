@@ -205,14 +205,14 @@ TEST_F(OrcChunkedReaderTest, ListFiles)
 
 TEST_F(OrcChunkedReaderTest, TestFiles)
 {
-  auto const path  = "/home/nghiat/tmp/store_sales/";
+  auto const path  = "/home/nvidia/nghiat/store_sales/";
   auto const files = find_orc_files(path);
 
   std::unordered_map<std::string, int> file_rows;
   std::unordered_map<std::string, int> file_distinct_counts;
   std::unordered_map<std::string, int> file_distinct_counts_nulls;
 
-  for (int iter = 0; iter < 10; ++iter) {
+  for (int iter = 0; iter < 100; ++iter) {
     printf("Iter: %d\n", iter);
     fflush(stdout);
     for (auto& f : files) {
@@ -241,10 +241,12 @@ TEST_F(OrcChunkedReaderTest, TestFiles)
         if (file_distinct_counts[f] != hcount) {
           printf("... difference w/o nulls: %s\n", f.c_str());
           fflush(stdout);
+          exit(0);
         }
         if (file_distinct_counts_nulls[f] != hcount_nulls) {
           printf("... difference with nulls: %s\n", f.c_str());
           fflush(stdout);
+          exit(0);
         }
 
         EXPECT_EQ(file_distinct_counts[f], hcount);
