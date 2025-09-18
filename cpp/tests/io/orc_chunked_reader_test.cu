@@ -205,8 +205,8 @@ TEST_F(OrcChunkedReaderTest, ListFiles)
 
 TEST_F(OrcChunkedReaderTest, TestFiles)
 {
-  // auto const path  = "/home/nghiat/tmp/store_sales/";
-  // auto const files = find_orc_files(path);
+  auto const path  = "/home/nghiat/tmp/store_sales/";
+  auto const files = find_orc_files(path);
 
   std::unordered_map<std::string, int> file_rows;
   std::unordered_map<std::string, int> file_distinct_counts;
@@ -215,11 +215,7 @@ TEST_F(OrcChunkedReaderTest, TestFiles)
   for (int iter = 0; iter < 10; ++iter) {
     printf("Iter: %d\n", iter);
     fflush(stdout);
-    // for (auto& f : files)
-    std::string f =
-      "/home/nghiat/tmp/store_sales/ss_sold_date_sk=__HIVE_DEFAULT_PARTITION__/"
-      "part-00002-f60bcb3f-a0f4-402e-af54-19e70030248e.c000.snappy.orc";
-    {
+    for (auto& f : files) {
       // std::cout << f << std::endl;
       auto const [result, num_chunks] = chunked_read(f);
 
