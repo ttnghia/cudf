@@ -247,16 +247,20 @@ TEST_F(OrcChunkedReaderTest, TestFiles)
         fflush(stdout);
 
         if (file_distinct_counts[f] != hcount) {
-          printf(
-            "... difference w/o nulls: %d vs %d, %s\n", file_distinct_counts[f], hcount, f.c_str());
+          printf("... difference w/o nulls: %d vs %d (num rows = %d), %s\n",
+                 file_distinct_counts[f],
+                 hcount,
+                 result->num_rows(),
+                 f.c_str());
 
           fflush(stdout);
           exit(0);
         }
         if (file_distinct_counts_nulls[f] != hcount_nulls) {
-          printf("... difference with nulls: %d vs %d, %s\n",
+          printf("... difference with nulls: %d vs %d (num rows = %d), %s\n",
                  file_distinct_counts_nulls[f],
                  hcount_nulls,
+                 result->num_rows(),
                  f.c_str());
           fflush(stdout);
           exit(0);
