@@ -240,17 +240,23 @@ TEST_F(OrcChunkedReaderTest, TestFiles)
         EXPECT_TRUE(file_distinct_counts.contains(f));
         EXPECT_TRUE(file_distinct_counts_nulls.contains(f));
 
-        CUDF_TEST_EXPECT_COLUMNS_EQUAL(expected->view(),
-                                       result->get_column(11).view(),
-                                       cudf::test::debug_output_level::ALL_ERRORS);
-
         if (file_distinct_counts[f] != hcount) {
-          printf("... difference w/o nulls: %s\n", f.c_str());
+          printf(
+            "... difference w/o nulls: %d vs %d, %s\n", file_distinct_counts[f], hcount, f.c_str());
+          CUDF_TEST_EXPECT_COLUMNS_EQUAL(expected->view(),
+                                         result->get_column(11).view(),
+                                         cudf::test::debug_output_level::ALL_ERRORS);
           fflush(stdout);
           exit(0);
         }
         if (file_distinct_counts_nulls[f] != hcount_nulls) {
-          printf("... difference with nulls: %s\n", f.c_str());
+          printf("... difference with nulls: %d vs %d, %s\n",
+                 file_distinct_counts_nulls[f],
+                 hcount_nulls,
+                 f.c_str());
+          CUDF_TEST_EXPECT_COLUMNS_EQUAL(expected->view(),
+                                         result->get_column(11).view(),
+                                         cudf::test::debug_output_level::ALL_ERRORS);
           fflush(stdout);
           exit(0);
         }
