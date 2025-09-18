@@ -208,6 +208,7 @@ TEST_F(OrcChunkedReaderTest, TestFiles)
   auto const path  = "/home/nvidia/nghiat/store_sales/";
   auto const files = find_orc_files(path);
 
+  std::unique_ptr<cudf::column> expected{nullptr};
   std::unordered_map<std::string, int> file_rows;
   std::unordered_map<std::string, int> file_distinct_counts;
   std::unordered_map<std::string, int> file_distinct_counts_nulls;
@@ -238,6 +239,11 @@ TEST_F(OrcChunkedReaderTest, TestFiles)
         EXPECT_EQ(result->num_rows(), file_rows[f]);
         EXPECT_TRUE(file_distinct_counts.contains(f));
         EXPECT_TRUE(file_distinct_counts_nulls.contains(f));
+
+        CUDF_TEST_EXPECT_COLUMNS_EQUAL(expected->view(),
+                                       result->get_column(11).view(),
+                                       cudf::test::debug_output_level::ALL_ERRORS);
+
         if (file_distinct_counts[f] != hcount) {
           printf("... difference w/o nulls: %s\n", f.c_str());
           fflush(stdout);
@@ -255,6 +261,8 @@ TEST_F(OrcChunkedReaderTest, TestFiles)
         file_rows[f]                  = result->num_rows();
         file_distinct_counts[f]       = hcount;
         file_distinct_counts_nulls[f] = hcount_nulls;
+
+        if (!expected) { expected = std::move((result->release())[11]); }
       }
       // std::cout << "    Number of rows: " << result->num_rows() << ", num. chunks: " <<
       // num_chunks
