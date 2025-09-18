@@ -174,8 +174,19 @@ auto chunked_read(std::string const& filepath,
 
 namespace fs = std::filesystem;
 
+#if 0
+std::string prefix = "/home/nghiat/tmp/";
+#else
+std::string prefix = "/home/nvidia/nghiat/";
+#endif
+
 std::vector<std::string> find_orc_files(const std::string& root)
 {
+#if 1
+  return {prefix +
+          "store_sales/ss_sold_date_sk=__HIVE_DEFAULT_PARTITION__/"
+          "part-00002-f60bcb3f-a0f4-402e-af54-19e70030248e.c000.snappy.orc"};
+#endif
   std::vector<std::string> result;
   fs::path root_path(root);  // convert string to filesystem::path
   for (const auto& entry : fs::recursive_directory_iterator(root_path)) {
@@ -205,8 +216,7 @@ TEST_F(OrcChunkedReaderTest, ListFiles)
 
 TEST_F(OrcChunkedReaderTest, TestFiles)
 {
-  auto const path = "/home/nvidia/nghiat/store_sales/";
-  // auto const path  = "/home/nghiat/tmp/store_sales/";
+  auto const path  = prefix + "store_sales/";
   auto const files = find_orc_files(path);
 
   std::unordered_map<std::string, std::unique_ptr<cudf::column>> expected;
