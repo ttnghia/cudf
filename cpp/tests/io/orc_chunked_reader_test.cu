@@ -235,6 +235,11 @@ TEST_F(OrcChunkedReaderTest, TestFiles)
       auto const hcount_nulls =
         dynamic_cast<cudf::numeric_scalar<cudf::size_type>*>(dcount_nulls.get())->value();
 
+      CUDF_TEST_EXPECT_COLUMNS_EQUAL(expected->view(),
+                                     result->get_column(11).view(),
+                                     cudf::test::debug_output_level::ALL_ERRORS);
+      fflush(stdout);
+
       if (file_rows.contains(f)) {
         EXPECT_EQ(result->num_rows(), file_rows[f]);
         EXPECT_TRUE(file_distinct_counts.contains(f));
@@ -243,9 +248,7 @@ TEST_F(OrcChunkedReaderTest, TestFiles)
         if (file_distinct_counts[f] != hcount) {
           printf(
             "... difference w/o nulls: %d vs %d, %s\n", file_distinct_counts[f], hcount, f.c_str());
-          CUDF_TEST_EXPECT_COLUMNS_EQUAL(expected->view(),
-                                         result->get_column(11).view(),
-                                         cudf::test::debug_output_level::ALL_ERRORS);
+
           fflush(stdout);
           exit(0);
         }
@@ -254,9 +257,6 @@ TEST_F(OrcChunkedReaderTest, TestFiles)
                  file_distinct_counts_nulls[f],
                  hcount_nulls,
                  f.c_str());
-          CUDF_TEST_EXPECT_COLUMNS_EQUAL(expected->view(),
-                                         result->get_column(11).view(),
-                                         cudf::test::debug_output_level::ALL_ERRORS);
           fflush(stdout);
           exit(0);
         }
