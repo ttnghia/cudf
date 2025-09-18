@@ -58,7 +58,7 @@ inline auto make_pool()
 {
   auto const [free, total] = rmm::available_device_memory();
   auto const min_alloc =
-    rmm::align_down(std::min(free, total / 10), rmm::CUDA_ALLOCATION_ALIGNMENT);
+    rmm::align_down(std::min(free, total / 100), rmm::CUDA_ALLOCATION_ALIGNMENT);
   return rmm::mr::make_owning_wrapper<rmm::mr::pool_memory_resource>(make_cuda(), min_alloc);
 }
 
