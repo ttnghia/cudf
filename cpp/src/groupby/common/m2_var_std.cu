@@ -27,6 +27,7 @@ __device__ constexpr bool is_m2_supported()
   return is_numeric<Source>() && !is_fixed_point<Source>();
 }
 
+#if 0
 struct m2_functor {
   template <typename Source, typename... Args>
   void operator()(Args...)  //
@@ -98,6 +99,105 @@ std::unique_ptr<column> compute_m2(data_type source_type,
   type_dispatcher(source_type, m2_functor{}, output->mutable_view(), sum_sqr, sum, count, stream);
   return output;
 }
+
+#else
+
+struct m2_functor {
+  template <typename Source, typename... Args>
+  void operator()(Args...)  //
+    requires(!is_m2_supported<Source>())
+  {
+    CUDF_FAIL("Invalid source type for M2 aggregation.");
+  }
+
+  template <typename Target, typename SumSqrType, typename SumType, typename CountType>
+  void evaluate(Target* out_count,
+                Target* out_mean,
+                Target* out_m2,
+                SumSqrType const* sum_sqr,
+                SumType const* sum,
+                CountType const* count,
+                size_type size,
+                rmm::cuda_stream_view stream) const noexcept
+  {
+    auto const out_iter = thrust::make_zip_iterator(out_count, out_mean, out_m2);
+    thrust::tabulate(rmm::exec_policy_nosync(stream),
+                     out_iter,
+                     out_iter + size,
+                     [sum_sqr, sum, count] __device__(
+                       size_type const idx) -> cuda::std::tuple<Target, Target, Target> {
+                       auto const group_count = count[idx];
+                       if (group_count == 0) {
+                         return cuda::std::tuple{Target{}, Target{}, Target{}};
+                       }
+                       auto const group_sum_sqr = static_cast<Target>(sum_sqr[idx]);
+                       auto const group_sum     = static_cast<Target>(sum[idx]);
+                       auto const group_avg     = group_sum / group_count;
+                       auto const result        = group_sum_sqr - group_sum * group_avg;
+                       return cuda::std::tuple{static_cast<Target>(group_count), group_avg, result};
+                     });
+  }
+
+  template <typename Source>
+  void operator()(mutable_column_view const& out_count,
+                  mutable_column_view const& out_mean,
+                  mutable_column_view const& out_m2,
+                  column_view const& sum_sqr,
+                  column_view const& sum,
+                  column_view const& count,
+                  rmm::cuda_stream_view stream) const noexcept  //
+    requires(is_m2_supported<Source>())
+  {
+    using Target     = cudf::detail::target_type_t<Source, aggregation::M2>;
+    using SumSqrType = cudf::detail::target_type_t<Source, aggregation::SUM_OF_SQUARES>;
+    using SumType    = cudf::detail::target_type_t<Source, aggregation::SUM>;
+    using CountType  = cudf::detail::target_type_t<Source, aggregation::COUNT_VALID>;
+
+    // Separate the implementation into another function, which has fewer instantiations since
+    // the data types (target/sum/count etc) are mostly the same.
+    evaluate(out_count.begin<Target>(),
+             out_mean.begin<Target>(),
+             out_m2.begin<Target>(),
+             sum_sqr.begin<SumSqrType>(),
+             sum.begin<SumType>(),
+             count.begin<CountType>(),
+             out_count.size(),
+             stream);
+  }
+};
+
+}  // namespace
+
+std::unique_ptr<column> compute_m2(data_type source_type,
+                                   column_view const& sum_sqr,
+                                   column_view const& sum,
+                                   column_view const& count,
+                                   rmm::cuda_stream_view stream,
+                                   rmm::device_async_resource_ref mr)
+{
+  auto out_count = make_numeric_column(
+    cudf::data_type(cudf::type_id::FLOAT64), sum.size(), cudf::mask_state::UNALLOCATED, stream, mr);
+  auto out_mean = make_numeric_column(
+    cudf::data_type(cudf::type_id::FLOAT64), sum.size(), cudf::mask_state::UNALLOCATED, stream, mr);
+  auto out_m2 = make_numeric_column(
+    cudf::data_type(cudf::type_id::FLOAT64), sum.size(), cudf::mask_state::UNALLOCATED, stream, mr);
+  type_dispatcher(source_type,
+                  m2_functor{},
+                  out_count->mutable_view(),
+                  out_mean->mutable_view(),
+                  out_m2->mutable_view(),
+                  sum_sqr,
+                  sum,
+                  count,
+                  stream);
+  std::vector<std::unique_ptr<cudf::column>> out_cols;
+  out_cols.emplace_back(std::move(out_count));
+  out_cols.emplace_back(std::move(out_mean));
+  out_cols.emplace_back(std::move(out_m2));
+  return cudf::make_structs_column(
+    sum.size(), std::move(out_cols), 0, rmm::device_buffer{}, stream, mr);
+}
+#endif
 
 namespace {
 

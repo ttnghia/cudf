@@ -60,8 +60,8 @@ struct merge_fn {
 
     // If there are all nulls in the partial results (i.e., sum of all valid counts is
     // zero), then the output is a null.
-    auto const is_valid = n > 0;
-    return thrust::tuple{n, avg, m2, is_valid};
+    // auto const is_valid = n > 0;
+    return thrust::tuple{n, avg, m2};
   }
 };
 
@@ -78,15 +78,16 @@ std::unique_ptr<column> merge_m2(column_view const& values,
     data_type(type_to_id<result_type>()), num_groups, mask_state::UNALLOCATED, stream, mr);
   auto result_M2s = make_numeric_column(
     data_type(type_to_id<result_type>()), num_groups, mask_state::UNALLOCATED, stream, mr);
-  auto validities = rmm::device_uvector<bool>(num_groups, stream);
+  // auto validities = rmm::device_uvector<bool>(num_groups, stream);
 
   // Perform merging for all the aggregations. Their output (and their validity data) are written
   // out concurrently through an output zip iterator.
   auto const out_iter =
     thrust::make_zip_iterator(result_counts->mutable_view().template data<count_type>(),
                               result_means->mutable_view().template data<result_type>(),
-                              result_M2s->mutable_view().template data<result_type>(),
-                              validities.begin());
+                              result_M2s->mutable_view().template data<result_type>()
+                              // validities.begin()
+    );
 
   auto const count_valid = values.child(0);
   auto const mean_values = values.child(1);
@@ -101,12 +102,13 @@ std::unique_ptr<column> merge_m2(column_view const& values,
 
   // Generate bitmask for the output.
   // Only mean and M2 values can be nullable. Count column must be non-nullable.
-  auto [null_mask, null_count] =
-    cudf::detail::valid_if(validities.begin(), validities.end(), cuda::std::identity{}, stream, mr);
-  if (null_count > 0) {
-    result_means->set_null_mask(null_mask, null_count, stream);   // copy null_mask
-    result_M2s->set_null_mask(std::move(null_mask), null_count);  // take over null_mask
-  }
+  // auto [null_mask, null_count] =
+  //   cudf::detail::valid_if(validities.begin(), validities.end(), cuda::std::identity{}, stream,
+  //   mr);
+  // if (null_count > 0) {
+  //   result_means->set_null_mask(null_mask, null_count, stream);   // copy null_mask
+  //   result_M2s->set_null_mask(std::move(null_mask), null_count);  // take over null_mask
+  // }
 
   // Output is a structs column containing the merged values of `COUNT_VALID`, `MEAN`, and `M2`.
   std::vector<std::unique_ptr<column>> out_columns;
