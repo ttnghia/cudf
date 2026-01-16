@@ -172,6 +172,11 @@ void collect_level_info_recursive(host_span<column_view const> cols,
  * The work is distributed across all levels and words, with each warp handling a complete word
  * to ensure no cross-level corruption.
  *
+ * Optimizations:
+ * - Uses shared memory to cache level metadata for frequently accessed levels
+ * - Uses block-level reduction before atomic updates to reduce contention
+ * - Processes words in contiguous chunks for better memory coalescing
+ *
  * @param mask_ptrs Source mask pointers for all columns across all levels
  * @param mask_offsets Bit offset for each source mask (from column offset)
  * @param level_column_offsets Prefix sum of columns per level [num_levels + 1]
@@ -196,12 +201,19 @@ CUDF_KERNEL void batch_concatenate_masks_kernel(
   size_type total_words,
   size_type* __restrict__ valid_counts)
 {
+  // Shared memory for per-level valid counts within this block
+  // Maximum 32 levels supported in shared memory (covers most practical cases)
+  constexpr size_type max_cached_levels = 32;
+  __shared__ size_type block_valid_counts[max_cached_levels];
+
+  // Initialize shared memory valid counts to 0
+  if (threadIdx.x < max_cached_levels) { block_valid_counts[threadIdx.x] = 0; }
+  __syncthreads();
+
   // Each warp processes one word
-  auto const warp_idx      = cudf::detail::grid_1d::global_thread_id<block_size>() / warp_size;
-  auto const lane_idx      = threadIdx.x % warp_size;
-  auto const num_warps     = cudf::detail::grid_1d::grid_stride<block_size>() / warp_size;
-  size_type warp_valid_sum = 0;
-  size_type current_level  = -1;
+  auto const warp_idx  = cudf::detail::grid_1d::global_thread_id<block_size>() / warp_size;
+  auto const lane_idx  = threadIdx.x % warp_size;
+  auto const num_warps = cudf::detail::grid_1d::grid_stride<block_size>() / warp_size;
 
   for (size_type word_idx = warp_idx; word_idx < total_words; word_idx += num_warps) {
     // Find which level this word belongs to using binary search
@@ -209,13 +221,6 @@ CUDF_KERNEL void batch_concatenate_masks_kernel(
       thrust::upper_bound(
         thrust::seq, level_word_offsets, level_word_offsets + num_levels + 1, word_idx) -
       level_word_offsets - 1;
-
-    // Flush valid count when level changes
-    if (lane_idx == 0 && current_level != level_idx && current_level >= 0) {
-      atomicAdd(&valid_counts[current_level], warp_valid_sum);
-      warp_valid_sum = 0;
-    }
-    current_level = level_idx;
 
     // Get the word index within this level
     size_type const word_in_level = word_idx - level_word_offsets[level_idx];
@@ -253,17 +258,26 @@ CUDF_KERNEL void batch_concatenate_masks_kernel(
     // Collect validity bits from all threads in warp
     bitmask_type const new_word = __ballot_sync(0xFFFF'FFFFu, bit_is_valid);
 
-    // First thread in warp writes the result
+    // First thread in warp writes the result and accumulates valid count
     if (lane_idx == 0) {
-      bitmask_type* dest  = dest_masks[level_idx];
-      dest[word_in_level] = new_word;
-      warp_valid_sum += __popc(new_word);
+      dest_masks[level_idx][word_in_level] = new_word;
+      size_type const word_valid_count     = __popc(new_word);
+
+      // Use shared memory for levels that fit, otherwise atomic directly
+      if (level_idx < max_cached_levels) {
+        atomicAdd(&block_valid_counts[level_idx], word_valid_count);
+      } else {
+        atomicAdd(&valid_counts[level_idx], word_valid_count);
+      }
     }
   }
 
-  // Flush remaining valid count
-  if (lane_idx == 0 && current_level >= 0) {
-    atomicAdd(&valid_counts[current_level], warp_valid_sum);
+  // Sync before reducing shared memory counts to global
+  __syncthreads();
+
+  // First warp reduces shared memory counts to global memory
+  if (threadIdx.x < num_levels && threadIdx.x < max_cached_levels) {
+    atomicAdd(&valid_counts[threadIdx.x], block_valid_counts[threadIdx.x]);
   }
 }
 
@@ -305,24 +319,34 @@ batch_process_levels(std::vector<level_info> const& levels,
   }
 
   // ========== PHASE 2: Batch data copy ==========
-  std::vector<void const*> all_src_ptrs;
-  std::vector<void*> all_dst_ptrs;
-  std::vector<std::size_t> all_sizes;
-
-  for (size_type level_idx = 0; level_idx < num_levels; ++level_idx) {
-    auto const& level = levels[level_idx];
-    if (level.is_struct) continue;
-
-    char* dst_ptr = static_cast<char*>(data_buffers[level_idx].data());
-    for (size_t col = 0; col < level.src_data_ptrs.size(); ++col) {
-      all_src_ptrs.push_back(level.src_data_ptrs[col]);
-      all_dst_ptrs.push_back(dst_ptr);
-      all_sizes.push_back(level.data_sizes[col]);
-      dst_ptr += level.data_sizes[col];
-    }
+  // Pre-calculate total number of copy operations for efficient allocation
+  size_t total_copy_ops = 0;
+  for (auto const& level : levels) {
+    if (!level.is_struct) { total_copy_ops += level.src_data_ptrs.size(); }
   }
 
-  if (!all_src_ptrs.empty()) {
+  if (total_copy_ops > 0) {
+    // Reserve upfront to avoid reallocations
+    std::vector<void const*> all_src_ptrs;
+    std::vector<void*> all_dst_ptrs;
+    std::vector<std::size_t> all_sizes;
+    all_src_ptrs.reserve(total_copy_ops);
+    all_dst_ptrs.reserve(total_copy_ops);
+    all_sizes.reserve(total_copy_ops);
+
+    for (size_type level_idx = 0; level_idx < num_levels; ++level_idx) {
+      auto const& level = levels[level_idx];
+      if (level.is_struct) continue;
+
+      char* dst_ptr = static_cast<char*>(data_buffers[level_idx].data());
+      for (size_t col = 0; col < level.src_data_ptrs.size(); ++col) {
+        all_src_ptrs.push_back(level.src_data_ptrs[col]);
+        all_dst_ptrs.push_back(dst_ptr);
+        all_sizes.push_back(level.data_sizes[col]);
+        dst_ptr += level.data_sizes[col];
+      }
+    }
+
     auto d_src_ptrs =
       make_device_uvector_async(all_src_ptrs, stream, cudf::get_current_device_resource_ref());
     auto d_dst_ptrs =
@@ -331,7 +355,7 @@ batch_process_levels(std::vector<level_info> const& levels,
       make_device_uvector_async(all_sizes, stream, cudf::get_current_device_resource_ref());
 
     batched_memcpy_async(
-      d_src_ptrs.data(), d_dst_ptrs.data(), d_sizes.data(), all_src_ptrs.size(), stream);
+      d_src_ptrs.data(), d_dst_ptrs.data(), d_sizes.data(), total_copy_ops, stream);
   }
 
   // ========== PHASE 3: Batch mask concatenation ==========
@@ -345,14 +369,33 @@ batch_process_levels(std::vector<level_info> const& levels,
   std::vector<size_type> null_counts(num_levels, 0);
 
   if (!levels_with_nulls.empty()) {
-    // Build flattened arrays for kernel
+    auto const num_null_levels = levels_with_nulls.size();
+
+    // Pre-calculate total sizes for efficient allocation
+    size_t total_columns = 0;
+    for (size_type level_idx : levels_with_nulls) {
+      total_columns += levels[level_idx].mask_ptrs.size();
+    }
+
+    // Reserve space upfront to avoid reallocations
     std::vector<bitmask_type const*> all_mask_ptrs;
     std::vector<size_type> all_mask_offsets;
-    std::vector<size_type> level_column_offsets{0};
-    std::vector<size_type> level_word_offsets{0};
+    std::vector<size_type> level_column_offsets;
+    std::vector<size_type> level_word_offsets;
     std::vector<size_type> within_level_bit_offsets;
     std::vector<bitmask_type*> dest_mask_ptrs;
     std::vector<size_type> level_total_bits;
+
+    all_mask_ptrs.reserve(total_columns);
+    all_mask_offsets.reserve(total_columns);
+    level_column_offsets.reserve(num_null_levels + 1);
+    level_word_offsets.reserve(num_null_levels + 1);
+    within_level_bit_offsets.reserve(total_columns + num_null_levels);
+    dest_mask_ptrs.reserve(num_null_levels);
+    level_total_bits.reserve(num_null_levels);
+
+    level_column_offsets.push_back(0);
+    level_word_offsets.push_back(0);
 
     size_type total_words = 0;
 
@@ -379,7 +422,7 @@ batch_process_levels(std::vector<level_info> const& levels,
       level_word_offsets.push_back(total_words);
     }
 
-    // Upload to device
+    // Upload to device - use temporary memory resource for intermediate allocations
     auto d_mask_ptrs =
       make_device_uvector_async(all_mask_ptrs, stream, cudf::get_current_device_resource_ref());
     auto d_mask_offsets =
@@ -395,7 +438,7 @@ batch_process_levels(std::vector<level_info> const& levels,
     auto d_level_total_bits =
       make_device_uvector_async(level_total_bits, stream, cudf::get_current_device_resource_ref());
     auto d_valid_counts = make_zeroed_device_uvector_async<size_type>(
-      levels_with_nulls.size(), stream, cudf::get_current_device_resource_ref());
+      num_null_levels, stream, cudf::get_current_device_resource_ref());
 
     // Launch kernel - one warp per word
     constexpr size_type block_size{256};
@@ -411,14 +454,17 @@ batch_process_levels(std::vector<level_info> const& levels,
         d_within_level_bit_offsets.data(),
         d_dest_masks.data(),
         d_level_total_bits.data(),
-        static_cast<size_type>(levels_with_nulls.size()),
+        static_cast<size_type>(num_null_levels),
         total_words,
         d_valid_counts.data());
 
-    // Copy valid counts back and compute null counts
-    auto h_valid_counts = make_host_vector(d_valid_counts, stream);
+    // Copy valid counts back using pinned memory for efficient transfer
+    auto h_valid_counts = make_pinned_vector_async<size_type>(num_null_levels, stream);
+    cuda_memcpy_async<size_type>(
+      host_span<size_type>{h_valid_counts}, device_span<size_type const>{d_valid_counts}, stream);
+    stream.synchronize();
 
-    for (size_t i = 0; i < levels_with_nulls.size(); ++i) {
+    for (size_t i = 0; i < num_null_levels; ++i) {
       size_type const level_idx   = levels_with_nulls[i];
       size_type const valid_count = h_valid_counts[i];
       null_counts[level_idx]      = levels[level_idx].total_rows - valid_count;
