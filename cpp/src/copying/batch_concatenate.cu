@@ -12,6 +12,7 @@
 #include <cudf/detail/utilities/batched_memcpy.hpp>
 #include <cudf/detail/utilities/cuda.cuh>
 #include <cudf/detail/utilities/grid_1d.cuh>
+#include <cudf/detail/utilities/integer_utils.hpp>
 #include <cudf/detail/utilities/vector_factories.hpp>
 #include <cudf/structs/structs_column_view.hpp>
 #include <cudf/utilities/bit.hpp>
@@ -167,84 +168,102 @@ void collect_level_info_recursive(host_span<column_view const> cols,
 /**
  * @brief Kernel to concatenate bitmasks for multiple levels in a single launch.
  *
- * Each warp processes consecutive bits within a level, using ballot to collect
- * 32 bits at a time. This is more efficient than processing bits across levels.
+ * Each warp processes one complete 32-bit word (aligned to warp boundaries within each level).
+ * The work is distributed across all levels and words, with each warp handling a complete word
+ * to ensure no cross-level corruption.
+ *
+ * @param mask_ptrs Source mask pointers for all columns across all levels
+ * @param mask_offsets Bit offset for each source mask (from column offset)
+ * @param level_column_offsets Prefix sum of columns per level [num_levels + 1]
+ * @param level_word_offsets Prefix sum of words per level [num_levels + 1]
+ * @param within_level_bit_offsets Prefix sum of bits within each level [total_columns + 1]
+ * @param dest_masks Output mask pointers for each level [num_levels]
+ * @param level_total_bits Total bits for each level [num_levels]
+ * @param num_levels Number of levels to process
+ * @param total_words Total number of 32-bit words across all levels
+ * @param valid_counts Output valid counts per level [num_levels]
  */
 template <size_type block_size>
 CUDF_KERNEL void batch_concatenate_masks_kernel(
   bitmask_type const* const* __restrict__ mask_ptrs,
   size_type const* __restrict__ mask_offsets,
   size_type const* __restrict__ level_column_offsets,
-  size_type const* __restrict__ level_bit_offsets,
+  size_type const* __restrict__ level_word_offsets,
   size_type const* __restrict__ within_level_bit_offsets,
   bitmask_type* const* __restrict__ dest_masks,
+  size_type const* __restrict__ level_total_bits,
   size_type num_levels,
-  size_type total_bits,
+  size_type total_words,
   size_type* __restrict__ valid_counts)
 {
-  auto tidx         = cudf::detail::grid_1d::global_thread_id<block_size>();
-  auto const stride = cudf::detail::grid_1d::grid_stride<block_size>();
-  auto active_mask  = __ballot_sync(0xFFFF'FFFFu, tidx < total_bits);
+  // Each warp processes one word
+  auto const warp_idx      = cudf::detail::grid_1d::global_thread_id<block_size>() / warp_size;
+  auto const lane_idx      = threadIdx.x % warp_size;
+  auto const num_warps     = cudf::detail::grid_1d::grid_stride<block_size>() / warp_size;
+  size_type warp_valid_sum = 0;
+  size_type current_level  = -1;
 
-  size_type warp_valid_count = 0;
-  size_type last_level_idx   = -1;
-
-  while (tidx < total_bits) {
-    // Find which level this bit belongs to
+  for (size_type word_idx = warp_idx; word_idx < total_words; word_idx += num_warps) {
+    // Find which level this word belongs to using binary search
     size_type const level_idx =
       thrust::upper_bound(
-        thrust::seq, level_bit_offsets, level_bit_offsets + num_levels + 1, tidx) -
-      level_bit_offsets - 1;
+        thrust::seq, level_word_offsets, level_word_offsets + num_levels + 1, word_idx) -
+      level_word_offsets - 1;
 
-    // Get the bit index within this level
-    size_type const bit_in_level = tidx - level_bit_offsets[level_idx];
-
-    // Find which column within the level this bit belongs to
-    size_type const col_start         = level_column_offsets[level_idx];
-    size_type const* level_bit_starts = within_level_bit_offsets + col_start;
-    size_type const num_cols_in_level = level_column_offsets[level_idx + 1] - col_start;
-
-    size_type const col_in_level =
-      thrust::upper_bound(
-        thrust::seq, level_bit_starts, level_bit_starts + num_cols_in_level + 1, bit_in_level) -
-      level_bit_starts - 1;
-
-    size_type const global_col_idx = col_start + col_in_level;
-    size_type const bit_in_col     = bit_in_level - level_bit_starts[col_in_level];
-
-    // Read the validity bit from source
-    bitmask_type const* src_mask = mask_ptrs[global_col_idx];
-    size_type const src_offset   = mask_offsets[global_col_idx];
-    bool bit_is_set              = true;
-    if (src_mask != nullptr) {
-      size_type const src_bit_idx = src_offset + bit_in_col;
-      bit_is_set                  = (src_mask[src_bit_idx / 32] >> (src_bit_idx % 32)) & 1;
+    // Flush valid count when level changes
+    if (lane_idx == 0 && current_level != level_idx && current_level >= 0) {
+      atomicAdd(&valid_counts[current_level], warp_valid_sum);
+      warp_valid_sum = 0;
     }
+    current_level = level_idx;
 
-    // Use ballot to collect bits from the warp
-    bitmask_type const new_word = __ballot_sync(active_mask, bit_is_set);
+    // Get the word index within this level
+    size_type const word_in_level = word_idx - level_word_offsets[level_idx];
 
-    // First thread in warp writes the result and tracks valid count
-    if (threadIdx.x % warp_size == 0) {
-      bitmask_type* dest             = dest_masks[level_idx];
-      dest[word_index(bit_in_level)] = new_word;
+    // Calculate the bit index for this thread within the level
+    size_type const bit_in_level = word_in_level * warp_size + lane_idx;
 
-      // Flush accumulated count when level changes
-      if (last_level_idx != level_idx && last_level_idx >= 0) {
-        atomicAdd(&valid_counts[last_level_idx], warp_valid_count);
-        warp_valid_count = 0;
+    // Check if this bit is within the valid range for this level
+    bool bit_is_valid = false;
+    if (bit_in_level < level_total_bits[level_idx]) {
+      // Find which column within the level this bit belongs to
+      size_type const col_start         = level_column_offsets[level_idx];
+      size_type const* level_bit_starts = within_level_bit_offsets + col_start;
+      size_type const num_cols_in_level = level_column_offsets[level_idx + 1] - col_start;
+
+      size_type const col_in_level =
+        thrust::upper_bound(
+          thrust::seq, level_bit_starts, level_bit_starts + num_cols_in_level + 1, bit_in_level) -
+        level_bit_starts - 1;
+
+      size_type const global_col_idx = col_start + col_in_level;
+      size_type const bit_in_col     = bit_in_level - level_bit_starts[col_in_level];
+
+      // Read the validity bit from source
+      bitmask_type const* src_mask = mask_ptrs[global_col_idx];
+      if (src_mask == nullptr) {
+        bit_is_valid = true;  // No mask means all valid
+      } else {
+        size_type const src_offset  = mask_offsets[global_col_idx];
+        size_type const src_bit_idx = src_offset + bit_in_col;
+        bit_is_valid = (src_mask[src_bit_idx / warp_size] >> (src_bit_idx % warp_size)) & 1;
       }
-      warp_valid_count += __popc(new_word);
-      last_level_idx = level_idx;
     }
 
-    tidx += stride;
-    active_mask = __ballot_sync(active_mask, tidx < total_bits);
+    // Collect validity bits from all threads in warp
+    bitmask_type const new_word = __ballot_sync(0xFFFF'FFFFu, bit_is_valid);
+
+    // First thread in warp writes the result
+    if (lane_idx == 0) {
+      bitmask_type* dest  = dest_masks[level_idx];
+      dest[word_in_level] = new_word;
+      warp_valid_sum += __popc(new_word);
+    }
   }
 
   // Flush remaining valid count
-  if (threadIdx.x % warp_size == 0 && last_level_idx >= 0) {
-    atomicAdd(&valid_counts[last_level_idx], warp_valid_count);
+  if (lane_idx == 0 && current_level >= 0) {
+    atomicAdd(&valid_counts[current_level], warp_valid_sum);
   }
 }
 
@@ -330,16 +349,18 @@ batch_process_levels(std::vector<level_info> const& levels,
     std::vector<bitmask_type const*> all_mask_ptrs;
     std::vector<size_type> all_mask_offsets;
     std::vector<size_type> level_column_offsets{0};
-    std::vector<size_type> level_bit_offsets{0};
+    std::vector<size_type> level_word_offsets{0};
     std::vector<size_type> within_level_bit_offsets;
     std::vector<bitmask_type*> dest_mask_ptrs;
+    std::vector<size_type> level_total_bits;
 
-    size_type total_bits = 0;
+    size_type total_words = 0;
 
     for (size_type level_idx : levels_with_nulls) {
       auto const& level = levels[level_idx];
 
       dest_mask_ptrs.push_back(static_cast<bitmask_type*>(null_masks[level_idx].data()));
+      level_total_bits.push_back(level.total_rows);
 
       size_type level_bit_count = 0;
       for (size_t col = 0; col < level.mask_ptrs.size(); ++col) {
@@ -351,8 +372,11 @@ batch_process_levels(std::vector<level_info> const& levels,
       within_level_bit_offsets.push_back(level_bit_count);
 
       level_column_offsets.push_back(static_cast<size_type>(all_mask_ptrs.size()));
-      total_bits += level.total_rows;
-      level_bit_offsets.push_back(total_bits);
+
+      // Calculate number of words for this level (rounded up to warp size)
+      size_type const level_words = cudf::util::div_rounding_up_safe(level.total_rows, warp_size);
+      total_words += level_words;
+      level_word_offsets.push_back(total_words);
     }
 
     // Upload to device
@@ -362,29 +386,33 @@ batch_process_levels(std::vector<level_info> const& levels,
       make_device_uvector_async(all_mask_offsets, stream, cudf::get_current_device_resource_ref());
     auto d_level_column_offsets = make_device_uvector_async(
       level_column_offsets, stream, cudf::get_current_device_resource_ref());
-    auto d_level_bit_offsets =
-      make_device_uvector_async(level_bit_offsets, stream, cudf::get_current_device_resource_ref());
+    auto d_level_word_offsets = make_device_uvector_async(
+      level_word_offsets, stream, cudf::get_current_device_resource_ref());
     auto d_within_level_bit_offsets = make_device_uvector_async(
       within_level_bit_offsets, stream, cudf::get_current_device_resource_ref());
     auto d_dest_masks =
       make_device_uvector_async(dest_mask_ptrs, stream, cudf::get_current_device_resource_ref());
+    auto d_level_total_bits =
+      make_device_uvector_async(level_total_bits, stream, cudf::get_current_device_resource_ref());
     auto d_valid_counts = make_zeroed_device_uvector_async<size_type>(
       levels_with_nulls.size(), stream, cudf::get_current_device_resource_ref());
 
-    // Launch kernel
+    // Launch kernel - one warp per word
     constexpr size_type block_size{256};
-    cudf::detail::grid_1d config(total_bits, block_size);
+    size_type const num_threads = total_words * warp_size;
+    cudf::detail::grid_1d config(num_threads, block_size);
 
     batch_concatenate_masks_kernel<block_size>
       <<<config.num_blocks, config.num_threads_per_block, 0, stream.value()>>>(
         d_mask_ptrs.data(),
         d_mask_offsets.data(),
         d_level_column_offsets.data(),
-        d_level_bit_offsets.data(),
+        d_level_word_offsets.data(),
         d_within_level_bit_offsets.data(),
         d_dest_masks.data(),
+        d_level_total_bits.data(),
         static_cast<size_type>(levels_with_nulls.size()),
-        total_bits,
+        total_words,
         d_valid_counts.data());
 
     // Copy valid counts back and compute null counts
