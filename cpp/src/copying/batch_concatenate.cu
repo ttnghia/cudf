@@ -179,9 +179,11 @@ void collect_level_info_recursive(host_span<column_view const> cols,
  *
  * @param mask_ptrs Source mask pointers for all columns across all levels
  * @param mask_offsets Bit offset for each source mask (from column offset)
- * @param level_column_offsets Prefix sum of columns per level [num_levels + 1]
+ * @param level_bit_offset_starts Index into within_level_bit_offsets for each level [num_levels +
+ * 1]
+ * @param level_mask_ptr_starts Index into mask_ptrs for each level [num_levels + 1]
  * @param level_word_offsets Prefix sum of words per level [num_levels + 1]
- * @param within_level_bit_offsets Prefix sum of bits within each level [total_columns + 1]
+ * @param within_level_bit_offsets Prefix sum of bits within each level
  * @param dest_masks Output mask pointers for each level [num_levels]
  * @param level_total_bits Total bits for each level [num_levels]
  * @param num_levels Number of levels to process
@@ -192,7 +194,8 @@ template <size_type block_size>
 CUDF_KERNEL void batch_concatenate_masks_kernel(
   bitmask_type const* const* __restrict__ mask_ptrs,
   size_type const* __restrict__ mask_offsets,
-  size_type const* __restrict__ level_column_offsets,
+  size_type const* __restrict__ level_bit_offset_starts,
+  size_type const* __restrict__ level_mask_ptr_starts,
   size_type const* __restrict__ level_word_offsets,
   size_type const* __restrict__ within_level_bit_offsets,
   bitmask_type* const* __restrict__ dest_masks,
@@ -232,16 +235,20 @@ CUDF_KERNEL void batch_concatenate_masks_kernel(
     bool bit_is_valid = false;
     if (bit_in_level < level_total_bits[level_idx]) {
       // Find which column within the level this bit belongs to
-      size_type const col_start         = level_column_offsets[level_idx];
-      size_type const* level_bit_starts = within_level_bit_offsets + col_start;
-      size_type const num_cols_in_level = level_column_offsets[level_idx + 1] - col_start;
+      size_type const bit_offset_start = level_bit_offset_starts[level_idx];
+      size_type const bit_offset_end   = level_bit_offset_starts[level_idx + 1];
+      size_type const num_bit_entries  = bit_offset_end - bit_offset_start;  // This is num_cols + 1
+
+      size_type const* level_bit_starts = within_level_bit_offsets + bit_offset_start;
 
       size_type const col_in_level =
         thrust::upper_bound(
-          thrust::seq, level_bit_starts, level_bit_starts + num_cols_in_level + 1, bit_in_level) -
+          thrust::seq, level_bit_starts, level_bit_starts + num_bit_entries, bit_in_level) -
         level_bit_starts - 1;
 
-      size_type const global_col_idx = col_start + col_in_level;
+      // Get the global column index and bit position within that column
+      size_type const mask_ptr_start = level_mask_ptr_starts[level_idx];
+      size_type const global_col_idx = mask_ptr_start + col_in_level;
       size_type const bit_in_col     = bit_in_level - level_bit_starts[col_in_level];
 
       // Read the validity bit from source
@@ -380,7 +387,9 @@ batch_process_levels(std::vector<level_info> const& levels,
     // Reserve space upfront to avoid reallocations
     std::vector<bitmask_type const*> all_mask_ptrs;
     std::vector<size_type> all_mask_offsets;
-    std::vector<size_type> level_column_offsets;
+    std::vector<size_type>
+      level_bit_offset_starts;  // Index into within_level_bit_offsets for each level
+    std::vector<size_type> level_mask_ptr_starts;  // Index into all_mask_ptrs for each level
     std::vector<size_type> level_word_offsets;
     std::vector<size_type> within_level_bit_offsets;
     std::vector<bitmask_type*> dest_mask_ptrs;
@@ -388,13 +397,15 @@ batch_process_levels(std::vector<level_info> const& levels,
 
     all_mask_ptrs.reserve(total_columns);
     all_mask_offsets.reserve(total_columns);
-    level_column_offsets.reserve(num_null_levels + 1);
+    level_bit_offset_starts.reserve(num_null_levels + 1);
+    level_mask_ptr_starts.reserve(num_null_levels + 1);
     level_word_offsets.reserve(num_null_levels + 1);
     within_level_bit_offsets.reserve(total_columns + num_null_levels);
     dest_mask_ptrs.reserve(num_null_levels);
     level_total_bits.reserve(num_null_levels);
 
-    level_column_offsets.push_back(0);
+    level_bit_offset_starts.push_back(0);
+    level_mask_ptr_starts.push_back(0);
     level_word_offsets.push_back(0);
 
     size_type total_words = 0;
@@ -414,7 +425,9 @@ batch_process_levels(std::vector<level_info> const& levels,
       }
       within_level_bit_offsets.push_back(level_bit_count);
 
-      level_column_offsets.push_back(static_cast<size_type>(all_mask_ptrs.size()));
+      // Track where each level's data starts
+      level_bit_offset_starts.push_back(static_cast<size_type>(within_level_bit_offsets.size()));
+      level_mask_ptr_starts.push_back(static_cast<size_type>(all_mask_ptrs.size()));
 
       // Calculate number of words for this level (rounded up to warp size)
       size_type const level_words = cudf::util::div_rounding_up_safe(level.total_rows, warp_size);
@@ -427,8 +440,10 @@ batch_process_levels(std::vector<level_info> const& levels,
       make_device_uvector_async(all_mask_ptrs, stream, cudf::get_current_device_resource_ref());
     auto d_mask_offsets =
       make_device_uvector_async(all_mask_offsets, stream, cudf::get_current_device_resource_ref());
-    auto d_level_column_offsets = make_device_uvector_async(
-      level_column_offsets, stream, cudf::get_current_device_resource_ref());
+    auto d_level_bit_offset_starts = make_device_uvector_async(
+      level_bit_offset_starts, stream, cudf::get_current_device_resource_ref());
+    auto d_level_mask_ptr_starts = make_device_uvector_async(
+      level_mask_ptr_starts, stream, cudf::get_current_device_resource_ref());
     auto d_level_word_offsets = make_device_uvector_async(
       level_word_offsets, stream, cudf::get_current_device_resource_ref());
     auto d_within_level_bit_offsets = make_device_uvector_async(
@@ -449,7 +464,8 @@ batch_process_levels(std::vector<level_info> const& levels,
       <<<config.num_blocks, config.num_threads_per_block, 0, stream.value()>>>(
         d_mask_ptrs.data(),
         d_mask_offsets.data(),
-        d_level_column_offsets.data(),
+        d_level_bit_offset_starts.data(),
+        d_level_mask_ptr_starts.data(),
         d_level_word_offsets.data(),
         d_within_level_bit_offsets.data(),
         d_dest_masks.data(),
