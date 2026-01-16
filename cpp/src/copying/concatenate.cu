@@ -1,11 +1,12 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2020-2025, NVIDIA CORPORATION.
+ * SPDX-FileCopyrightText: Copyright (c) 2020-2026, NVIDIA CORPORATION.
  * SPDX-License-Identifier: Apache-2.0
  */
 
 #include <cudf/column/column.hpp>
 #include <cudf/column/column_device_view.cuh>
 #include <cudf/concatenate.hpp>
+#include <cudf/detail/concatenate.hpp>
 #include <cudf/detail/concatenate_masks.hpp>
 #include <cudf/detail/copy.hpp>
 #include <cudf/detail/device_scalar.hpp>
@@ -514,6 +515,12 @@ std::unique_ptr<column> concatenate(host_span<column_view const> columns_to_conc
     return std::make_unique<column>(
       data_type(type_id::EMPTY), length, rmm::device_buffer{}, rmm::device_buffer{}, length);
   }
+
+  // Use batch_concatenate for fixed-width and struct types (no lists, strings, or dictionaries)
+  if (can_use_batch_concatenate(columns_to_concat)) {
+    return batch_concatenate(columns_to_concat, stream, mr);
+  }
+
   return type_dispatcher<dispatch_storage_type>(
     columns_to_concat.front().type(), concatenate_dispatch{columns_to_concat, stream, mr});
 }
