@@ -245,27 +245,29 @@ CUDF_KERNEL void batch_concatenate_masks_kernel(bitmask_type const* const* __res
         size_type const src_word_idx  = src_bit_idx / bits_per_word;
         size_type const src_bit_shift = src_bit_idx % bits_per_word;
 
-        // Read source word(s) into uint64_t for shifting
-        uint64_t src_bits = static_cast<uint64_t>(src_mask[src_word_idx]);
+        // Read source word
+        bitmask_type src_bits = src_mask[src_word_idx];
 
-        // If we need bits from the next word and there are more bits available
+        // If we need bits from the next word, use funnel shift
         if (src_bit_shift + bits_to_copy > bits_per_word) {
           // Check if next word exists (need to check against column bounds)
           size_type const total_src_bits      = mask_offsets[col_idx] + col_size;
           size_type const next_word_start_bit = (src_word_idx + 1) * bits_per_word;
           if (next_word_start_bit < total_src_bits) {
-            src_bits |= (static_cast<uint64_t>(src_mask[src_word_idx + 1]) << bits_per_word);
+            // Use hardware funnel shift: extracts bits across two words
+            src_bits = __funnelshift_r(src_bits, src_mask[src_word_idx + 1], src_bit_shift);
+          } else {
+            src_bits >>= src_bit_shift;
           }
+        } else if (src_bit_shift > 0) {
+          src_bits >>= src_bit_shift;
         }
 
-        // Shift right to align the bits we want at position 0
-        src_bits >>= src_bit_shift;
-
         // Mask to get only the bits we need
-        bitmask_type const bits_mask      = (bits_to_copy == bits_per_word)
-                                              ? ~bitmask_type{0}
-                                              : ((bitmask_type{1} << bits_to_copy) - 1);
-        bitmask_type const extracted_bits = static_cast<bitmask_type>(src_bits) & bits_mask;
+        bitmask_type const bits_mask = (bits_to_copy == bits_per_word)
+                                         ? ~bitmask_type{0}
+                                         : ((bitmask_type{1} << bits_to_copy) - 1);
+        bitmask_type const extracted_bits = src_bits & bits_mask;
 
         // Place the extracted bits at the correct position in the output word
         output_word |= (extracted_bits << bits_filled);
