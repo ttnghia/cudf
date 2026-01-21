@@ -9,6 +9,7 @@
 #include <cudf/copying.hpp>
 #include <cudf/detail/concatenate.hpp>
 #include <cudf/detail/null_mask.hpp>
+#include <cudf/detail/nvtx/ranges.hpp>
 #include <cudf/detail/utilities/batched_memcpy.hpp>
 #include <cudf/detail/utilities/cuda.cuh>
 #include <cudf/detail/utilities/grid_1d.cuh>
@@ -230,6 +231,8 @@ batch_process_levels(std::vector<level_info> const& levels,
                      rmm::cuda_stream_view stream,
                      rmm::device_async_resource_ref mr)
 {
+  CUDF_FUNC_RANGE();
+
   size_type const num_levels = static_cast<size_type>(levels.size());
 
   // ========== PHASE 1: Allocate output buffers ==========
@@ -308,6 +311,8 @@ batch_process_levels(std::vector<level_info> const& levels,
   std::vector<size_type> null_counts(num_levels, 0);
 
   if (!levels_with_nulls.empty()) {
+    cudf::scoped_range r{"concatenate masks"};
+
     // Process each level with nulls
     for (size_type level_idx : levels_with_nulls) {
       auto const& level        = levels[level_idx];
@@ -368,6 +373,8 @@ std::unique_ptr<column> reconstruct_column(
   rmm::cuda_stream_view stream,
   rmm::device_async_resource_ref mr)
 {
+  CUDF_FUNC_RANGE();
+
   auto const& level             = levels[level_idx];
   auto& [null_mask, null_count] = mask_results[level_idx];
   size_type const current_level = level_idx;
@@ -448,6 +455,8 @@ std::unique_ptr<column> batch_concatenate(host_span<column_view const> columns_t
                                           rmm::cuda_stream_view stream,
                                           rmm::device_async_resource_ref mr)
 {
+  CUDF_FUNC_RANGE();
+
   CUDF_EXPECTS(!columns_to_concat.empty(), "Unexpected empty list of columns to concatenate.");
 
   // Check that all columns are supported types (plain types or struct types)
