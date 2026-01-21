@@ -170,17 +170,24 @@ void collect_level_info_recursive(host_span<column_view const> cols,
 }
 
 /**
- * @brief Concatenates bitmasks for a single level.
+ * @brief Concatenates bitmasks for a single level using word-level operations.
  *
- * Follows the same pattern as concatenate_masks_kernel but without computing null counts
- * (they are pre-computed on the host from input columns).
+ * Each thread processes one output word (32 bits). The algorithm:
+ * 1. Find which column(s) contribute to this output word
+ * 2. Read one or two source words into a uint64_t
+ * 3. Shift the bits to align with the output position
+ * 4. Write the output word (with special handling for column boundaries)
+ *
+ * For boundary handling: when an output word spans two columns, the thread processing
+ * the first word of the later column will merge the trailing bits from the previous
+ * column with its own bits.
  *
  * @param mask_ptrs Source mask pointers for columns in this level
  * @param mask_offsets Bit offset for each source mask (from column offset)
- * @param output_offsets Prefix sum of column sizes [num_columns + 1]
+ * @param output_offsets Prefix sum of column sizes (in bits) [num_columns + 1]
  * @param num_columns Number of columns being concatenated
  * @param dest_mask Output mask buffer
- * @param num_mask_bits Total number of bits in the output mask
+ * @param num_output_words Total number of words in the output mask
  */
 template <size_type block_size>
 CUDF_KERNEL void batch_concatenate_masks_kernel(bitmask_type const* const* __restrict__ mask_ptrs,
@@ -188,36 +195,90 @@ CUDF_KERNEL void batch_concatenate_masks_kernel(bitmask_type const* const* __res
                                                 size_type const* __restrict__ output_offsets,
                                                 size_type num_columns,
                                                 bitmask_type* __restrict__ dest_mask,
-                                                size_type num_mask_bits)
+                                                size_type num_output_words)
 {
-  auto tidx         = cudf::detail::grid_1d::global_thread_id<block_size>();
+  constexpr size_type bits_per_word = detail::size_in_bits<bitmask_type>();
+
+  auto word_idx     = cudf::detail::grid_1d::global_thread_id<block_size>();
   auto const stride = cudf::detail::grid_1d::grid_stride<block_size>();
-  auto active_mask  = __ballot_sync(0xFFFF'FFFFu, tidx < num_mask_bits);
 
-  while (tidx < num_mask_bits) {
-    auto const bit_idx = tidx;
+  while (word_idx < num_output_words) {
+    // Bit range for this output word
+    size_type const out_bit_start = word_idx * bits_per_word;
+    size_type const out_bit_end   = out_bit_start + bits_per_word;  // exclusive
 
-    // Find which column this bit belongs to
-    size_type const col_idx =
-      thrust::upper_bound(thrust::seq, output_offsets, output_offsets + num_columns + 1, bit_idx) -
+    // Find which column contains the start bit of this word
+    size_type col_idx =
+      thrust::upper_bound(
+        thrust::seq, output_offsets, output_offsets + num_columns + 1, out_bit_start) -
       output_offsets - 1;
 
-    bool bit_is_valid = true;
-    if (col_idx < num_columns) {
-      size_type const bit_in_col   = bit_idx - output_offsets[col_idx];
+    bitmask_type output_word = 0;
+    size_type bits_filled    = 0;
+
+    // Process columns that contribute to this output word
+    while (bits_filled < bits_per_word && col_idx < num_columns) {
+      size_type const col_start_bit = output_offsets[col_idx];
+      size_type const col_end_bit   = output_offsets[col_idx + 1];
+      size_type const col_size      = col_end_bit - col_start_bit;
+
+      // Calculate bit positions within this column
+      size_type const current_out_bit = out_bit_start + bits_filled;
+      size_type const bit_in_col      = current_out_bit - col_start_bit;
+
+      // How many bits can we take from this column?
+      size_type const bits_remaining_in_col = col_size - bit_in_col;
+      size_type const bits_needed           = bits_per_word - bits_filled;
+      size_type const bits_to_copy          = min(bits_remaining_in_col, bits_needed);
+
       bitmask_type const* src_mask = mask_ptrs[col_idx];
-      if (src_mask != nullptr) {
-        size_type const src_bit_idx = mask_offsets[col_idx] + bit_in_col;
-        bit_is_valid                = cudf::bit_is_set(src_mask, src_bit_idx);
+
+      if (src_mask == nullptr) {
+        // No mask means all valid (all 1s)
+        bitmask_type const all_ones_mask = (bits_to_copy == bits_per_word)
+                                             ? ~bitmask_type{0}
+                                             : ((bitmask_type{1} << bits_to_copy) - 1);
+        output_word |= (all_ones_mask << bits_filled);
+      } else {
+        // Calculate source bit position
+        size_type const src_bit_idx   = mask_offsets[col_idx] + bit_in_col;
+        size_type const src_word_idx  = src_bit_idx / bits_per_word;
+        size_type const src_bit_shift = src_bit_idx % bits_per_word;
+
+        // Read source word(s) into uint64_t for shifting
+        uint64_t src_bits = static_cast<uint64_t>(src_mask[src_word_idx]);
+
+        // If we need bits from the next word and there are more bits available
+        if (src_bit_shift + bits_to_copy > bits_per_word) {
+          // Check if next word exists (need to check against column bounds)
+          size_type const total_src_bits      = mask_offsets[col_idx] + col_size;
+          size_type const next_word_start_bit = (src_word_idx + 1) * bits_per_word;
+          if (next_word_start_bit < total_src_bits) {
+            src_bits |= (static_cast<uint64_t>(src_mask[src_word_idx + 1]) << bits_per_word);
+          }
+        }
+
+        // Shift right to align the bits we want at position 0
+        src_bits >>= src_bit_shift;
+
+        // Mask to get only the bits we need
+        bitmask_type const bits_mask      = (bits_to_copy == bits_per_word)
+                                              ? ~bitmask_type{0}
+                                              : ((bitmask_type{1} << bits_to_copy) - 1);
+        bitmask_type const extracted_bits = static_cast<bitmask_type>(src_bits) & bits_mask;
+
+        // Place the extracted bits at the correct position in the output word
+        output_word |= (extracted_bits << bits_filled);
       }
+
+      bits_filled += bits_to_copy;
+      col_idx++;
     }
 
-    bitmask_type const new_word = __ballot_sync(active_mask, bit_is_valid);
+    // Write the output word
+    dest_mask[word_idx] = output_word;
 
-    if (threadIdx.x % warp_size == 0) { dest_mask[word_index(bit_idx)] = new_word; }
-
-    tidx += stride;
-    active_mask = __ballot_sync(active_mask, tidx < num_mask_bits);
+    word_idx += stride;
   }
 }
 
@@ -334,9 +395,10 @@ batch_process_levels(std::vector<level_info> const& levels,
       auto d_output_offsets =
         make_device_uvector_async(output_offsets, stream, cudf::get_current_device_resource_ref());
 
-      // Launch kernel
+      // Launch kernel - one thread per output word
       constexpr size_type block_size{256};
-      cudf::detail::grid_1d config(num_mask_bits, block_size);
+      auto const num_output_words = cudf::util::div_rounding_up_safe(num_mask_bits, 32);
+      cudf::detail::grid_1d config(num_output_words, block_size);
 
       batch_concatenate_masks_kernel<block_size>
         <<<config.num_blocks, config.num_threads_per_block, 0, stream.value()>>>(
@@ -345,7 +407,7 @@ batch_process_levels(std::vector<level_info> const& levels,
           d_output_offsets.data(),
           static_cast<size_type>(num_columns),
           static_cast<bitmask_type*>(null_masks[level_idx].data()),
-          num_mask_bits);
+          num_output_words);
 
       // Use pre-computed null count
       null_counts[level_idx] = level.total_null_count;
