@@ -87,14 +87,14 @@ struct level_info {
   std::vector<bitmask_type const*> mask_ptrs;  // Source mask pointers (can be null)
   std::vector<size_type> mask_offsets;         // Bit offset for each mask
   std::vector<size_type> col_sizes;            // Number of rows in each column
-  std::vector<size_type> col_null_counts;      // Null count for each column
 
   // Level metadata
-  data_type dtype;         // Data type at this level
-  size_type total_rows;    // Total number of rows
-  size_type num_children;  // Number of children (for struct types)
-  bool has_nulls;          // Whether any column has nulls
-  bool is_struct;          // Whether this level is a struct type
+  data_type dtype;             // Data type at this level
+  size_type total_rows;        // Total number of rows
+  size_type total_null_count;  // Sum of null counts from all columns
+  size_type num_children;      // Number of children (for struct types)
+  bool has_nulls;              // Whether any column has nulls
+  bool is_struct;              // Whether this level is a struct type
 };
 
 /**
@@ -115,6 +115,7 @@ void collect_level_info_recursive(host_span<column_view const> cols,
   info.num_children     = first_col.num_children();
   info.has_nulls        = false;
   info.total_rows       = 0;
+  info.total_null_count = 0;
 
   // Compute element size once for fixed-width types
   std::size_t const element_size = info.is_struct ? 0 : cudf::size_of(info.dtype);
@@ -124,7 +125,6 @@ void collect_level_info_recursive(host_span<column_view const> cols,
   info.mask_ptrs.reserve(num_cols);
   info.mask_offsets.reserve(num_cols);
   info.col_sizes.reserve(num_cols);
-  info.col_null_counts.reserve(num_cols);
   if (!info.is_struct) {
     info.src_data_ptrs.reserve(num_cols);
     info.data_sizes.reserve(num_cols);
@@ -139,7 +139,7 @@ void collect_level_info_recursive(host_span<column_view const> cols,
     // Mask info
     info.mask_ptrs.push_back(col.null_mask());
     info.mask_offsets.push_back(col.offset());
-    info.col_null_counts.push_back(col.null_count());
+    info.total_null_count += col.null_count();
     if (col.has_nulls()) { info.has_nulls = true; }
 
     // Data info (only for non-struct types)
@@ -169,97 +169,54 @@ void collect_level_info_recursive(host_span<column_view const> cols,
 }
 
 /**
- * @brief Optimized kernel to concatenate bitmasks for multiple levels in a single launch.
+ * @brief Concatenates bitmasks for a single level.
  *
- * Key optimizations:
- * - Thread-per-bit processing with warp-level ballot for better parallelism
- * - Reduced binary searches by caching level indices within warps
- * - Memory coalescing through aligned warp-level operations
- * - Simplified indexing logic for fewer operations
+ * Follows the same pattern as concatenate_masks_kernel but without computing null counts
+ * (they are pre-computed on the host from input columns).
  *
- * Similar to concatenate_masks_kernel but optimized for batch processing of multiple levels.
- * Unlike concatenate_masks_kernel, this kernel does not compute null counts - they can be
- * efficiently summed on the host side from the input columns' null counts.
- *
- * @param mask_ptrs Source mask pointers for all columns across all levels
+ * @param mask_ptrs Source mask pointers for columns in this level
  * @param mask_offsets Bit offset for each source mask (from column offset)
- * @param level_bit_offset_starts Index into within_level_bit_offsets for each level [num_levels + 1]
- * @param level_mask_ptr_starts Index into mask_ptrs for each level [num_levels + 1]
- * @param level_word_offsets Prefix sum of words per level [num_levels + 1]
- * @param within_level_bit_offsets Prefix sum of bits within each level
- * @param dest_masks Output mask pointers for each level [num_levels]
- * @param level_total_bits Total bits for each level [num_levels]
- * @param num_levels Number of levels to process
- * @param total_words Total number of 32-bit words across all levels
+ * @param output_offsets Prefix sum of column sizes [num_columns + 1]
+ * @param num_columns Number of columns being concatenated
+ * @param dest_mask Output mask buffer
+ * @param num_mask_bits Total number of bits in the output mask
  */
 template <size_type block_size>
-CUDF_KERNEL void batch_concatenate_masks_kernel(
-  bitmask_type const* const* __restrict__ mask_ptrs,
-  size_type const* __restrict__ mask_offsets,
-  size_type const* __restrict__ level_bit_offset_starts,
-  size_type const* __restrict__ level_mask_ptr_starts,
-  size_type const* __restrict__ level_word_offsets,
-  size_type const* __restrict__ within_level_bit_offsets,
-  bitmask_type* const* __restrict__ dest_masks,
-  size_type const* __restrict__ level_total_bits,
-  size_type num_levels,
-  size_type total_words)
+CUDF_KERNEL void batch_concatenate_masks_kernel(bitmask_type const* const* __restrict__ mask_ptrs,
+                                                size_type const* __restrict__ mask_offsets,
+                                                size_type const* __restrict__ output_offsets,
+                                                size_type num_columns,
+                                                bitmask_type* __restrict__ dest_mask,
+                                                size_type num_mask_bits)
 {
-  auto const warp_idx  = cudf::detail::grid_1d::global_thread_id<block_size>() / warp_size;
-  auto const lane_idx  = threadIdx.x % warp_size;
-  auto const num_warps = cudf::detail::grid_1d::grid_stride<block_size>() / warp_size;
+  auto tidx         = cudf::detail::grid_1d::global_thread_id<block_size>();
+  auto const stride = cudf::detail::grid_1d::grid_stride<block_size>();
+  auto active_mask  = __ballot_sync(0xFFFF'FFFFu, tidx < num_mask_bits);
 
-  // Process one word per warp
-  for (size_type word_idx = warp_idx; word_idx < total_words; word_idx += num_warps) {
-    // Binary search to find level (first thread in warp, then broadcast)
-    size_type level_idx;
-    if (lane_idx == 0) {
-      level_idx = thrust::upper_bound(thrust::seq,
-                                      level_word_offsets,
-                                      level_word_offsets + num_levels + 1,
-                                      word_idx) -
-                  level_word_offsets - 1;
-    }
-    // Broadcast level_idx to all threads in warp
-    level_idx = __shfl_sync(0xFFFF'FFFFu, level_idx, 0);
+  while (tidx < num_mask_bits) {
+    auto const bit_idx = tidx;
 
-    size_type const word_in_level = word_idx - level_word_offsets[level_idx];
-    size_type const bit_in_level  = word_in_level * warp_size + lane_idx;
+    // Find which column this bit belongs to
+    size_type const col_idx =
+      thrust::upper_bound(thrust::seq, output_offsets, output_offsets + num_columns + 1, bit_idx) -
+      output_offsets - 1;
 
-    // Load level metadata (broadcast from lane 0 for better coalescing)
-    size_type const total_bits = level_total_bits[level_idx];
-    bool bit_is_valid          = false;
-
-    if (bit_in_level < total_bits) {
-      // Get level-specific offsets
-      size_type const bit_offset_start = level_bit_offset_starts[level_idx];
-      size_type const mask_ptr_start   = level_mask_ptr_starts[level_idx];
-      size_type const* level_bit_starts =
-        within_level_bit_offsets + bit_offset_start;
-      size_type const num_bit_entries = level_bit_offset_starts[level_idx + 1] - bit_offset_start;
-
-      // Find column within level
-      size_type const col_in_level =
-        thrust::upper_bound(
-          thrust::seq, level_bit_starts, level_bit_starts + num_bit_entries, bit_in_level) -
-        level_bit_starts - 1;
-
-      size_type const global_col_idx = mask_ptr_start + col_in_level;
-      size_type const bit_in_col     = bit_in_level - level_bit_starts[col_in_level];
-
-      // Read validity bit
-      bitmask_type const* src_mask = mask_ptrs[global_col_idx];
+    bool bit_is_valid = true;
+    if (col_idx < num_columns) {
+      size_type const bit_in_col   = bit_idx - output_offsets[col_idx];
+      bitmask_type const* src_mask = mask_ptrs[col_idx];
       if (src_mask != nullptr) {
-        size_type const src_bit_idx = mask_offsets[global_col_idx] + bit_in_col;
-        bit_is_valid = cudf::bit_is_set(src_mask, src_bit_idx);
-      } else {
-        bit_is_valid = true;  // No mask means all valid
+        size_type const src_bit_idx = mask_offsets[col_idx] + bit_in_col;
+        bit_is_valid                = cudf::bit_is_set(src_mask, src_bit_idx);
       }
     }
 
-    // Collect validity bits from all lanes and write result
-    bitmask_type const new_word = __ballot_sync(0xFFFF'FFFFu, bit_is_valid);
-    if (lane_idx == 0) { dest_masks[level_idx][word_in_level] = new_word; }
+    bitmask_type const new_word = __ballot_sync(active_mask, bit_is_valid);
+
+    if (threadIdx.x % warp_size == 0) { dest_mask[word_index(bit_idx)] = new_word; }
+
+    tidx += stride;
+    active_mask = __ballot_sync(active_mask, tidx < num_mask_bits);
   }
 }
 
@@ -351,110 +308,42 @@ batch_process_levels(std::vector<level_info> const& levels,
   std::vector<size_type> null_counts(num_levels, 0);
 
   if (!levels_with_nulls.empty()) {
-    auto const num_null_levels = levels_with_nulls.size();
-
-    // Pre-calculate total sizes for efficient allocation
-    size_t total_columns = 0;
+    // Process each level with nulls
     for (size_type level_idx : levels_with_nulls) {
-      total_columns += levels[level_idx].mask_ptrs.size();
-    }
+      auto const& level        = levels[level_idx];
+      auto const num_columns   = level.mask_ptrs.size();
+      auto const num_mask_bits = level.total_rows;
 
-    // Reserve space upfront to avoid reallocations
-    std::vector<bitmask_type const*> all_mask_ptrs;
-    std::vector<size_type> all_mask_offsets;
-    std::vector<size_type>
-      level_bit_offset_starts;  // Index into within_level_bit_offsets for each level
-    std::vector<size_type> level_mask_ptr_starts;  // Index into all_mask_ptrs for each level
-    std::vector<size_type> level_word_offsets;
-    std::vector<size_type> within_level_bit_offsets;
-    std::vector<bitmask_type*> dest_mask_ptrs;
-    std::vector<size_type> level_total_bits;
-
-    all_mask_ptrs.reserve(total_columns);
-    all_mask_offsets.reserve(total_columns);
-    level_bit_offset_starts.reserve(num_null_levels + 1);
-    level_mask_ptr_starts.reserve(num_null_levels + 1);
-    level_word_offsets.reserve(num_null_levels + 1);
-    within_level_bit_offsets.reserve(total_columns + num_null_levels);
-    dest_mask_ptrs.reserve(num_null_levels);
-    level_total_bits.reserve(num_null_levels);
-
-    level_bit_offset_starts.push_back(0);
-    level_mask_ptr_starts.push_back(0);
-    level_word_offsets.push_back(0);
-
-    size_type total_words = 0;
-
-    for (size_type level_idx : levels_with_nulls) {
-      auto const& level = levels[level_idx];
-
-      dest_mask_ptrs.push_back(static_cast<bitmask_type*>(null_masks[level_idx].data()));
-      level_total_bits.push_back(level.total_rows);
-
-      size_type level_bit_count = 0;
-      for (size_t col = 0; col < level.mask_ptrs.size(); ++col) {
-        all_mask_ptrs.push_back(level.mask_ptrs[col]);
-        all_mask_offsets.push_back(level.mask_offsets[col]);
-        within_level_bit_offsets.push_back(level_bit_count);
-        level_bit_count += level.col_sizes[col];
+      // Build output offsets (prefix sum of column sizes)
+      std::vector<size_type> output_offsets(num_columns + 1);
+      output_offsets[0] = 0;
+      for (size_t col = 0; col < num_columns; ++col) {
+        output_offsets[col + 1] = output_offsets[col] + level.col_sizes[col];
       }
-      within_level_bit_offsets.push_back(level_bit_count);
 
-      // Track where each level's data starts
-      level_bit_offset_starts.push_back(static_cast<size_type>(within_level_bit_offsets.size()));
-      level_mask_ptr_starts.push_back(static_cast<size_type>(all_mask_ptrs.size()));
+      // Upload to device
+      auto d_mask_ptrs =
+        make_device_uvector_async(level.mask_ptrs, stream, cudf::get_current_device_resource_ref());
+      auto d_mask_offsets = make_device_uvector_async(
+        level.mask_offsets, stream, cudf::get_current_device_resource_ref());
+      auto d_output_offsets =
+        make_device_uvector_async(output_offsets, stream, cudf::get_current_device_resource_ref());
 
-      // Calculate number of words for this level (rounded up to warp size)
-      size_type const level_words = cudf::util::div_rounding_up_safe(level.total_rows, warp_size);
-      total_words += level_words;
-      level_word_offsets.push_back(total_words);
-    }
+      // Launch kernel
+      constexpr size_type block_size{256};
+      cudf::detail::grid_1d config(num_mask_bits, block_size);
 
-    // Upload to device - use temporary memory resource for intermediate allocations
-    auto d_mask_ptrs =
-      make_device_uvector_async(all_mask_ptrs, stream, cudf::get_current_device_resource_ref());
-    auto d_mask_offsets =
-      make_device_uvector_async(all_mask_offsets, stream, cudf::get_current_device_resource_ref());
-    auto d_level_bit_offset_starts = make_device_uvector_async(
-      level_bit_offset_starts, stream, cudf::get_current_device_resource_ref());
-    auto d_level_mask_ptr_starts = make_device_uvector_async(
-      level_mask_ptr_starts, stream, cudf::get_current_device_resource_ref());
-    auto d_level_word_offsets = make_device_uvector_async(
-      level_word_offsets, stream, cudf::get_current_device_resource_ref());
-    auto d_within_level_bit_offsets = make_device_uvector_async(
-      within_level_bit_offsets, stream, cudf::get_current_device_resource_ref());
-    auto d_dest_masks =
-      make_device_uvector_async(dest_mask_ptrs, stream, cudf::get_current_device_resource_ref());
-    auto d_level_total_bits =
-      make_device_uvector_async(level_total_bits, stream, cudf::get_current_device_resource_ref());
+      batch_concatenate_masks_kernel<block_size>
+        <<<config.num_blocks, config.num_threads_per_block, 0, stream.value()>>>(
+          d_mask_ptrs.data(),
+          d_mask_offsets.data(),
+          d_output_offsets.data(),
+          static_cast<size_type>(num_columns),
+          static_cast<bitmask_type*>(null_masks[level_idx].data()),
+          num_mask_bits);
 
-    // Launch kernel - one warp per word
-    constexpr size_type block_size{256};
-    size_type const num_threads = total_words * warp_size;
-    cudf::detail::grid_1d config(num_threads, block_size);
-
-    batch_concatenate_masks_kernel<block_size>
-      <<<config.num_blocks, config.num_threads_per_block, 0, stream.value()>>>(
-        d_mask_ptrs.data(),
-        d_mask_offsets.data(),
-        d_level_bit_offset_starts.data(),
-        d_level_mask_ptr_starts.data(),
-        d_level_word_offsets.data(),
-        d_within_level_bit_offsets.data(),
-        d_dest_masks.data(),
-        d_level_total_bits.data(),
-        static_cast<size_type>(num_null_levels),
-        total_words);
-
-    // Compute null counts on host by summing null counts from input columns
-    for (size_t i = 0; i < num_null_levels; ++i) {
-      size_type const level_idx = levels_with_nulls[i];
-      auto const& level         = levels[level_idx];
-
-      // Sum up null counts from all input columns at this level
-      size_type total_null_count =
-        std::accumulate(level.col_null_counts.begin(), level.col_null_counts.end(), size_type{0});
-      null_counts[level_idx] = total_null_count;
+      // Use pre-computed null count
+      null_counts[level_idx] = level.total_null_count;
     }
   }
 
