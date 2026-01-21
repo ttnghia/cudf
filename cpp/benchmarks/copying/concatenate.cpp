@@ -146,8 +146,8 @@ static void bench_concatenate_fixed_width(nvbench::state& state)
 
 NVBENCH_BENCH(bench_concatenate_fixed_width)
   .set_name("concatenate_fixed_width")
-  .add_int64_axis("num_rows", {64, 512, 4096, 32768, 262144})
-  .add_int64_axis("num_cols", {2, 8, 64, 512, 1024})
+  .add_int64_axis("num_rows", {100000, 200000, 500000, 1000000})
+  .add_int64_axis("num_cols", {64, 512, 1024})
   .add_float64_axis("nulls", {0.0, 0.3});
 
 // Benchmark for concatenating struct columns (uses batch_concatenate path)
@@ -180,8 +180,8 @@ static void bench_concatenate_structs(nvbench::state& state)
 
 NVBENCH_BENCH(bench_concatenate_structs)
   .set_name("concatenate_structs")
-  .add_int64_axis("num_rows", {256, 4096, 32768, 262144})
-  .add_int64_axis("num_cols", {2, 8, 64, 256})
+  .add_int64_axis("num_rows", {100000, 200000, 500000})
+  .add_int64_axis("num_cols", {100})
   .add_int64_axis("num_children", {2, 4, 8})
   .add_int64_axis("depth", {1, 2, 4})
   .add_float64_axis("nulls", {0.0, 0.3});
