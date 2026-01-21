@@ -87,6 +87,7 @@ struct level_info {
   std::vector<bitmask_type const*> mask_ptrs;  // Source mask pointers (can be null)
   std::vector<size_type> mask_offsets;         // Bit offset for each mask
   std::vector<size_type> col_sizes;            // Number of rows in each column
+  std::vector<size_type> col_null_counts;      // Null count for each column
 
   // Level metadata
   data_type dtype;         // Data type at this level
@@ -123,6 +124,7 @@ void collect_level_info_recursive(host_span<column_view const> cols,
   info.mask_ptrs.reserve(num_cols);
   info.mask_offsets.reserve(num_cols);
   info.col_sizes.reserve(num_cols);
+  info.col_null_counts.reserve(num_cols);
   if (!info.is_struct) {
     info.src_data_ptrs.reserve(num_cols);
     info.data_sizes.reserve(num_cols);
@@ -137,6 +139,7 @@ void collect_level_info_recursive(host_span<column_view const> cols,
     // Mask info
     info.mask_ptrs.push_back(col.null_mask());
     info.mask_offsets.push_back(col.offset());
+    info.col_null_counts.push_back(col.null_count());
     if (col.has_nulls()) { info.has_nulls = true; }
 
     // Data info (only for non-struct types)
@@ -172,10 +175,9 @@ void collect_level_info_recursive(host_span<column_view const> cols,
  * The work is distributed across all levels and words, with each warp handling a complete word
  * to ensure no cross-level corruption.
  *
- * Optimizations:
- * - Uses shared memory to cache level metadata for frequently accessed levels
- * - Uses block-level reduction before atomic updates to reduce contention
- * - Processes words in contiguous chunks for better memory coalescing
+ * Similar to concatenate_masks_kernel but optimized for batch processing of multiple levels.
+ * Unlike concatenate_masks_kernel, this kernel does not compute null counts - they can be
+ * efficiently summed on the host side from the input columns' null counts.
  *
  * @param mask_ptrs Source mask pointers for all columns across all levels
  * @param mask_offsets Bit offset for each source mask (from column offset)
@@ -188,7 +190,6 @@ void collect_level_info_recursive(host_span<column_view const> cols,
  * @param level_total_bits Total bits for each level [num_levels]
  * @param num_levels Number of levels to process
  * @param total_words Total number of 32-bit words across all levels
- * @param valid_counts Output valid counts per level [num_levels]
  */
 template <size_type block_size>
 CUDF_KERNEL void batch_concatenate_masks_kernel(
@@ -201,18 +202,8 @@ CUDF_KERNEL void batch_concatenate_masks_kernel(
   bitmask_type* const* __restrict__ dest_masks,
   size_type const* __restrict__ level_total_bits,
   size_type num_levels,
-  size_type total_words,
-  size_type* __restrict__ valid_counts)
+  size_type total_words)
 {
-  // Shared memory for per-level valid counts within this block
-  // Maximum 32 levels supported in shared memory (covers most practical cases)
-  constexpr size_type max_cached_levels = 32;
-  __shared__ size_type block_valid_counts[max_cached_levels];
-
-  // Initialize shared memory valid counts to 0
-  if (threadIdx.x < max_cached_levels) { block_valid_counts[threadIdx.x] = 0; }
-  __syncthreads();
-
   // Each warp processes one word
   auto const warp_idx  = cudf::detail::grid_1d::global_thread_id<block_size>() / warp_size;
   auto const lane_idx  = threadIdx.x % warp_size;
@@ -265,26 +256,8 @@ CUDF_KERNEL void batch_concatenate_masks_kernel(
     // Collect validity bits from all threads in warp
     bitmask_type const new_word = __ballot_sync(0xFFFF'FFFFu, bit_is_valid);
 
-    // First thread in warp writes the result and accumulates valid count
-    if (lane_idx == 0) {
-      dest_masks[level_idx][word_in_level] = new_word;
-      size_type const word_valid_count     = __popc(new_word);
-
-      // Use shared memory for levels that fit, otherwise atomic directly
-      if (level_idx < max_cached_levels) {
-        atomicAdd(&block_valid_counts[level_idx], word_valid_count);
-      } else {
-        atomicAdd(&valid_counts[level_idx], word_valid_count);
-      }
-    }
-  }
-
-  // Sync before reducing shared memory counts to global
-  __syncthreads();
-
-  // First warp reduces shared memory counts to global memory
-  if (threadIdx.x < num_levels && threadIdx.x < max_cached_levels) {
-    atomicAdd(&valid_counts[threadIdx.x], block_valid_counts[threadIdx.x]);
+    // First thread in warp writes the result
+    if (lane_idx == 0) { dest_masks[level_idx][word_in_level] = new_word; }
   }
 }
 
@@ -452,8 +425,6 @@ batch_process_levels(std::vector<level_info> const& levels,
       make_device_uvector_async(dest_mask_ptrs, stream, cudf::get_current_device_resource_ref());
     auto d_level_total_bits =
       make_device_uvector_async(level_total_bits, stream, cudf::get_current_device_resource_ref());
-    auto d_valid_counts = make_zeroed_device_uvector_async<size_type>(
-      num_null_levels, stream, cudf::get_current_device_resource_ref());
 
     // Launch kernel - one warp per word
     constexpr size_type block_size{256};
@@ -471,19 +442,17 @@ batch_process_levels(std::vector<level_info> const& levels,
         d_dest_masks.data(),
         d_level_total_bits.data(),
         static_cast<size_type>(num_null_levels),
-        total_words,
-        d_valid_counts.data());
+        total_words);
 
-    // Copy valid counts back using pinned memory for efficient transfer
-    auto h_valid_counts = make_pinned_vector_async<size_type>(num_null_levels, stream);
-    cuda_memcpy_async<size_type>(
-      host_span<size_type>{h_valid_counts}, device_span<size_type const>{d_valid_counts}, stream);
-    stream.synchronize();
-
+    // Compute null counts on host by summing null counts from input columns
     for (size_t i = 0; i < num_null_levels; ++i) {
-      size_type const level_idx   = levels_with_nulls[i];
-      size_type const valid_count = h_valid_counts[i];
-      null_counts[level_idx]      = levels[level_idx].total_rows - valid_count;
+      size_type const level_idx = levels_with_nulls[i];
+      auto const& level         = levels[level_idx];
+
+      // Sum up null counts from all input columns at this level
+      size_type total_null_count =
+        std::accumulate(level.col_null_counts.begin(), level.col_null_counts.end(), size_type{0});
+      null_counts[level_idx] = total_null_count;
     }
   }
 
