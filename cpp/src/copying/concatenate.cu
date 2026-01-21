@@ -516,11 +516,6 @@ std::unique_ptr<column> concatenate(host_span<column_view const> columns_to_conc
       data_type(type_id::EMPTY), length, rmm::device_buffer{}, rmm::device_buffer{}, length);
   }
 
-  // Use batch_concatenate for fixed-width and struct types (no lists, strings, or dictionaries)
-  if (can_use_batch_concatenate(columns_to_concat)) {
-    return batch_concatenate(columns_to_concat, stream, mr);
-  }
-
   return type_dispatcher<dispatch_storage_type>(
     columns_to_concat.front().type(), concatenate_dispatch{columns_to_concat, stream, mr});
 }
