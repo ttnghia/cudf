@@ -189,6 +189,9 @@ void collect_level_info_recursive(host_span<column_view const> cols,
  * @param dest_mask Output mask buffer
  * @param num_output_words Total number of words in the output mask
  */
+// Maximum number of columns that can fit in shared memory (num_columns + 1 offsets)
+constexpr size_type max_smem_columns = 1024;
+
 template <size_type block_size>
 CUDF_KERNEL void batch_concatenate_masks_kernel(bitmask_type const* const* __restrict__ mask_ptrs,
                                                 size_type const* __restrict__ mask_offsets,
@@ -198,6 +201,21 @@ CUDF_KERNEL void batch_concatenate_masks_kernel(bitmask_type const* const* __res
                                                 size_type num_output_words)
 {
   constexpr size_type bits_per_word = detail::size_in_bits<bitmask_type>();
+
+  // Load output_offsets into shared memory if it fits
+  __shared__ size_type smem_output_offsets[max_smem_columns + 1];
+  bool const use_smem = (num_columns <= max_smem_columns);
+
+  if (use_smem) {
+    // Cooperatively load output_offsets into shared memory
+    for (size_type i = threadIdx.x; i <= num_columns; i += block_size) {
+      smem_output_offsets[i] = output_offsets[i];
+    }
+    __syncthreads();
+  }
+
+  // Pointer to use for output_offsets lookups
+  size_type const* offsets_ptr = use_smem ? smem_output_offsets : output_offsets;
 
   auto word_idx     = cudf::detail::grid_1d::global_thread_id<block_size>();
   auto const stride = cudf::detail::grid_1d::grid_stride<block_size>();
@@ -209,17 +227,16 @@ CUDF_KERNEL void batch_concatenate_masks_kernel(bitmask_type const* const* __res
 
     // Find which column contains the start bit of this word
     size_type col_idx =
-      thrust::upper_bound(
-        thrust::seq, output_offsets, output_offsets + num_columns + 1, out_bit_start) -
-      output_offsets - 1;
+      thrust::upper_bound(thrust::seq, offsets_ptr, offsets_ptr + num_columns + 1, out_bit_start) -
+      offsets_ptr - 1;
 
     bitmask_type output_word = 0;
     size_type bits_filled    = 0;
 
     // Process columns that contribute to this output word
     while (bits_filled < bits_per_word && col_idx < num_columns) {
-      size_type const col_start_bit = output_offsets[col_idx];
-      size_type const col_end_bit   = output_offsets[col_idx + 1];
+      size_type const col_start_bit = offsets_ptr[col_idx];
+      size_type const col_end_bit   = offsets_ptr[col_idx + 1];
       size_type const col_size      = col_end_bit - col_start_bit;
 
       // Calculate bit positions within this column
