@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2020-2024, NVIDIA CORPORATION.
+ * SPDX-FileCopyrightText: Copyright (c) 2020-2026, NVIDIA CORPORATION.
  * SPDX-License-Identifier: Apache-2.0
  */
 #pragma once
@@ -81,6 +81,35 @@ std::unique_ptr<column> concatenate(
  */
 std::unique_ptr<table> concatenate(
   host_span<table_view const> tables_to_concat,
+  rmm::cuda_stream_view stream      = cudf::get_default_stream(),
+  rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref());
+
+/**
+ * @brief Concatenates multiple columns into a single column using batched memory operations.
+ *
+ * This function performs concatenation using batched memory copy operations
+ * (cub::DeviceMemcpy::Batched) and batched mask concatenation kernels. It produces
+ * identical results to cudf::concatenate but is optimized for reducing kernel launch
+ * overhead by processing all nesting levels in fewer operations.
+ *
+ * Supported types:
+ * - Fixed-width types (int, float, etc.)
+ * - Struct types (recursively supports all nested types)
+ * - String types
+ * - List types (recursively supports nested lists and all child types)
+ * - Dictionary types (delegated to specialized implementation)
+ *
+ * @throws cudf::logic_error If types of the input columns mismatch
+ * @throws std::overflow_error If the total number of output rows exceeds cudf::size_type
+ *
+ * @param columns_to_concat Column views to be concatenated into a single column
+ * @param stream CUDA stream used for device memory operations and kernel launches
+ * @param mr Device memory resource used to allocate the returned column's device memory
+ * @return A single column having all the rows from the elements of `columns_to_concat` respectively
+ * in the same order.
+ */
+std::unique_ptr<column> batch_concatenate(
+  host_span<column_view const> columns_to_concat,
   rmm::cuda_stream_view stream      = cudf::get_default_stream(),
   rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref());
 

@@ -1019,4 +1019,13 @@ bool can_use_batch_concatenate(host_span<column_view const> columns)
 }
 
 }  // namespace detail
+
+std::unique_ptr<column> batch_concatenate(host_span<column_view const> columns_to_concat,
+                                          rmm::cuda_stream_view stream,
+                                          rmm::device_async_resource_ref mr)
+{
+  CUDF_FUNC_RANGE();
+  return detail::batch_concatenate(columns_to_concat, stream, mr);
+}
+
 }  // namespace cudf
