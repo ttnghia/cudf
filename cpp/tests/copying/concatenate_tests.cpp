@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2020-2025, NVIDIA CORPORATION.
+ * SPDX-FileCopyrightText: Copyright (c) 2020-2026, NVIDIA CORPORATION.
  * SPDX-License-Identifier: Apache-2.0
  */
 
@@ -1713,4 +1713,226 @@ TEST_F(TableOfEmptyColumnsTest, SimpleTest)
   for (auto i = 0; i < num_columns; ++i) {
     ASSERT_EQ(result->get_column(i).type().id(), cudf::type_id::EMPTY);
   }
+}
+
+// Tests for batch_concatenate with LIST and DICTIONARY types
+// batch_concatenate is called internally by cudf::concatenate, so we test via the public API
+
+struct BatchConcatenateListTest : public cudf::test::BaseFixture {};
+
+TEST_F(BatchConcatenateListTest, SimpleList)
+{
+  using LCW = cudf::test::lists_column_wrapper<int>;
+
+  LCW a{0, 1, 2, 3};
+  LCW b{4, 5, 6, 7, 8, 9, 10};
+  LCW expected{{0, 1, 2, 3}, {4, 5, 6, 7, 8, 9, 10}};
+
+  std::vector<cudf::column_view> views({a, b});
+  auto result = cudf::concatenate(views);
+
+  CUDF_TEST_EXPECT_COLUMNS_EQUAL(*result, expected);
+}
+
+TEST_F(BatchConcatenateListTest, NestedList)
+{
+  using LCW = cudf::test::lists_column_wrapper<int>;
+
+  LCW a{{{0, 1}, {2}}, {{4, 5, 6, 7, 8, 9, 10}}};
+  LCW b{{{6, 7}}, {{8, 9, 10}, {11, 12}}};
+  LCW expected{{{0, 1}, {2}}, {{4, 5, 6, 7, 8, 9, 10}}, {{6, 7}}, {{8, 9, 10}, {11, 12}}};
+
+  std::vector<cudf::column_view> views({a, b});
+  auto result = cudf::concatenate(views);
+
+  CUDF_TEST_EXPECT_COLUMNS_EQUAL(*result, expected);
+}
+
+TEST_F(BatchConcatenateListTest, DeeplyNestedList)
+{
+  using LCW = cudf::test::lists_column_wrapper<int>;
+
+  // 3-level nesting: LIST<LIST<LIST<INT>>>
+  LCW a{{{{1, 2}, {3}}}};
+  LCW b{{{{4, 5}}, {{6, 7, 8}}}};
+  LCW expected{{{{1, 2}, {3}}}, {{{4, 5}}, {{6, 7, 8}}}};
+
+  std::vector<cudf::column_view> views({a, b});
+  auto result = cudf::concatenate(views);
+
+  CUDF_TEST_EXPECT_COLUMNS_EQUAL(*result, expected);
+}
+
+TEST_F(BatchConcatenateListTest, ListWithNulls)
+{
+  using LCW = cudf::test::lists_column_wrapper<int>;
+
+  auto valids =
+    cudf::detail::make_counting_transform_iterator(0, [](auto i) { return i % 2 == 0; });
+
+  LCW a{{{0, 1, 2, 3}, valids}};
+  LCW b{{{4, 6, 7}, valids}};
+  LCW expected{{{0, 1, 2, 3}, valids}, {{4, 6, 7}, valids}};
+
+  std::vector<cudf::column_view> views({a, b});
+  auto result = cudf::concatenate(views);
+
+  CUDF_TEST_EXPECT_COLUMNS_EQUAL(*result, expected);
+}
+
+TEST_F(BatchConcatenateListTest, ListOfStrings)
+{
+  using SLCW = cudf::test::lists_column_wrapper<cudf::string_view>;
+
+  SLCW a{{"a", "b", "c"}, {"d", "e"}};
+  SLCW b{{"f"}, {"g", "h", "i", "j"}};
+  SLCW expected{{"a", "b", "c"}, {"d", "e"}, {"f"}, {"g", "h", "i", "j"}};
+
+  std::vector<cudf::column_view> views({a, b});
+  auto result = cudf::concatenate(views);
+
+  CUDF_TEST_EXPECT_COLUMNS_EQUAL(*result, expected);
+}
+
+TEST_F(BatchConcatenateListTest, ManyColumns)
+{
+  using LCW = cudf::test::lists_column_wrapper<int>;
+
+  // Test with many columns to ensure batch processing works correctly
+  std::vector<LCW> columns;
+  std::vector<cudf::column_view> views;
+
+  for (int i = 0; i < 100; ++i) {
+    columns.push_back(LCW{{i * 3, i * 3 + 1, i * 3 + 2}});
+  }
+  for (auto& col : columns) {
+    views.push_back(col);
+  }
+
+  auto result = cudf::concatenate(views);
+  EXPECT_EQ(result->size(), 100);
+}
+
+TEST_F(BatchConcatenateListTest, EmptyLists)
+{
+  using LCW = cudf::test::lists_column_wrapper<int>;
+
+  LCW a{LCW{}};
+  LCW b{4, 5, 6, 7};
+  LCW expected{LCW{}, {4, 5, 6, 7}};
+
+  std::vector<cudf::column_view> views({a, b});
+  auto result = cudf::concatenate(views);
+
+  CUDF_TEST_EXPECT_COLUMNS_EQUAL(*result, expected);
+}
+
+TEST_F(BatchConcatenateListTest, SlicedList)
+{
+  using LCW = cudf::test::lists_column_wrapper<int>;
+
+  LCW full{{0, 1}, {2, 3}, {4, 5}, {6, 7}};
+  auto sliced = cudf::slice(full, {1, 3});
+
+  LCW b{{8, 9}};
+  LCW expected{{2, 3}, {4, 5}, {8, 9}};
+
+  std::vector<cudf::column_view> views({sliced[0], b});
+  auto result = cudf::concatenate(views);
+
+  CUDF_TEST_EXPECT_COLUMNS_EQUAL(*result, expected);
+}
+
+struct BatchConcatenateDictionaryTest : public cudf::test::BaseFixture {};
+
+TEST_F(BatchConcatenateDictionaryTest, SimpleDictionary)
+{
+  cudf::test::strings_column_wrapper strings({"aaa", "bbb", "aaa", "ccc", "bbb"});
+  auto dictionary = cudf::dictionary::encode(strings);
+
+  std::vector<cudf::column_view> sliced_views = cudf::slice(dictionary->view(), {0, 2, 2, 5});
+  auto result                                 = cudf::concatenate(sliced_views);
+
+  auto decoded = cudf::dictionary::decode(result->view());
+  CUDF_TEST_EXPECT_COLUMNS_EQUAL(*decoded, strings);
+}
+
+TEST_F(BatchConcatenateDictionaryTest, ManyDictionaryColumns)
+{
+  cudf::test::fixed_width_column_wrapper<int32_t> original({10, 30, 20, 30, 10, 40});
+  auto dictionary = cudf::dictionary::encode(original);
+
+  std::vector<cudf::column_view> views;
+  for (int i = 0; i < 50; ++i) {
+    views.push_back(dictionary->view());
+  }
+
+  auto result  = cudf::concatenate(views);
+  auto decoded = cudf::dictionary::decode(result->view());
+
+  // Verify size
+  EXPECT_EQ(decoded->size(), 50 * 6);
+}
+
+struct BatchConcatenateStructWithListTest : public cudf::test::BaseFixture {};
+
+TEST_F(BatchConcatenateStructWithListTest, StructContainingList)
+{
+  using LCW = cudf::test::lists_column_wrapper<int32_t>;
+  using SCW = cudf::test::structs_column_wrapper;
+
+  // STRUCT<INT32, LIST<INT32>>
+  cudf::test::fixed_width_column_wrapper<int32_t> int_col1({1, 2, 3});
+  LCW list_col1{{10, 11}, {12}, {13, 14, 15}};
+  SCW struct1({int_col1, list_col1});
+
+  cudf::test::fixed_width_column_wrapper<int32_t> int_col2({4, 5});
+  LCW list_col2{{16, 17}, {18, 19}};
+  SCW struct2({int_col2, list_col2});
+
+  std::vector<cudf::column_view> views({struct1, struct2});
+  auto result = cudf::concatenate(views);
+
+  // Build expected result by concatenating children separately (matching existing test pattern)
+  auto expected_int_col = cudf::concatenate(std::vector<cudf::column_view>({int_col1, int_col2}));
+  auto expected_list_col =
+    cudf::concatenate(std::vector<cudf::column_view>({list_col1, list_col2}));
+  std::vector<std::unique_ptr<cudf::column>> expected_children;
+  expected_children.push_back(std::move(expected_int_col));
+  expected_children.push_back(std::move(expected_list_col));
+  auto expected =
+    cudf::make_structs_column(5, std::move(expected_children), 0, rmm::device_buffer{});
+
+  CUDF_TEST_EXPECT_COLUMNS_EQUIVALENT(*result, *expected);
+}
+
+TEST_F(BatchConcatenateStructWithListTest, StructContainingNestedList)
+{
+  using LCW = cudf::test::lists_column_wrapper<int32_t>;
+  using SCW = cudf::test::structs_column_wrapper;
+
+  // STRUCT<LIST<LIST<INT32>>>
+  // list_col1: 1 row - outer list contains 1 middle list containing 2 inner lists
+  // Row 0: [[{1,2}, {3}]]
+  LCW list_col1{LCW{LCW{LCW{1, 2}, LCW{3}}}};
+  SCW struct1({list_col1});
+
+  // list_col2: 2 rows - each outer list element contains middle lists
+  // Row 0: [[{4}]]
+  // Row 1: [[{5, 6}]]
+  LCW list_col2{LCW{LCW{LCW{4}}}, LCW{LCW{LCW{5, 6}}}};
+  SCW struct2({list_col2});
+
+  std::vector<cudf::column_view> views({struct1, struct2});
+  auto result = cudf::concatenate(views);
+
+  // Build expected result by concatenating children separately (matching existing test pattern)
+  auto expected_list_col =
+    cudf::concatenate(std::vector<cudf::column_view>({list_col1, list_col2}));
+  std::vector<std::unique_ptr<cudf::column>> expected_children;
+  expected_children.push_back(std::move(expected_list_col));
+  auto expected =
+    cudf::make_structs_column(3, std::move(expected_children), 0, rmm::device_buffer{});
+
+  CUDF_TEST_EXPECT_COLUMNS_EQUIVALENT(*result, *expected);
 }

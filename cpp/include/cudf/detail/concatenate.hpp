@@ -46,15 +46,18 @@ std::unique_ptr<table> concatenate(host_span<table_view const> tables_to_concat,
  * identical results to cudf::concatenate but is optimized for reducing kernel launch
  * overhead by processing all nesting levels in fewer operations.
  *
- * @note This function supports fixed-width (plain) types, struct types, and string types.
- * Lists and dictionaries are NOT supported.
+ * Supported types:
+ * - Fixed-width types (int, float, etc.)
+ * - Struct types (recursively supports all nested types)
+ * - String types
+ * - List types (recursively supports nested lists and all child types)
+ * - Dictionary types (delegated to specialized implementation)
  *
  * @param columns_to_concat Columns to concatenate
  * @param stream CUDA stream used for device memory operations and kernel launches.
  * @param mr Device memory resource used for allocating the returned column's device memory.
  * @return A single column containing all rows from the input columns.
  *
- * @throws cudf::logic_error if columns contain unsupported types (lists, dictionaries)
  * @throws cudf::logic_error if column types don't match
  * @throws std::overflow_error if total row count exceeds size_type limits
  */
@@ -65,8 +68,8 @@ std::unique_ptr<column> batch_concatenate(host_span<column_view const> columns_t
 /**
  * @brief Checks if batch_concatenate can be used for the given columns.
  *
- * Returns true if all columns are fixed-width, struct, or string types (with no nested
- * lists or dictionaries).
+ * Returns true if all columns are of supported types: fixed-width, struct, string,
+ * list, or dictionary types.
  *
  * @param columns Columns to check
  * @return true if batch_concatenate can be used, false otherwise

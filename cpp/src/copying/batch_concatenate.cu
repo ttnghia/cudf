@@ -8,6 +8,7 @@
 #include <cudf/concatenate.hpp>
 #include <cudf/copying.hpp>
 #include <cudf/detail/concatenate.hpp>
+#include <cudf/detail/get_value.cuh>
 #include <cudf/detail/null_mask.hpp>
 #include <cudf/detail/nvtx/ranges.hpp>
 #include <cudf/detail/offsets_iterator_factory.cuh>
@@ -16,6 +17,9 @@
 #include <cudf/detail/utilities/grid_1d.cuh>
 #include <cudf/detail/utilities/integer_utils.hpp>
 #include <cudf/detail/utilities/vector_factories.hpp>
+#include <cudf/dictionary/detail/concatenate.hpp>
+#include <cudf/dictionary/dictionary_column_view.hpp>
+#include <cudf/lists/lists_column_view.hpp>
 #include <cudf/strings/detail/utilities.hpp>
 #include <cudf/strings/strings_column_view.hpp>
 #include <cudf/structs/structs_column_view.hpp>
@@ -37,6 +41,7 @@
 #include <algorithm>
 #include <limits>
 #include <numeric>
+#include <optional>
 #include <utility>
 #include <vector>
 
@@ -47,12 +52,14 @@ namespace {
 /**
  * @brief Checks if the given data type is supported by batch_concatenate.
  *
- * Supported types are: fixed-width types (plain types), struct types, and string types.
- * Lists and dictionaries are NOT supported.
+ * Supported types are: fixed-width types (plain types), struct types, string types,
+ * list types, and dictionary types.
  */
 bool is_batch_concat_supported_type(data_type type)
 {
-  return cudf::is_fixed_width(type) || type.id() == type_id::STRUCT || type.id() == type_id::STRING;
+  return cudf::is_fixed_width(type) || type.id() == type_id::STRUCT ||
+         type.id() == type_id::STRING || type.id() == type_id::LIST ||
+         type.id() == type_id::DICTIONARY32;
 }
 
 /**
@@ -67,7 +74,14 @@ bool is_column_batch_concat_supported(column_view const& col)
       if (!is_column_batch_concat_supported(col.child(i))) { return false; }
     }
   }
-  // STRING type: no need to check children - offsets and chars are handled specially
+  // LIST type: recursively check child column
+  if (col.type().id() == type_id::LIST) {
+    if (col.size() > 0) {
+      lists_column_view lcv(col);
+      if (!is_column_batch_concat_supported(lcv.child())) { return false; }
+    }
+  }
+  // STRING and DICTIONARY types: no need to check children - handled specially
   return true;
 }
 
@@ -95,13 +109,21 @@ struct level_info {
   std::vector<size_type> mask_offsets;         // Bit offset for each mask
   std::vector<size_type> col_sizes;            // Number of rows in each column
 
-  // String-specific info (for offset concatenation)
+  // String/List offset concatenation info
   std::vector<void const*> src_offsets_ptrs;         // Source offsets pointers
   std::vector<size_type> src_offsets_offsets;        // Offset within each source offsets column
-  std::vector<std::size_t> chars_partition_offsets;  // Cumulative char offsets for each column
+  std::vector<std::size_t> chars_partition_offsets;  // Cumulative child offsets for each column
   std::vector<int64_t> first_src_offsets;  // First offset value for each column (for adjustment)
   data_type offsets_dtype;                 // Type of offsets column (INT32 or INT64)
-  std::size_t total_chars_bytes;           // Total bytes in chars buffer
+  std::size_t total_child_size;            // Total chars bytes (STRING) or child rows (LIST)
+
+  // LIST-specific info
+  data_type child_dtype;  // Type of child column (for empty list reconstruction)
+  std::optional<column_view> empty_child_like;  // Child column view for empty_like (nested types)
+
+  // DICTIONARY delegation info
+  bool delegate_to_specialized;               // If true, skip batch processing and delegate
+  std::vector<column_view> original_columns;  // Store column views for delegation
 
   // Level metadata
   data_type dtype;             // Data type at this level
@@ -111,6 +133,8 @@ struct level_info {
   bool has_nulls;              // Whether any column has nulls
   bool is_struct;              // Whether this level is a struct type
   bool is_string;              // Whether this level is a string type
+  bool is_list;                // Whether this level is a list type
+  bool is_dictionary;          // Whether this level is a dictionary type
 };
 
 /**
@@ -125,26 +149,49 @@ void collect_level_info_recursive(host_span<column_view const> cols,
   if (cols.empty()) return;
 
   level_info info;
-  auto const& first_col  = cols.front();
-  info.dtype             = first_col.type();
-  info.is_struct         = (info.dtype.id() == type_id::STRUCT);
-  info.is_string         = (info.dtype.id() == type_id::STRING);
-  info.num_children      = first_col.num_children();
-  info.has_nulls         = false;
-  info.total_rows        = 0;
-  info.total_null_count  = 0;
-  info.total_chars_bytes = 0;
+  auto const& first_col        = cols.front();
+  info.dtype                   = first_col.type();
+  info.is_struct               = (info.dtype.id() == type_id::STRUCT);
+  info.is_string               = (info.dtype.id() == type_id::STRING);
+  info.is_list                 = (info.dtype.id() == type_id::LIST);
+  info.is_dictionary           = (info.dtype.id() == type_id::DICTIONARY32);
+  info.delegate_to_specialized = info.is_dictionary;
+  info.num_children            = first_col.num_children();
+  info.has_nulls               = false;
+  info.total_rows              = 0;
+  info.total_null_count        = 0;
+  info.total_child_size        = 0;
 
   // Compute element size once for fixed-width types
   std::size_t const element_size =
-    (info.is_struct || info.is_string) ? 0 : cudf::size_of(info.dtype);
+    (info.is_struct || info.is_string || info.is_list || info.is_dictionary)
+      ? 0
+      : cudf::size_of(info.dtype);
 
   // Reserve space to avoid reallocations
   auto const num_cols = cols.size();
   info.mask_ptrs.reserve(num_cols);
   info.mask_offsets.reserve(num_cols);
   info.col_sizes.reserve(num_cols);
-  if (!info.is_struct && !info.is_string) {
+
+  // Handle DICTIONARY delegation - collect columns and return early
+  if (info.delegate_to_specialized) {
+    // Collect basic mask info for all columns first
+    for (auto const& col : cols) {
+      auto const col_size = col.size();
+      info.total_rows += col_size;
+      info.col_sizes.push_back(col_size);
+      info.mask_ptrs.push_back(col.null_mask());
+      info.mask_offsets.push_back(col.offset());
+      info.total_null_count += col.null_count();
+      if (col.has_nulls()) { info.has_nulls = true; }
+      info.original_columns.push_back(col);
+    }
+    levels.push_back(std::move(info));
+    return;  // Don't recurse - specialized implementation handles everything
+  }
+
+  if (!info.is_struct && !info.is_string && !info.is_list) {
     info.src_data_ptrs.reserve(num_cols);
     info.data_sizes.reserve(num_cols);
   }
@@ -163,6 +210,25 @@ void collect_level_info_recursive(host_span<column_view const> cols,
       if (col.size() > 0) {
         strings_column_view scv(col);
         info.offsets_dtype = scv.offsets().type();
+        break;
+      }
+    }
+  }
+  if (info.is_list) {
+    info.src_offsets_ptrs.reserve(num_cols);
+    info.src_offsets_offsets.reserve(num_cols);
+    info.chars_partition_offsets.reserve(num_cols + 1);
+    info.chars_partition_offsets.push_back(0);  // First offset is 0
+    info.first_src_offsets.reserve(num_cols);
+    info.offsets_dtype = data_type{type_id::INT32};  // LIST offsets are always INT32
+
+    // Store child info for empty list reconstruction
+    // Find first non-empty column to get child type and view
+    for (auto const& col : cols) {
+      if (col.size() > 0) {
+        lists_column_view lcv(col);
+        info.child_dtype      = lcv.child().type();
+        info.empty_child_like = lcv.child();  // Store for empty_like on nested types
         break;
       }
     }
@@ -199,8 +265,8 @@ void collect_level_info_recursive(host_span<column_view const> cols,
         // For sliced columns, chars start at first_offset from the beginning
         info.src_data_ptrs.push_back(scv.chars_begin(stream) + first_offset);
         info.data_sizes.push_back(chars_bytes);
-        info.total_chars_bytes += chars_bytes;
-        info.chars_partition_offsets.push_back(info.total_chars_bytes);
+        info.total_child_size += chars_bytes;
+        info.chars_partition_offsets.push_back(info.total_child_size);
         // Store first offset for kernel optimization (avoid redundant reads)
         info.first_src_offsets.push_back(first_offset);
       } else {
@@ -209,8 +275,38 @@ void collect_level_info_recursive(host_span<column_view const> cols,
         info.src_offsets_offsets.push_back(0);
         info.src_data_ptrs.push_back(nullptr);
         info.data_sizes.push_back(0);
-        info.chars_partition_offsets.push_back(info.total_chars_bytes);
+        info.chars_partition_offsets.push_back(info.total_child_size);
         info.first_src_offsets.push_back(0);
+      }
+    } else if (info.is_list) {
+      // List column: collect offsets info (child data handled via recursion)
+      if (col_size > 0) {
+        lists_column_view lcv(col);
+        auto const offsets_col = lcv.offsets();
+
+        // Offsets info
+        info.src_offsets_ptrs.push_back(offsets_col.head());
+        info.src_offsets_offsets.push_back(col.offset());
+
+        // Get child boundaries (requires GPU read for sliced columns)
+        size_type child_start = 0;
+        size_type child_end   = 0;
+        if (col.offset() > 0) {
+          child_start = cudf::detail::get_value<size_type>(offsets_col, col.offset(), stream);
+        }
+        child_end =
+          cudf::detail::get_value<size_type>(offsets_col, col.offset() + col_size, stream);
+
+        auto const child_rows = child_end - child_start;
+        info.first_src_offsets.push_back(child_start);
+        info.total_child_size += child_rows;
+        info.chars_partition_offsets.push_back(info.total_child_size);
+      } else {
+        // Empty column - push placeholders
+        info.src_offsets_ptrs.push_back(nullptr);
+        info.src_offsets_offsets.push_back(0);
+        info.first_src_offsets.push_back(0);
+        info.chars_partition_offsets.push_back(info.total_child_size);
       }
     } else if (!info.is_struct) {
       // Fixed-width type
@@ -236,7 +332,27 @@ void collect_level_info_recursive(host_span<column_view const> cols,
       collect_level_info_recursive(child_cols, levels, stream);
     }
   }
+
+  // Recurse into list children
+  if (first_col.type().id() == type_id::LIST) {
+    std::vector<column_view> child_cols;
+    child_cols.reserve(num_cols);
+
+    for (auto const& col : cols) {
+      if (col.size() > 0) {
+        lists_column_view lcv(col);
+        child_cols.push_back(lcv.get_sliced_child(stream));
+      }
+    }
+
+    // Only recurse if there are non-empty columns
+    // If all columns are empty, total_child_size will be 0 and
+    // the child level will have 0 rows, which is handled correctly
+    if (!child_cols.empty()) { collect_level_info_recursive(child_cols, levels, stream); }
+  }
+
   // Note: STRING type children (offsets, chars) are handled specially, not recursively
+  // Note: DICTIONARY type is handled via delegation, not recursively
 }
 
 /**
@@ -384,7 +500,7 @@ CUDF_KERNEL void batch_concatenate_masks_kernel(bitmask_type const* const* __res
  * @param num_columns Number of columns being concatenated
  * @param output_size Number of strings (num rows, not including final offset element)
  * @param output_data Output offsetalator
- * @param total_chars_bytes Total bytes in concatenated chars buffer (for final offset)
+ * @param total_child_size Total bytes in concatenated chars buffer (for final offset)
  * @param offsets_type_size Size of offset type in bytes (4 for INT32, 8 for INT64)
  */
 template <size_type block_size>
@@ -397,7 +513,7 @@ CUDF_KERNEL void batch_concatenate_string_offsets_kernel(
   size_type num_columns,
   size_type output_size,
   cudf::detail::output_offsetalator output_data,
-  size_t total_chars_bytes,
+  size_t total_child_size,
   size_type offsets_type_size)
 {
   // Use shared memory to cache input_offsets for binary search
@@ -448,7 +564,7 @@ CUDF_KERNEL void batch_concatenate_string_offsets_kernel(
   }
 
   // Handle the final offset element (total chars bytes)
-  if (output_index == output_size) { output_data[output_size] = total_chars_bytes; }
+  if (output_index == output_size) { output_data[output_size] = total_child_size; }
 }
 
 /**
@@ -484,16 +600,30 @@ batch_process_result batch_process_levels(std::vector<level_info> const& levels,
   for (size_type level_idx = 0; level_idx < num_levels; ++level_idx) {
     auto const& level = levels[level_idx];
 
+    // Skip allocation for delegated levels (e.g., DICTIONARY)
+    if (level.delegate_to_specialized) {
+      data_buffers.emplace_back(0, stream, mr);
+      null_masks.emplace_back(0, stream, mr);
+      continue;
+    }
+
     // Data buffer
     if (level.is_struct) {
       data_buffers.emplace_back(0, stream, mr);
     } else if (level.is_string) {
       // For strings, data_buffer holds chars
-      data_buffers.emplace_back(level.total_chars_bytes, stream, mr);
+      data_buffers.emplace_back(level.total_child_size, stream, mr);
       // Allocate offsets column
       auto const offsets_count   = level.total_rows + 1;
       offsets_columns[level_idx] = cudf::strings::detail::create_offsets_child_column(
-        static_cast<int64_t>(level.total_chars_bytes), offsets_count, stream, mr);
+        static_cast<int64_t>(level.total_child_size), offsets_count, stream, mr);
+    } else if (level.is_list) {
+      // For lists, no data buffer at this level (child data handled via recursion)
+      data_buffers.emplace_back(0, stream, mr);
+      // Allocate INT32 offsets column
+      auto const offsets_count   = level.total_rows + 1;
+      offsets_columns[level_idx] = cudf::make_numeric_column(
+        data_type{type_id::INT32}, offsets_count, mask_state::UNALLOCATED, stream, mr);
     } else {
       std::size_t const total_bytes =
         std::accumulate(level.data_sizes.begin(), level.data_sizes.end(), std::size_t{0});
@@ -511,9 +641,11 @@ batch_process_result batch_process_levels(std::vector<level_info> const& levels,
 
   // ========== PHASE 2: Batch data copy ==========
   // Pre-calculate total number of copy operations for efficient allocation
+  // Skip struct, list, and delegated levels (they have no data to copy at this level)
   size_t total_copy_ops = 0;
   for (auto const& level : levels) {
-    if (!level.is_struct && !level.src_data_ptrs.empty()) {
+    if (level.delegate_to_specialized) continue;
+    if (!level.is_struct && !level.is_list && !level.src_data_ptrs.empty()) {
       total_copy_ops += level.src_data_ptrs.size();
     }
   }
@@ -529,7 +661,8 @@ batch_process_result batch_process_levels(std::vector<level_info> const& levels,
 
     for (size_type level_idx = 0; level_idx < num_levels; ++level_idx) {
       auto const& level = levels[level_idx];
-      if (level.is_struct || level.src_data_ptrs.empty()) continue;
+      if (level.delegate_to_specialized) continue;
+      if (level.is_struct || level.is_list || level.src_data_ptrs.empty()) continue;
 
       char* dst_ptr = static_cast<char*>(data_buffers[level_idx].data());
       for (size_t col = 0; col < level.src_data_ptrs.size(); ++col) {
@@ -555,12 +688,13 @@ batch_process_result batch_process_levels(std::vector<level_info> const& levels,
     }
   }
 
-  // ========== PHASE 3: String offsets concatenation ==========
+  // ========== PHASE 3: String/List offsets concatenation ==========
   for (size_type level_idx = 0; level_idx < num_levels; ++level_idx) {
     auto const& level = levels[level_idx];
-    if (!level.is_string) continue;
+    if (!level.is_string && !level.is_list) continue;
 
-    cudf::scoped_range r{"concatenate string offsets"};
+    cudf::scoped_range r{level.is_string ? "concatenate string offsets"
+                                         : "concatenate list offsets"};
 
     auto const num_columns = level.src_offsets_ptrs.size();
 
@@ -604,14 +738,15 @@ batch_process_result batch_process_levels(std::vector<level_info> const& levels,
         static_cast<size_type>(num_columns),
         level.total_rows,
         output_offsetalator,
-        level.total_chars_bytes,
+        level.total_child_size,
         offsets_type_size);
   }
 
   // ========== PHASE 4: Batch mask concatenation ==========
-  // Collect levels with nulls
+  // Collect levels with nulls (skip delegated levels - their masks are handled separately)
   std::vector<size_type> levels_with_nulls;
   for (size_type i = 0; i < num_levels; ++i) {
+    if (levels[i].delegate_to_specialized) continue;
     if (levels[i].has_nulls) { levels_with_nulls.push_back(i); }
   }
 
@@ -690,6 +825,11 @@ std::unique_ptr<column> reconstruct_column(
   size_type const current_level = level_idx;
   ++level_idx;
 
+  // DICTIONARY: delegate to specialized implementation
+  if (level.is_dictionary) {
+    return cudf::dictionary::detail::concatenate(level.original_columns, stream, mr);
+  }
+
   if (level.is_struct) {
     std::vector<std::unique_ptr<column>> children;
     children.reserve(level.num_children);
@@ -701,6 +841,33 @@ std::unique_ptr<column> reconstruct_column(
 
     return make_structs_column(
       level.total_rows, std::move(children), null_count, std::move(null_mask), stream, mr);
+  } else if (level.is_list) {
+    // LIST column: construct from offsets column and recursively reconstructed child
+    std::unique_ptr<column> child_column;
+
+    // Handle edge case: all lists were empty, so no child level exists
+    if (level.total_child_size == 0) {
+      // Create empty child column of correct type
+      // Use empty_like for nested types, make_empty_column for simple types
+      if (level.empty_child_like.has_value()) {
+        child_column = empty_like(level.empty_child_like.value());
+      } else {
+        // Fallback for simple types (or if no non-empty column was found)
+        child_column = make_empty_column(level.child_dtype);
+      }
+    } else {
+      // Recursively reconstruct child column from next level
+      child_column = reconstruct_column(
+        levels, data_buffers, mask_results, offsets_columns, level_idx, stream, mr);
+    }
+
+    return make_lists_column(level.total_rows,
+                             std::move(offsets_columns[current_level]),
+                             std::move(child_column),
+                             null_count,
+                             std::move(null_mask),
+                             stream,
+                             mr);
   } else if (level.is_string) {
     // String column: construct from offsets column and chars buffer
     return make_strings_column(level.total_rows,
@@ -764,6 +931,31 @@ void batch_bounds_and_type_check(host_span<column_view const> cols, rmm::cuda_st
       batch_bounds_and_type_check(nth_children, stream);
     }
   }
+
+  // Recursively check list children
+  if (cols.front().type().id() == type_id::LIST) {
+    // Check offset overflow
+    size_t const total_offset_count =
+      std::accumulate(cols.begin(),
+                      cols.end(),
+                      std::size_t{},
+                      [](size_t a, auto const& b) { return a + static_cast<size_t>(b.size()); }) +
+      1;
+    CUDF_EXPECTS(total_offset_count <= static_cast<size_t>(std::numeric_limits<size_type>::max()),
+                 "Total number of concatenated offsets exceeds the column size limit",
+                 std::overflow_error);
+
+    // Recursively check children
+    std::vector<column_view> child_cols;
+    child_cols.reserve(cols.size());
+    for (auto const& col : cols) {
+      if (col.size() > 0) {
+        lists_column_view lcv(col);
+        child_cols.push_back(lcv.get_sliced_child(stream));
+      }
+    }
+    if (!child_cols.empty()) { batch_bounds_and_type_check(child_cols, stream); }
+  }
 }
 
 }  // anonymous namespace
@@ -776,10 +968,10 @@ std::unique_ptr<column> batch_concatenate(host_span<column_view const> columns_t
 
   CUDF_EXPECTS(!columns_to_concat.empty(), "Unexpected empty list of columns to concatenate.");
 
-  // Check that all columns are supported types (plain types, struct types, or string types)
+  // Check that all columns are supported types
   CUDF_EXPECTS(all_columns_batch_concat_supported(columns_to_concat),
-               "batch_concatenate only supports fixed-width, struct, and string types. "
-               "Lists and dictionaries are not supported.",
+               "batch_concatenate only supports fixed-width, struct, string, list, and dictionary "
+               "types.",
                cudf::logic_error);
 
   // Verify bounds and type compatibility

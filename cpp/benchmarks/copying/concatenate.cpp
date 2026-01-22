@@ -9,6 +9,7 @@
 #include <cudf/column/column_view.hpp>
 #include <cudf/concatenate.hpp>
 #include <cudf/detail/iterator.cuh>
+#include <cudf/lists/lists_column_view.hpp>
 #include <cudf/strings/strings_column_view.hpp>
 #include <cudf/utilities/default_stream.hpp>
 
@@ -71,9 +72,9 @@ static void bench_concatenate_strings(nvbench::state& state)
 
 NVBENCH_BENCH(bench_concatenate_strings)
   .set_name("concatenate_strings")
-  .add_int64_axis("num_rows", {256, 512, 4096, 16384})
+  .add_int64_axis("num_rows", {100000, 200000, 500000, 1000000})
   .add_int64_axis("num_cols", {2, 8, 64, 256})
-  .add_int64_axis("row_width", {32, 128})
+  .add_int64_axis("row_width", {32})
   .add_float64_axis("nulls", {0.0, 0.3});
 
 // Helper to create a struct column with fixed-width children
@@ -185,3 +186,119 @@ NVBENCH_BENCH(bench_concatenate_structs)
   .add_int64_axis("num_children", {2, 4, 8})
   .add_int64_axis("depth", {1, 2, 4})
   .add_float64_axis("nulls", {0.0, 0.3});
+
+// Helper to create a nested list column with specified nesting level
+// nesting_level=1 -> LIST<INT32>
+// nesting_level=2 -> LIST<LIST<INT32>>
+// nesting_level=3 -> LIST<LIST<LIST<INT32>>>
+// etc.
+static std::unique_ptr<cudf::column> create_nested_list_column(cudf::size_type num_rows,
+                                                               cudf::size_type avg_list_size,
+                                                               cudf::size_type nesting_level,
+                                                               double null_probability)
+{
+  using int_column_wrapper = cudf::test::fixed_width_column_wrapper<int32_t>;
+
+  std::default_random_engine generator;
+  std::uniform_int_distribution<int> distribution(0, 100);
+  std::uniform_int_distribution<int> size_distribution(1, avg_list_size * 2 - 1);
+
+  // Start with innermost level (leaf INT32 values)
+  // For simplicity, create fixed-size lists at each level
+  auto const total_leaf_elements =
+    static_cast<cudf::size_type>(std::pow(avg_list_size, nesting_level)) * num_rows;
+
+  // Create leaf int32 values
+  auto const elements = cudf::detail::make_counting_transform_iterator(
+    0, [&](auto row) { return distribution(generator); });
+
+  std::unique_ptr<cudf::column> current_column;
+  if (null_probability == 0.0) {
+    int_column_wrapper leaf_col(elements, elements + total_leaf_elements);
+    current_column = leaf_col.release();
+  } else {
+    auto valids = cudf::detail::make_counting_transform_iterator(
+      0, [&](auto i) { return distribution(generator) >= (null_probability * 100); });
+    int_column_wrapper leaf_col(elements, elements + total_leaf_elements, valids);
+    current_column = leaf_col.release();
+  }
+
+  // Wrap in list levels from innermost to outermost
+  auto current_num_elements = total_leaf_elements;
+  for (cudf::size_type level = 0; level < nesting_level; ++level) {
+    auto const num_lists = current_num_elements / avg_list_size;
+
+    // Create offsets for this level
+    std::vector<cudf::size_type> offsets;
+    offsets.reserve(num_lists + 1);
+    offsets.push_back(0);
+    for (cudf::size_type i = 0; i < num_lists; ++i) {
+      offsets.push_back(offsets.back() + avg_list_size);
+    }
+
+    auto offsets_col =
+      cudf::test::fixed_width_column_wrapper<cudf::size_type>(offsets.begin(), offsets.end());
+
+    // Create validity mask for lists
+    rmm::device_buffer null_mask;
+    cudf::size_type null_count = 0;
+    if (null_probability > 0.0) {
+      std::vector<bool> validity;
+      validity.reserve(num_lists);
+      for (cudf::size_type i = 0; i < num_lists; ++i) {
+        validity.push_back(distribution(generator) >= (null_probability * 100));
+        if (!validity.back()) { ++null_count; }
+      }
+      auto validity_iter = validity.begin();
+      auto [mask, count] =
+        cudf::test::detail::make_null_mask(validity_iter, validity_iter + num_lists);
+      null_mask = std::move(mask);
+    }
+
+    current_column       = cudf::make_lists_column(num_lists,
+                                             offsets_col.release(),
+                                             std::move(current_column),
+                                             null_count,
+                                             std::move(null_mask));
+    current_num_elements = num_lists;
+  }
+
+  return current_column;
+}
+
+// Benchmark for concatenating list columns (uses batch_concatenate path)
+static void bench_concatenate_lists(nvbench::state& state)
+{
+  auto const num_rows      = static_cast<cudf::size_type>(state.get_int64("num_rows"));
+  auto const num_cols      = static_cast<cudf::size_type>(state.get_int64("num_cols"));
+  auto const avg_list_size = static_cast<cudf::size_type>(state.get_int64("avg_list_size"));
+  auto const nesting_level = static_cast<cudf::size_type>(state.get_int64("nesting_level"));
+  auto const nulls         = state.get_float64("nulls");
+
+  // Create nested list column
+  auto column = create_nested_list_column(num_rows, avg_list_size, nesting_level, nulls);
+  auto input  = column->view();
+
+  auto column_views = std::vector<cudf::column_view>(num_cols, input);
+
+  auto stream = cudf::get_default_stream();
+  state.set_cuda_stream(nvbench::make_cuda_stream_view(stream.value()));
+
+  // Estimate memory: leaf data size
+  auto const leaf_elements =
+    static_cast<int64_t>(std::pow(avg_list_size, nesting_level)) * num_rows;
+  auto const leaf_bytes = leaf_elements * sizeof(int32_t);
+  state.add_global_memory_reads<int8_t>(leaf_bytes * num_cols);
+  state.add_global_memory_writes<int8_t>(leaf_bytes * num_cols);
+
+  state.exec(nvbench::exec_tag::sync,
+             [&](nvbench::launch&) { auto result = cudf::concatenate(column_views); });
+}
+
+NVBENCH_BENCH(bench_concatenate_lists)
+  .set_name("concatenate_lists")
+  .add_int64_axis("num_rows", {50000, 100000, 200000})
+  .add_int64_axis("num_cols", {64, 128})
+  .add_int64_axis("avg_list_size", {5})
+  .add_int64_axis("nesting_level", {1, 2, 3})
+  .add_float64_axis("nulls", {0.0});
