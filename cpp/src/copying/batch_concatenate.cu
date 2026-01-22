@@ -23,6 +23,7 @@
 #include <cudf/strings/detail/utilities.hpp>
 #include <cudf/strings/strings_column_view.hpp>
 #include <cudf/structs/structs_column_view.hpp>
+#include <cudf/table/table.hpp>
 #include <cudf/types.hpp>
 #include <cudf/utilities/bit.hpp>
 #include <cudf/utilities/error.hpp>
@@ -1018,6 +1019,361 @@ bool can_use_batch_concatenate(host_span<column_view const> columns)
   return all_columns_batch_concat_supported(columns);
 }
 
+/**
+ * @brief Result structure for batch_process_table_levels.
+ */
+struct table_batch_process_result {
+  std::vector<std::vector<rmm::device_buffer>> data_buffers_by_column;
+  std::vector<std::vector<std::pair<rmm::device_buffer, size_type>>> mask_results_by_column;
+  std::vector<std::vector<std::unique_ptr<column>>> offsets_columns_by_column;
+};
+
+/**
+ * @brief Performs all batch operations for table concatenation.
+ *
+ * This function processes ALL columns from ALL tables with a SINGLE batched_memcpy_async call
+ * for maximum efficiency.
+ */
+table_batch_process_result batch_process_table_levels(
+  std::vector<std::vector<level_info>> const& levels_by_column,
+  rmm::cuda_stream_view stream,
+  rmm::device_async_resource_ref mr)
+{
+  CUDF_FUNC_RANGE();
+
+  size_type const num_columns = static_cast<size_type>(levels_by_column.size());
+
+  // ========== PHASE 1: Allocate output buffers for ALL columns ==========
+  std::vector<std::vector<rmm::device_buffer>> data_buffers_by_column(num_columns);
+  std::vector<std::vector<rmm::device_buffer>> null_masks_by_column(num_columns);
+  std::vector<std::vector<std::unique_ptr<column>>> offsets_columns_by_column(num_columns);
+
+  for (size_type col_idx = 0; col_idx < num_columns; ++col_idx) {
+    auto const& levels    = levels_by_column[col_idx];
+    auto const num_levels = static_cast<size_type>(levels.size());
+    auto& data_buffers    = data_buffers_by_column[col_idx];
+    auto& null_masks      = null_masks_by_column[col_idx];
+    auto& offsets_columns = offsets_columns_by_column[col_idx];
+
+    data_buffers.reserve(num_levels);
+    null_masks.reserve(num_levels);
+    offsets_columns.resize(num_levels);
+
+    for (size_type level_idx = 0; level_idx < num_levels; ++level_idx) {
+      auto const& level = levels[level_idx];
+
+      // Skip allocation for delegated levels (e.g., DICTIONARY)
+      if (level.delegate_to_specialized) {
+        data_buffers.emplace_back(0, stream, mr);
+        null_masks.emplace_back(0, stream, mr);
+        continue;
+      }
+
+      // Data buffer
+      if (level.is_struct) {
+        data_buffers.emplace_back(0, stream, mr);
+      } else if (level.is_string) {
+        data_buffers.emplace_back(level.total_child_size, stream, mr);
+        auto const offsets_count   = level.total_rows + 1;
+        offsets_columns[level_idx] = cudf::strings::detail::create_offsets_child_column(
+          static_cast<int64_t>(level.total_child_size), offsets_count, stream, mr);
+      } else if (level.is_list) {
+        data_buffers.emplace_back(0, stream, mr);
+        auto const offsets_count   = level.total_rows + 1;
+        offsets_columns[level_idx] = cudf::make_numeric_column(
+          data_type{type_id::INT32}, offsets_count, mask_state::UNALLOCATED, stream, mr);
+      } else {
+        std::size_t const total_bytes =
+          std::accumulate(level.data_sizes.begin(), level.data_sizes.end(), std::size_t{0});
+        data_buffers.emplace_back(total_bytes, stream, mr);
+      }
+
+      // Null mask buffer
+      if (level.has_nulls) {
+        null_masks.emplace_back(
+          cudf::detail::create_null_mask(level.total_rows, mask_state::UNINITIALIZED, stream, mr));
+      } else {
+        null_masks.emplace_back(0, stream, mr);
+      }
+    }
+  }
+
+  // ========== PHASE 2: SINGLE batched memcpy for ALL data across ALL columns ==========
+  // Calculate total copy operations across ALL columns
+  size_t total_copy_ops = 0;
+  for (auto const& levels : levels_by_column) {
+    for (auto const& level : levels) {
+      if (level.delegate_to_specialized) continue;
+      if (!level.is_struct && !level.is_list && !level.src_data_ptrs.empty()) {
+        total_copy_ops += level.src_data_ptrs.size();
+      }
+    }
+  }
+
+  if (total_copy_ops > 0) {
+    std::vector<void const*> all_src_ptrs;
+    std::vector<void*> all_dst_ptrs;
+    std::vector<std::size_t> all_sizes;
+    all_src_ptrs.reserve(total_copy_ops);
+    all_dst_ptrs.reserve(total_copy_ops);
+    all_sizes.reserve(total_copy_ops);
+
+    // Aggregate ALL copy operations from ALL columns
+    for (size_type col_idx = 0; col_idx < num_columns; ++col_idx) {
+      auto const& levels = levels_by_column[col_idx];
+      auto& data_buffers = data_buffers_by_column[col_idx];
+
+      for (size_type level_idx = 0; level_idx < static_cast<size_type>(levels.size());
+           ++level_idx) {
+        auto const& level = levels[level_idx];
+        if (level.delegate_to_specialized) continue;
+        if (level.is_struct || level.is_list || level.src_data_ptrs.empty()) continue;
+
+        char* dst_ptr = static_cast<char*>(data_buffers[level_idx].data());
+        for (size_t i = 0; i < level.src_data_ptrs.size(); ++i) {
+          if (level.src_data_ptrs[i] != nullptr && level.data_sizes[i] > 0) {
+            all_src_ptrs.push_back(level.src_data_ptrs[i]);
+            all_dst_ptrs.push_back(dst_ptr);
+            all_sizes.push_back(level.data_sizes[i]);
+          }
+          dst_ptr += level.data_sizes[i];
+        }
+      }
+    }
+
+    // SINGLE batched_memcpy_async call for ALL data
+    if (!all_src_ptrs.empty()) {
+      auto d_src_ptrs =
+        make_device_uvector_async(all_src_ptrs, stream, cudf::get_current_device_resource_ref());
+      auto d_dst_ptrs =
+        make_device_uvector_async(all_dst_ptrs, stream, cudf::get_current_device_resource_ref());
+      auto d_sizes =
+        make_device_uvector_async(all_sizes, stream, cudf::get_current_device_resource_ref());
+
+      batched_memcpy_async(
+        d_src_ptrs.data(), d_dst_ptrs.data(), d_sizes.data(), all_src_ptrs.size(), stream);
+    }
+  }
+
+  // ========== PHASE 3: String/List offsets concatenation for each column ==========
+  for (size_type col_idx = 0; col_idx < num_columns; ++col_idx) {
+    auto const& levels    = levels_by_column[col_idx];
+    auto& offsets_columns = offsets_columns_by_column[col_idx];
+
+    for (size_type level_idx = 0; level_idx < static_cast<size_type>(levels.size()); ++level_idx) {
+      auto const& level = levels[level_idx];
+      if (!level.is_string && !level.is_list) continue;
+
+      auto const num_src_columns = level.src_offsets_ptrs.size();
+
+      // Build input offsets (prefix sum of row counts)
+      std::vector<size_t> input_offsets(num_src_columns + 1);
+      input_offsets[0] = 0;
+      for (size_t i = 0; i < num_src_columns; ++i) {
+        input_offsets[i + 1] = input_offsets[i] + level.col_sizes[i];
+      }
+
+      // Upload to device
+      auto d_src_offsets_ptrs = make_device_uvector_async(
+        level.src_offsets_ptrs, stream, cudf::get_current_device_resource_ref());
+      auto d_src_offsets_offsets = make_device_uvector_async(
+        level.src_offsets_offsets, stream, cudf::get_current_device_resource_ref());
+      auto d_input_offsets =
+        make_device_uvector_async(input_offsets, stream, cudf::get_current_device_resource_ref());
+      auto d_chars_partition_offsets = make_device_uvector_async(
+        level.chars_partition_offsets, stream, cudf::get_current_device_resource_ref());
+      auto d_first_src_offsets = make_device_uvector_async(
+        level.first_src_offsets, stream, cudf::get_current_device_resource_ref());
+
+      auto output_offsets_view = offsets_columns[level_idx]->mutable_view();
+      auto output_offsetalator = offsetalator_factory::make_output_iterator(output_offsets_view);
+
+      size_type const offsets_type_size = cudf::size_of(level.offsets_dtype);
+
+      constexpr size_type block_size{256};
+      cudf::detail::grid_1d config(level.total_rows + 1, block_size);
+
+      batch_concatenate_string_offsets_kernel<block_size>
+        <<<config.num_blocks, config.num_threads_per_block, 0, stream.value()>>>(
+          d_src_offsets_ptrs.data(),
+          d_src_offsets_offsets.data(),
+          d_input_offsets.data(),
+          d_chars_partition_offsets.data(),
+          d_first_src_offsets.data(),
+          static_cast<size_type>(num_src_columns),
+          level.total_rows,
+          output_offsetalator,
+          level.total_child_size,
+          offsets_type_size);
+    }
+  }
+
+  // ========== PHASE 4: Batch mask concatenation for each column ==========
+  std::vector<std::vector<size_type>> null_counts_by_column(num_columns);
+
+  for (size_type col_idx = 0; col_idx < num_columns; ++col_idx) {
+    auto const& levels = levels_by_column[col_idx];
+    auto& null_masks   = null_masks_by_column[col_idx];
+    auto& null_counts  = null_counts_by_column[col_idx];
+
+    null_counts.resize(levels.size(), 0);
+
+    for (size_type level_idx = 0; level_idx < static_cast<size_type>(levels.size()); ++level_idx) {
+      auto const& level = levels[level_idx];
+      if (level.delegate_to_specialized) continue;
+      if (!level.has_nulls) continue;
+
+      auto const num_src_columns = level.mask_ptrs.size();
+      auto const num_mask_bits   = level.total_rows;
+
+      // Build output offsets (prefix sum of column sizes)
+      std::vector<size_type> output_offsets(num_src_columns + 1);
+      output_offsets[0] = 0;
+      for (size_t i = 0; i < num_src_columns; ++i) {
+        output_offsets[i + 1] = output_offsets[i] + level.col_sizes[i];
+      }
+
+      auto d_mask_ptrs =
+        make_device_uvector_async(level.mask_ptrs, stream, cudf::get_current_device_resource_ref());
+      auto d_mask_offsets = make_device_uvector_async(
+        level.mask_offsets, stream, cudf::get_current_device_resource_ref());
+      auto d_output_offsets =
+        make_device_uvector_async(output_offsets, stream, cudf::get_current_device_resource_ref());
+
+      constexpr size_type block_size{256};
+      auto const num_output_words = cudf::util::div_rounding_up_safe(num_mask_bits, 32);
+      cudf::detail::grid_1d config(num_output_words, block_size);
+
+      batch_concatenate_masks_kernel<block_size>
+        <<<config.num_blocks, config.num_threads_per_block, 0, stream.value()>>>(
+          d_mask_ptrs.data(),
+          d_mask_offsets.data(),
+          d_output_offsets.data(),
+          static_cast<size_type>(num_src_columns),
+          static_cast<bitmask_type*>(null_masks[level_idx].data()),
+          num_output_words);
+
+      null_counts[level_idx] = level.total_null_count;
+    }
+  }
+
+  // Build mask results
+  std::vector<std::vector<std::pair<rmm::device_buffer, size_type>>> mask_results_by_column(
+    num_columns);
+  for (size_type col_idx = 0; col_idx < num_columns; ++col_idx) {
+    auto& mask_results = mask_results_by_column[col_idx];
+    auto& null_masks   = null_masks_by_column[col_idx];
+    auto& null_counts  = null_counts_by_column[col_idx];
+
+    mask_results.reserve(null_masks.size());
+    for (size_t i = 0; i < null_masks.size(); ++i) {
+      mask_results.emplace_back(std::move(null_masks[i]), null_counts[i]);
+    }
+  }
+
+  return {std::move(data_buffers_by_column),
+          std::move(mask_results_by_column),
+          std::move(offsets_columns_by_column)};
+}
+
+std::unique_ptr<table> batch_concatenate(host_span<table_view const> tables_to_concat,
+                                         rmm::cuda_stream_view stream,
+                                         rmm::device_async_resource_ref mr)
+{
+  CUDF_FUNC_RANGE();
+
+  if (tables_to_concat.empty()) { return std::make_unique<table>(); }
+
+  // Validate column counts match
+  table_view const first_table = tables_to_concat.front();
+  CUDF_EXPECTS(std::all_of(tables_to_concat.begin(),
+                           tables_to_concat.end(),
+                           [&first_table](auto const& t) {
+                             return t.num_columns() == first_table.num_columns();
+                           }),
+               "Mismatch in table columns to concatenate.");
+
+  auto const num_columns = first_table.num_columns();
+  if (num_columns == 0) { return std::make_unique<table>(); }
+
+  // Check that all columns in all tables are supported
+  for (auto const& table : tables_to_concat) {
+    for (size_type col_idx = 0; col_idx < num_columns; ++col_idx) {
+      CUDF_EXPECTS(is_column_batch_concat_supported(table.column(col_idx)),
+                   "batch_concatenate only supports fixed-width, struct, string, list, and "
+                   "dictionary types.",
+                   cudf::logic_error);
+    }
+  }
+
+  // Step 1: Collect level_info for each column position
+  std::vector<std::vector<level_info>> levels_by_column(num_columns);
+  std::vector<column_view> cols_for_position;
+  cols_for_position.reserve(tables_to_concat.size());
+
+  for (size_type col_idx = 0; col_idx < num_columns; ++col_idx) {
+    cols_for_position.clear();
+    for (auto const& table : tables_to_concat) {
+      cols_for_position.push_back(table.column(col_idx));
+    }
+
+    // Verify bounds and type compatibility
+    batch_bounds_and_type_check(cols_for_position, stream);
+
+    // Handle all-empty case for this column
+    bool all_empty = std::all_of(cols_for_position.begin(),
+                                 cols_for_position.end(),
+                                 [](auto const& c) { return c.is_empty(); });
+
+    if (!all_empty) {
+      collect_level_info_recursive(cols_for_position, levels_by_column[col_idx], stream);
+    }
+  }
+
+  // Step 2: Batch process all levels with SINGLE batched_memcpy
+  auto result = batch_process_table_levels(levels_by_column, stream, mr);
+
+  // Step 3: Reconstruct each column
+  std::vector<std::unique_ptr<column>> output_columns;
+  output_columns.reserve(num_columns);
+
+  for (size_type col_idx = 0; col_idx < num_columns; ++col_idx) {
+    auto const& levels = levels_by_column[col_idx];
+
+    // Handle all-empty column case
+    if (levels.empty()) {
+      // All columns at this position were empty - create empty_like
+      output_columns.push_back(empty_like(first_table.column(col_idx)));
+      continue;
+    }
+
+    size_type level_idx = 0;
+    output_columns.push_back(reconstruct_column(levels,
+                                                result.data_buffers_by_column[col_idx],
+                                                result.mask_results_by_column[col_idx],
+                                                result.offsets_columns_by_column[col_idx],
+                                                level_idx,
+                                                stream,
+                                                mr));
+  }
+
+  return std::make_unique<table>(std::move(output_columns));
+}
+
+bool can_use_batch_concatenate(host_span<table_view const> tables)
+{
+  if (tables.empty()) return false;
+
+  auto const num_columns = tables.front().num_columns();
+  for (auto const& table : tables) {
+    if (table.num_columns() != num_columns) return false;
+    for (size_type col_idx = 0; col_idx < num_columns; ++col_idx) {
+      if (!is_column_batch_concat_supported(table.column(col_idx))) { return false; }
+    }
+  }
+  return true;
+}
+
 }  // namespace detail
 
 std::unique_ptr<column> batch_concatenate(host_span<column_view const> columns_to_concat,
@@ -1026,6 +1382,14 @@ std::unique_ptr<column> batch_concatenate(host_span<column_view const> columns_t
 {
   CUDF_FUNC_RANGE();
   return detail::batch_concatenate(columns_to_concat, stream, mr);
+}
+
+std::unique_ptr<table> batch_concatenate(host_span<table_view const> tables_to_concat,
+                                         rmm::cuda_stream_view stream,
+                                         rmm::device_async_resource_ref mr)
+{
+  CUDF_FUNC_RANGE();
+  return detail::batch_concatenate(tables_to_concat, stream, mr);
 }
 
 }  // namespace cudf

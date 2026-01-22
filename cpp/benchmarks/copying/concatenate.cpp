@@ -7,6 +7,7 @@
 #include <cudf_test/base_fixture.hpp>
 #include <cudf_test/column_utilities.hpp>
 #include <cudf_test/column_wrapper.hpp>
+#include <cudf_test/table_utilities.hpp>
 
 #include <cudf/column/column_view.hpp>
 #include <cudf/concatenate.hpp>
@@ -29,6 +30,10 @@
 #define USE_BATCH 1
 #endif
 
+#ifndef NO_OP
+#define NO_OP 0
+#endif
+
 #if VALIDATE
 static void validate_batch_concatenate(std::vector<cudf::column_view> const& column_views,
                                        rmm::cuda_stream_view stream)
@@ -46,13 +51,33 @@ static void validate_batch_concatenate(std::vector<cudf::column_view> const& col
   printf("Validated!\n");
   fflush(stdout);
 }
+
+static void validate_batch_concatenate_tables(std::vector<cudf::table_view> const& table_views,
+                                              rmm::cuda_stream_view stream)
+{
+  auto mr = cudf::get_current_device_resource_ref();
+
+  // Run both implementations directly via detail namespace
+  auto result_concat = cudf::detail::concatenate(table_views, stream, mr);
+  auto result_batch  = cudf::detail::batch_concatenate(table_views, stream, mr);
+
+  // Compare results
+  CUDF_TEST_EXPECT_TABLES_EQUAL(*result_concat, *result_batch);
+  printf("Table concatenation validated!\n");
+  fflush(stdout);
+}
 #endif
 
+#ifdef NO_OP
+#define CONCATENATE_FUNC(column_views, stream) \
+  std::unique_ptr<cudf::column> {}
+#else
 // Helper macro to call the appropriate concatenate function
 #if USE_BATCH
 #define CONCATENATE_FUNC(column_views, stream) cudf::batch_concatenate(column_views, stream)
 #else
 #define CONCATENATE_FUNC(column_views, stream) cudf::concatenate(column_views, stream)
+#endif
 #endif
 
 static void bench_concatenate(nvbench::state& state)
@@ -358,4 +383,205 @@ NVBENCH_BENCH(bench_concatenate_lists)
   .add_int64_axis("num_cols", {64, 128})
   .add_int64_axis("avg_list_size", {5})
   .add_int64_axis("nesting_level", {1, 2, 3})
+  .add_float64_axis("nulls", {0.0});
+
+// Benchmark for batch concatenating tables (multiple tables, each with multiple columns)
+static void bench_concatenate_tables(nvbench::state& state)
+{
+  auto const num_rows   = static_cast<cudf::size_type>(state.get_int64("num_rows"));
+  auto const num_cols   = static_cast<cudf::size_type>(state.get_int64("num_cols"));
+  auto const num_tables = static_cast<cudf::size_type>(state.get_int64("num_tables"));
+  auto const nulls      = state.get_float64("nulls");
+
+  // Create tables with num_cols columns each
+  std::vector<std::unique_ptr<cudf::table>> tables;
+  std::vector<cudf::table_view> table_views;
+  tables.reserve(num_tables);
+  table_views.reserve(num_tables);
+
+  for (cudf::size_type i = 0; i < num_tables; ++i) {
+    auto tbl = create_sequence_table(
+      cycle_dtypes({cudf::type_to_id<int32_t>()}, num_cols), row_count{num_rows}, nulls);
+    table_views.push_back(tbl->view());
+    tables.push_back(std::move(tbl));
+  }
+
+  auto stream = cudf::get_default_stream();
+  state.set_cuda_stream(nvbench::make_cuda_stream_view(stream.value()));
+  state.add_global_memory_reads<int32_t>(static_cast<int64_t>(num_rows) * num_cols * num_tables);
+  state.add_global_memory_writes<int32_t>(static_cast<int64_t>(num_rows) * num_cols * num_tables);
+
+#if VALIDATE
+  validate_batch_concatenate_tables(table_views, stream);
+#else
+  state.exec(nvbench::exec_tag::sync,
+             [&](nvbench::launch&) { auto result = cudf::batch_concatenate(table_views, stream); });
+#endif
+}
+
+NVBENCH_BENCH(bench_concatenate_tables)
+  .set_name("concatenate_tables")
+  .add_int64_axis("num_rows", {10000, 100000, 500000})
+  .add_int64_axis("num_cols", {4, 16, 64})
+  .add_int64_axis("num_tables", {2, 8, 32, 128})
+  .add_float64_axis("nulls", {0.0, 0.3});
+
+// Benchmark for batch concatenating tables with string columns
+static void bench_concatenate_tables_strings(nvbench::state& state)
+{
+  auto const num_rows   = static_cast<cudf::size_type>(state.get_int64("num_rows"));
+  auto const num_cols   = static_cast<cudf::size_type>(state.get_int64("num_cols"));
+  auto const num_tables = static_cast<cudf::size_type>(state.get_int64("num_tables"));
+  auto const row_width  = static_cast<cudf::size_type>(state.get_int64("row_width"));
+  auto const nulls      = state.get_float64("nulls");
+
+  data_profile const profile =
+    data_profile_builder()
+      .distribution(cudf::type_id::STRING, distribution_id::NORMAL, 0, row_width)
+      .null_probability(nulls);
+
+  // Create tables with num_cols string columns each
+  std::vector<std::unique_ptr<cudf::table>> tables;
+  std::vector<cudf::table_view> table_views;
+  tables.reserve(num_tables);
+  table_views.reserve(num_tables);
+
+  for (cudf::size_type i = 0; i < num_tables; ++i) {
+    std::vector<std::unique_ptr<cudf::column>> columns;
+    columns.reserve(num_cols);
+    for (cudf::size_type c = 0; c < num_cols; ++c) {
+      columns.push_back(create_random_column(cudf::type_id::STRING, row_count{num_rows}, profile));
+    }
+    auto tbl = std::make_unique<cudf::table>(std::move(columns));
+    table_views.push_back(tbl->view());
+    tables.push_back(std::move(tbl));
+  }
+
+  auto stream = cudf::get_default_stream();
+  state.set_cuda_stream(nvbench::make_cuda_stream_view(stream.value()));
+
+  // Estimate memory based on average string width
+  auto const avg_chars_per_table = static_cast<int64_t>(num_rows) * num_cols * row_width;
+  state.add_global_memory_reads<int8_t>(avg_chars_per_table * num_tables);
+  state.add_global_memory_writes<int8_t>(avg_chars_per_table * num_tables);
+
+#if VALIDATE
+  validate_batch_concatenate_tables(table_views, stream);
+#else
+  state.exec(nvbench::exec_tag::sync,
+             [&](nvbench::launch&) { auto result = cudf::batch_concatenate(table_views, stream); });
+#endif
+}
+
+NVBENCH_BENCH(bench_concatenate_tables_strings)
+  .set_name("concatenate_tables_strings")
+  .add_int64_axis("num_rows", {10000, 100000})
+  .add_int64_axis("num_cols", {4, 16})
+  .add_int64_axis("num_tables", {2, 8, 32})
+  .add_int64_axis("row_width", {32})
+  .add_float64_axis("nulls", {0.0, 0.3});
+
+// Benchmark for batch concatenating tables with struct columns
+static void bench_concatenate_tables_structs(nvbench::state& state)
+{
+  auto const num_rows     = static_cast<cudf::size_type>(state.get_int64("num_rows"));
+  auto const num_cols     = static_cast<cudf::size_type>(state.get_int64("num_cols"));
+  auto const num_tables   = static_cast<cudf::size_type>(state.get_int64("num_tables"));
+  auto const num_children = static_cast<cudf::size_type>(state.get_int64("num_children"));
+  auto const nulls        = state.get_float64("nulls");
+
+  // Create tables with num_cols struct columns each
+  std::vector<std::unique_ptr<cudf::table>> tables;
+  std::vector<cudf::table_view> table_views;
+  tables.reserve(num_tables);
+  table_views.reserve(num_tables);
+
+  for (cudf::size_type i = 0; i < num_tables; ++i) {
+    std::vector<std::unique_ptr<cudf::column>> columns;
+    columns.reserve(num_cols);
+    for (cudf::size_type c = 0; c < num_cols; ++c) {
+      columns.push_back(create_struct_column(num_rows, num_children, 1, nulls));
+    }
+    auto tbl = std::make_unique<cudf::table>(std::move(columns));
+    table_views.push_back(tbl->view());
+    tables.push_back(std::move(tbl));
+  }
+
+  auto stream = cudf::get_default_stream();
+  state.set_cuda_stream(nvbench::make_cuda_stream_view(stream.value()));
+
+  // Estimate memory: struct column with num_children int32 columns
+  auto const leaf_bytes =
+    static_cast<int64_t>(num_rows) * sizeof(int32_t) * num_children * num_cols;
+  state.add_global_memory_reads<int8_t>(leaf_bytes * num_tables);
+  state.add_global_memory_writes<int8_t>(leaf_bytes * num_tables);
+
+#if VALIDATE
+  validate_batch_concatenate_tables(table_views, stream);
+#else
+  state.exec(nvbench::exec_tag::sync,
+             [&](nvbench::launch&) { auto result = cudf::batch_concatenate(table_views, stream); });
+#endif
+}
+
+NVBENCH_BENCH(bench_concatenate_tables_structs)
+  .set_name("concatenate_tables_structs")
+  .add_int64_axis("num_rows", {10000, 100000})
+  .add_int64_axis("num_cols", {4, 16})
+  .add_int64_axis("num_tables", {2, 8, 32})
+  .add_int64_axis("num_children", {4})
+  .add_float64_axis("nulls", {0.0, 0.3});
+
+// Benchmark for batch concatenating tables with list columns
+static void bench_concatenate_tables_lists(nvbench::state& state)
+{
+  auto const num_rows      = static_cast<cudf::size_type>(state.get_int64("num_rows"));
+  auto const num_cols      = static_cast<cudf::size_type>(state.get_int64("num_cols"));
+  auto const num_tables    = static_cast<cudf::size_type>(state.get_int64("num_tables"));
+  auto const avg_list_size = static_cast<cudf::size_type>(state.get_int64("avg_list_size"));
+  auto const nesting_level = static_cast<cudf::size_type>(state.get_int64("nesting_level"));
+  auto const nulls         = state.get_float64("nulls");
+
+  // Create tables with num_cols list columns each
+  std::vector<std::unique_ptr<cudf::table>> tables;
+  std::vector<cudf::table_view> table_views;
+  tables.reserve(num_tables);
+  table_views.reserve(num_tables);
+
+  for (cudf::size_type i = 0; i < num_tables; ++i) {
+    std::vector<std::unique_ptr<cudf::column>> columns;
+    columns.reserve(num_cols);
+    for (cudf::size_type c = 0; c < num_cols; ++c) {
+      columns.push_back(create_nested_list_column(num_rows, avg_list_size, nesting_level, nulls));
+    }
+    auto tbl = std::make_unique<cudf::table>(std::move(columns));
+    table_views.push_back(tbl->view());
+    tables.push_back(std::move(tbl));
+  }
+
+  auto stream = cudf::get_default_stream();
+  state.set_cuda_stream(nvbench::make_cuda_stream_view(stream.value()));
+
+  // Estimate memory: leaf data size per column
+  auto const leaf_elements =
+    static_cast<int64_t>(std::pow(avg_list_size, nesting_level)) * num_rows;
+  auto const leaf_bytes = leaf_elements * sizeof(int32_t) * num_cols;
+  state.add_global_memory_reads<int8_t>(leaf_bytes * num_tables);
+  state.add_global_memory_writes<int8_t>(leaf_bytes * num_tables);
+
+#if VALIDATE
+  validate_batch_concatenate_tables(table_views, stream);
+#else
+  state.exec(nvbench::exec_tag::sync,
+             [&](nvbench::launch&) { auto result = cudf::batch_concatenate(table_views, stream); });
+#endif
+}
+
+NVBENCH_BENCH(bench_concatenate_tables_lists)
+  .set_name("concatenate_tables_lists")
+  .add_int64_axis("num_rows", {10000, 50000})
+  .add_int64_axis("num_cols", {4, 16})
+  .add_int64_axis("num_tables", {2, 8, 32})
+  .add_int64_axis("avg_list_size", {5})
+  .add_int64_axis("nesting_level", {1, 2})
   .add_float64_axis("nulls", {0.0});

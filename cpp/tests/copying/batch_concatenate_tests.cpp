@@ -7,6 +7,7 @@
 #include <cudf_test/column_utilities.hpp>
 #include <cudf_test/column_wrapper.hpp>
 #include <cudf_test/iterator_utilities.hpp>
+#include <cudf_test/table_utilities.hpp>
 #include <cudf_test/type_lists.hpp>
 
 #include <cudf/column/column.hpp>
@@ -577,4 +578,268 @@ TYPED_TEST(BatchConcatenateTypedTest, WordBoundaryTest)
   auto expected = cudf::concatenate(columns);
 
   CUDF_TEST_EXPECT_COLUMNS_EQUAL(*result, *expected);
+}
+
+// ============================================================================
+// Table batch_concatenate tests
+// ============================================================================
+
+struct BatchConcatenateTableTest : public cudf::test::BaseFixture {};
+
+TEST_F(BatchConcatenateTableTest, EmptyTableSpan)
+{
+  std::vector<cudf::table_view> tables;
+
+  auto result = cudf::detail::batch_concatenate(
+    tables, cudf::get_default_stream(), cudf::get_current_device_resource_ref());
+
+  EXPECT_EQ(result->num_columns(), 0);
+  EXPECT_EQ(result->num_rows(), 0);
+}
+
+TEST_F(BatchConcatenateTableTest, SingleTable)
+{
+  auto col1 = cudf::test::fixed_width_column_wrapper<int32_t>({1, 2, 3}, {1, 0, 1});
+  auto col2 = cudf::test::fixed_width_column_wrapper<int64_t>({10, 20, 30}, {0, 1, 1});
+  cudf::table_view table{{col1, col2}};
+
+  std::vector<cudf::table_view> tables = {table};
+
+  auto result = cudf::detail::batch_concatenate(
+    tables, cudf::get_default_stream(), cudf::get_current_device_resource_ref());
+  auto expected = cudf::concatenate(tables);
+
+  CUDF_TEST_EXPECT_TABLES_EQUAL(*result, *expected);
+}
+
+TEST_F(BatchConcatenateTableTest, TwoTablesNoNulls)
+{
+  auto col1_t1 = cudf::test::fixed_width_column_wrapper<int32_t>({1, 2, 3});
+  auto col2_t1 = cudf::test::fixed_width_column_wrapper<int64_t>({10, 20, 30});
+  cudf::table_view table1{{col1_t1, col2_t1}};
+
+  auto col1_t2 = cudf::test::fixed_width_column_wrapper<int32_t>({4, 5});
+  auto col2_t2 = cudf::test::fixed_width_column_wrapper<int64_t>({40, 50});
+  cudf::table_view table2{{col1_t2, col2_t2}};
+
+  std::vector<cudf::table_view> tables = {table1, table2};
+
+  auto result = cudf::detail::batch_concatenate(
+    tables, cudf::get_default_stream(), cudf::get_current_device_resource_ref());
+  auto expected = cudf::concatenate(tables);
+
+  CUDF_TEST_EXPECT_TABLES_EQUAL(*result, *expected);
+}
+
+TEST_F(BatchConcatenateTableTest, TwoTablesWithNulls)
+{
+  auto col1_t1 = cudf::test::fixed_width_column_wrapper<int32_t>({1, 2, 3}, {1, 0, 1});
+  auto col2_t1 = cudf::test::fixed_width_column_wrapper<int64_t>({10, 20, 30}, {0, 1, 0});
+  cudf::table_view table1{{col1_t1, col2_t1}};
+
+  auto col1_t2 = cudf::test::fixed_width_column_wrapper<int32_t>({4, 5}, {1, 0});
+  auto col2_t2 = cudf::test::fixed_width_column_wrapper<int64_t>({40, 50}, {0, 1});
+  cudf::table_view table2{{col1_t2, col2_t2}};
+
+  std::vector<cudf::table_view> tables = {table1, table2};
+
+  auto result = cudf::detail::batch_concatenate(
+    tables, cudf::get_default_stream(), cudf::get_current_device_resource_ref());
+  auto expected = cudf::concatenate(tables);
+
+  CUDF_TEST_EXPECT_TABLES_EQUAL(*result, *expected);
+}
+
+TEST_F(BatchConcatenateTableTest, MultipleTables)
+{
+  std::vector<cudf::test::fixed_width_column_wrapper<int32_t>> col1_wrappers;
+  std::vector<cudf::test::fixed_width_column_wrapper<float>> col2_wrappers;
+  std::vector<cudf::table_view> tables;
+
+  // Create 5 tables with 2 columns each
+  for (int t = 0; t < 5; ++t) {
+    std::vector<int32_t> values1(10);
+    std::vector<float> values2(10);
+    std::vector<bool> validity(10);
+    for (int i = 0; i < 10; ++i) {
+      values1[i]  = t * 10 + i;
+      values2[i]  = static_cast<float>(t * 10 + i) / 10.0f;
+      validity[i] = (i + t) % 3 != 0;
+    }
+    col1_wrappers.push_back(cudf::test::fixed_width_column_wrapper<int32_t>(
+      values1.begin(), values1.end(), validity.begin()));
+    col2_wrappers.push_back(cudf::test::fixed_width_column_wrapper<float>(
+      values2.begin(), values2.end(), validity.begin()));
+  }
+
+  for (int t = 0; t < 5; ++t) {
+    tables.push_back(cudf::table_view{{col1_wrappers[t], col2_wrappers[t]}});
+  }
+
+  auto result = cudf::detail::batch_concatenate(
+    tables, cudf::get_default_stream(), cudf::get_current_device_resource_ref());
+  auto expected = cudf::concatenate(tables);
+
+  CUDF_TEST_EXPECT_TABLES_EQUAL(*result, *expected);
+}
+
+TEST_F(BatchConcatenateTableTest, TablesWithStringColumns)
+{
+  auto str_col1_t1 = cudf::test::strings_column_wrapper({"a", "bb", "ccc"}, {1, 1, 0});
+  auto int_col_t1  = cudf::test::fixed_width_column_wrapper<int32_t>({1, 2, 3});
+  cudf::table_view table1{{str_col1_t1, int_col_t1}};
+
+  auto str_col1_t2 = cudf::test::strings_column_wrapper({"dddd", "eeeee"}, {0, 1});
+  auto int_col_t2  = cudf::test::fixed_width_column_wrapper<int32_t>({4, 5});
+  cudf::table_view table2{{str_col1_t2, int_col_t2}};
+
+  std::vector<cudf::table_view> tables = {table1, table2};
+
+  auto result = cudf::detail::batch_concatenate(
+    tables, cudf::get_default_stream(), cudf::get_current_device_resource_ref());
+  auto expected = cudf::concatenate(tables);
+
+  CUDF_TEST_EXPECT_TABLES_EQUAL(*result, *expected);
+}
+
+TEST_F(BatchConcatenateTableTest, TablesWithStructColumns)
+{
+  // Table 1: struct column with two children
+  auto child1_t1 = cudf::test::fixed_width_column_wrapper<int32_t>({1, 2, 3}, {1, 1, 0});
+  auto child2_t1 = cudf::test::fixed_width_column_wrapper<float>({1.0f, 2.0f, 3.0f}, {1, 0, 1});
+  auto struct_t1 = cudf::test::structs_column_wrapper({child1_t1, child2_t1}, {1, 0, 1});
+  cudf::table_view table1{{struct_t1}};
+
+  // Table 2: matching struct column
+  auto child1_t2 = cudf::test::fixed_width_column_wrapper<int32_t>({4, 5}, {0, 1});
+  auto child2_t2 = cudf::test::fixed_width_column_wrapper<float>({4.0f, 5.0f}, {1, 1});
+  auto struct_t2 = cudf::test::structs_column_wrapper({child1_t2, child2_t2}, {1, 1});
+  cudf::table_view table2{{struct_t2}};
+
+  std::vector<cudf::table_view> tables = {table1, table2};
+
+  auto result = cudf::detail::batch_concatenate(
+    tables, cudf::get_default_stream(), cudf::get_current_device_resource_ref());
+  auto expected = cudf::concatenate(tables);
+
+  CUDF_TEST_EXPECT_TABLES_EQUAL(*result, *expected);
+}
+
+TEST_F(BatchConcatenateTableTest, TablesWithListColumns)
+{
+  // Table 1
+  auto list_col_t1 = cudf::test::lists_column_wrapper<int32_t>({{1, 2}, {3}, {4, 5, 6}});
+  auto int_col_t1  = cudf::test::fixed_width_column_wrapper<int32_t>({10, 20, 30});
+  cudf::table_view table1{{list_col_t1, int_col_t1}};
+
+  // Table 2
+  auto list_col_t2 = cudf::test::lists_column_wrapper<int32_t>({{7, 8}, {9, 10}});
+  auto int_col_t2  = cudf::test::fixed_width_column_wrapper<int32_t>({40, 50});
+  cudf::table_view table2{{list_col_t2, int_col_t2}};
+
+  std::vector<cudf::table_view> tables = {table1, table2};
+
+  auto result = cudf::detail::batch_concatenate(
+    tables, cudf::get_default_stream(), cudf::get_current_device_resource_ref());
+  auto expected = cudf::concatenate(tables);
+
+  CUDF_TEST_EXPECT_TABLES_EQUAL(*result, *expected);
+}
+
+TEST_F(BatchConcatenateTableTest, TablesWithEmptyTable)
+{
+  auto col1_t1 = cudf::test::fixed_width_column_wrapper<int32_t>({1, 2, 3});
+  auto col2_t1 = cudf::test::fixed_width_column_wrapper<int64_t>({10, 20, 30});
+  cudf::table_view table1{{col1_t1, col2_t1}};
+
+  // Empty table
+  auto col1_t2 = cudf::test::fixed_width_column_wrapper<int32_t>{};
+  auto col2_t2 = cudf::test::fixed_width_column_wrapper<int64_t>{};
+  cudf::table_view table2{{col1_t2, col2_t2}};
+
+  auto col1_t3 = cudf::test::fixed_width_column_wrapper<int32_t>({4, 5});
+  auto col2_t3 = cudf::test::fixed_width_column_wrapper<int64_t>({40, 50});
+  cudf::table_view table3{{col1_t3, col2_t3}};
+
+  std::vector<cudf::table_view> tables = {table1, table2, table3};
+
+  auto result = cudf::detail::batch_concatenate(
+    tables, cudf::get_default_stream(), cudf::get_current_device_resource_ref());
+  auto expected = cudf::concatenate(tables);
+
+  CUDF_TEST_EXPECT_TABLES_EQUAL(*result, *expected);
+}
+
+TEST_F(BatchConcatenateTableTest, ManyColumnsAndTables)
+{
+  // Test with many columns (10) and many tables (8) to stress the single batched_memcpy
+  // optimization
+  constexpr int num_columns = 10;
+  constexpr int num_tables  = 8;
+  constexpr int num_rows    = 100;
+
+  std::vector<std::vector<cudf::test::fixed_width_column_wrapper<int32_t>>> all_wrappers(
+    num_tables);
+  std::vector<cudf::table_view> tables;
+
+  for (int t = 0; t < num_tables; ++t) {
+    for (int c = 0; c < num_columns; ++c) {
+      std::vector<int32_t> values(num_rows);
+      std::vector<bool> validity(num_rows);
+      for (int r = 0; r < num_rows; ++r) {
+        values[r]   = t * 1000 + c * 100 + r;
+        validity[r] = (r + t + c) % 5 != 0;
+      }
+      all_wrappers[t].push_back(cudf::test::fixed_width_column_wrapper<int32_t>(
+        values.begin(), values.end(), validity.begin()));
+    }
+  }
+
+  for (int t = 0; t < num_tables; ++t) {
+    std::vector<cudf::column_view> cols;
+    for (int c = 0; c < num_columns; ++c) {
+      cols.push_back(all_wrappers[t][c]);
+    }
+    tables.push_back(cudf::table_view{cols});
+  }
+
+  auto result = cudf::detail::batch_concatenate(
+    tables, cudf::get_default_stream(), cudf::get_current_device_resource_ref());
+  auto expected = cudf::concatenate(tables);
+
+  CUDF_TEST_EXPECT_TABLES_EQUAL(*result, *expected);
+}
+
+TEST_F(BatchConcatenateTableTest, CanUseBatchConcatenateTables)
+{
+  auto col1 = cudf::test::fixed_width_column_wrapper<int32_t>({1, 2, 3});
+  auto col2 = cudf::test::strings_column_wrapper({"a", "b", "c"});
+  cudf::table_view table1{{col1, col2}};
+
+  auto col3 = cudf::test::fixed_width_column_wrapper<int32_t>({4, 5});
+  auto col4 = cudf::test::strings_column_wrapper({"d", "e"});
+  cudf::table_view table2{{col3, col4}};
+
+  std::vector<cudf::table_view> tables = {table1, table2};
+
+  EXPECT_TRUE(cudf::detail::can_use_batch_concatenate(tables));
+}
+
+TEST_F(BatchConcatenateTableTest, PublicAPIWorks)
+{
+  auto col1_t1 = cudf::test::fixed_width_column_wrapper<int32_t>({1, 2, 3}, {1, 0, 1});
+  auto col2_t1 = cudf::test::fixed_width_column_wrapper<int64_t>({10, 20, 30});
+  cudf::table_view table1{{col1_t1, col2_t1}};
+
+  auto col1_t2 = cudf::test::fixed_width_column_wrapper<int32_t>({4, 5});
+  auto col2_t2 = cudf::test::fixed_width_column_wrapper<int64_t>({40, 50}, {1, 0});
+  cudf::table_view table2{{col1_t2, col2_t2}};
+
+  std::vector<cudf::table_view> tables = {table1, table2};
+
+  // Test public API (not detail namespace)
+  auto result   = cudf::batch_concatenate(tables);
+  auto expected = cudf::concatenate(tables);
+
+  CUDF_TEST_EXPECT_TABLES_EQUAL(*result, *expected);
 }

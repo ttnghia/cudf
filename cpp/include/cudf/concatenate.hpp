@@ -113,5 +113,39 @@ std::unique_ptr<column> batch_concatenate(
   rmm::cuda_stream_view stream      = cudf::get_default_stream(),
   rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref());
 
+/**
+ * @brief Columns of `tables_to_concat` are concatenated vertically using batched
+ * memory operations to return a single table.
+ *
+ * This function performs concatenation using batched memory copy operations
+ * (cub::DeviceMemcpy::Batched) across ALL columns of ALL tables simultaneously.
+ * It produces identical results to cudf::concatenate for tables but is optimized
+ * for reducing kernel launch overhead by processing all data in fewer operations.
+ *
+ * @code{.pseudo}
+ * column_view c0 is {0,1,2,3}
+ * column_view c1 is {4,5,6,7}
+ * table_view t0{{c0, c0}};
+ * table_view t1{{c1, c1}};
+ * ...
+ * auto t = batch_concatenate({t0.view(), t1.view()});
+ * column_view tc0 = (t->view()).column(0) is {0,1,2,3,4,5,6,7}
+ * column_view tc1 = (t->view()).column(1) is {0,1,2,3,4,5,6,7}
+ * @endcode
+ *
+ * @throws cudf::logic_error If number of columns mismatch between tables
+ * @throws std::overflow_error If the total number of output rows exceeds cudf::size_type
+ *
+ * @param tables_to_concat Table views to be concatenated into a single table
+ * @param stream CUDA stream used for device memory operations and kernel launches
+ * @param mr Device memory resource used to allocate the returned table's device memory
+ * @return A single table having all the rows from the elements of
+ * `tables_to_concat` respectively in the same order.
+ */
+std::unique_ptr<table> batch_concatenate(
+  host_span<table_view const> tables_to_concat,
+  rmm::cuda_stream_view stream      = cudf::get_default_stream(),
+  rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref());
+
 /** @} */  // end of group
 }  // namespace CUDF_EXPORT cudf

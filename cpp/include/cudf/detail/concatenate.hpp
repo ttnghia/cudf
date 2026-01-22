@@ -76,5 +76,36 @@ std::unique_ptr<column> batch_concatenate(host_span<column_view const> columns_t
  */
 bool can_use_batch_concatenate(host_span<column_view const> columns);
 
+/**
+ * @brief Batch concatenates tables using optimized batched memory operations.
+ *
+ * This function performs concatenation of tables using batched memory copy operations
+ * (cub::DeviceMemcpy::Batched) across ALL columns of ALL tables simultaneously.
+ * It produces identical results to cudf::concatenate for tables but is optimized
+ * for reducing kernel launch overhead by processing all data in fewer operations.
+ *
+ * @param tables_to_concat Tables to concatenate
+ * @param stream CUDA stream used for device memory operations and kernel launches.
+ * @param mr Device memory resource used for allocating the returned table's device memory.
+ * @return A single table containing all rows from the input tables.
+ *
+ * @throws cudf::logic_error if table column counts don't match
+ * @throws std::overflow_error if total row count exceeds size_type limits
+ */
+std::unique_ptr<table> batch_concatenate(host_span<table_view const> tables_to_concat,
+                                         rmm::cuda_stream_view stream,
+                                         rmm::device_async_resource_ref mr);
+
+/**
+ * @brief Checks if batch_concatenate can be used for the given tables.
+ *
+ * Returns true if all columns in all tables are of supported types: fixed-width,
+ * struct, string, list, or dictionary types.
+ *
+ * @param tables Tables to check
+ * @return true if batch_concatenate can be used, false otherwise
+ */
+bool can_use_batch_concatenate(host_span<table_view const> tables);
+
 }  // namespace detail
 }  // namespace CUDF_EXPORT cudf
