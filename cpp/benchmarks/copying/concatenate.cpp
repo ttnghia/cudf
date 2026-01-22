@@ -579,9 +579,9 @@ static void bench_concatenate_tables_lists(nvbench::state& state)
 
 NVBENCH_BENCH(bench_concatenate_tables_lists)
   .set_name("concatenate_tables_lists")
-  .add_int64_axis("num_rows", {10000, 50000})
-  .add_int64_axis("num_cols", {4, 16})
-  .add_int64_axis("num_tables", {2, 8, 32})
+  .add_int64_axis("num_rows", {50'000, 100'000})
+  .add_int64_axis("num_cols", {4, 16, 36})
+  .add_int64_axis("num_tables", {8, 32})
   .add_int64_axis("avg_list_size", {5})
   .add_int64_axis("nesting_level", {1, 2})
   .add_float64_axis("nulls", {0.0});
