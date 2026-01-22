@@ -3,6 +3,11 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+// Set USE_BATCH_CONCATENATE=1 to route concatenate calls to batch_concatenate
+#ifndef USE_BATCH_CONCATENATE
+#define USE_BATCH_CONCATENATE 0
+#endif
+
 #include <cudf/column/column.hpp>
 #include <cudf/column/column_device_view.cuh>
 #include <cudf/concatenate.hpp>
@@ -588,7 +593,11 @@ std::unique_ptr<column> concatenate(host_span<column_view const> columns_to_conc
                                     rmm::device_async_resource_ref mr)
 {
   CUDF_FUNC_RANGE();
+#if USE_BATCH_CONCATENATE
+  return detail::batch_concatenate(columns_to_concat, stream, mr);
+#else
   return detail::concatenate(columns_to_concat, stream, mr);
+#endif
 }
 
 std::unique_ptr<table> concatenate(host_span<table_view const> tables_to_concat,
@@ -596,7 +605,11 @@ std::unique_ptr<table> concatenate(host_span<table_view const> tables_to_concat,
                                    rmm::device_async_resource_ref mr)
 {
   CUDF_FUNC_RANGE();
+#if USE_BATCH_CONCATENATE
+  return detail::batch_concatenate(tables_to_concat, stream, mr);
+#else
   return detail::concatenate(tables_to_concat, stream, mr);
+#endif
 }
 
 }  // namespace cudf
