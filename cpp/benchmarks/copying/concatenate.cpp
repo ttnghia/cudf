@@ -27,7 +27,7 @@
 #endif
 
 #ifndef USE_BATCH
-#define USE_BATCH 1
+#define USE_BATCH 0
 #endif
 
 #ifndef NO_OP
@@ -68,7 +68,7 @@ static void validate_batch_concatenate_tables(std::vector<cudf::table_view> cons
 }
 #endif
 
-#ifdef NO_OP
+#if NO_OP
 #define CONCATENATE_FUNC(column_views, stream) \
   std::unique_ptr<cudf::column> {}
 #else
@@ -382,7 +382,7 @@ NVBENCH_BENCH(bench_concatenate_lists)
   .add_int64_axis("num_rows", {50000, 100000, 200000})
   .add_int64_axis("num_cols", {64, 128})
   .add_int64_axis("avg_list_size", {5})
-  .add_int64_axis("nesting_level", {1, 2, 3})
+  .add_int64_axis("nesting_level", {1, 2})
   .add_float64_axis("nulls", {0.0});
 
 // Benchmark for batch concatenating tables (multiple tables, each with multiple columns)
@@ -580,8 +580,8 @@ static void bench_concatenate_tables_lists(nvbench::state& state)
 NVBENCH_BENCH(bench_concatenate_tables_lists)
   .set_name("concatenate_tables_lists")
   .add_int64_axis("num_rows", {50'000, 100'000})
-  .add_int64_axis("num_cols", {4, 16, 36})
-  .add_int64_axis("num_tables", {8, 32})
+  .add_int64_axis("num_cols", {1})
+  .add_int64_axis("num_tables", {64, 128})
   .add_int64_axis("avg_list_size", {5})
   .add_int64_axis("nesting_level", {1, 2})
   .add_float64_axis("nulls", {0.0});
