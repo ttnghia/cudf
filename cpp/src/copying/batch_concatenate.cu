@@ -213,47 +213,18 @@ CUDF_KERNEL void batch_concatenate_masks_kernel(bitmask_type const* const* __res
         thrust::seq, output_offsets, output_offsets + num_columns + 1, out_bit_start) -
       output_offsets - 1;
 
-    size_type const col_start_bit = output_offsets[col_idx];
-    size_type const col_end_bit   = output_offsets[col_idx + 1];
-
-    // Fast path: entire output word comes from single column and is word-aligned
-    if (col_start_bit <= out_bit_start && out_bit_end <= col_end_bit) {
-      bitmask_type const* src_mask = mask_ptrs[col_idx];
-      if (src_mask == nullptr) {
-        // No mask means all valid
-        dest_mask[word_idx] = ~bitmask_type{0};
-      } else {
-        size_type const bit_in_col    = out_bit_start - col_start_bit;
-        size_type const src_bit_idx   = mask_offsets[col_idx] + bit_in_col;
-        size_type const src_word_idx  = src_bit_idx / bits_per_word;
-        size_type const src_bit_shift = src_bit_idx % bits_per_word;
-
-        if (src_bit_shift == 0) {
-          // Perfectly aligned - direct copy
-          dest_mask[word_idx] = src_mask[src_word_idx];
-        } else {
-          // Need to combine two source words using funnel shift
-          dest_mask[word_idx] =
-            __funnelshift_r(src_mask[src_word_idx], src_mask[src_word_idx + 1], src_bit_shift);
-        }
-      }
-      word_idx += stride;
-      continue;
-    }
-
-    // Slow path: output word spans multiple columns or is at column boundary
     bitmask_type output_word = 0;
     size_type bits_filled    = 0;
 
     // Process columns that contribute to this output word
     while (bits_filled < bits_per_word && col_idx < num_columns) {
-      size_type const col_start = output_offsets[col_idx];
-      size_type const col_end   = output_offsets[col_idx + 1];
-      size_type const col_size  = col_end - col_start;
+      size_type const col_start_bit = output_offsets[col_idx];
+      size_type const col_end_bit   = output_offsets[col_idx + 1];
+      size_type const col_size      = col_end_bit - col_start_bit;
 
       // Calculate bit positions within this column
       size_type const current_out_bit = out_bit_start + bits_filled;
-      size_type const bit_in_col      = current_out_bit - col_start;
+      size_type const bit_in_col      = current_out_bit - col_start_bit;
 
       // How many bits can we take from this column?
       size_type const bits_remaining_in_col = col_size - bit_in_col;
