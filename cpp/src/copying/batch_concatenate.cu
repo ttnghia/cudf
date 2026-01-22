@@ -99,8 +99,9 @@ struct level_info {
   std::vector<void const*> src_offsets_ptrs;         // Source offsets pointers
   std::vector<size_type> src_offsets_offsets;        // Offset within each source offsets column
   std::vector<std::size_t> chars_partition_offsets;  // Cumulative char offsets for each column
-  data_type offsets_dtype;                           // Type of offsets column (INT32 or INT64)
-  std::size_t total_chars_bytes;                     // Total bytes in chars buffer
+  std::vector<int64_t> first_src_offsets;  // First offset value for each column (for adjustment)
+  data_type offsets_dtype;                 // Type of offsets column (INT32 or INT64)
+  std::size_t total_chars_bytes;           // Total bytes in chars buffer
 
   // Level metadata
   data_type dtype;             // Data type at this level
@@ -152,6 +153,7 @@ void collect_level_info_recursive(host_span<column_view const> cols,
     info.src_offsets_offsets.reserve(num_cols);
     info.chars_partition_offsets.reserve(num_cols + 1);
     info.chars_partition_offsets.push_back(0);  // First offset is 0
+    info.first_src_offsets.reserve(num_cols);   // Pre-computed first offsets
     info.src_data_ptrs.reserve(num_cols);       // For chars data
     info.data_sizes.reserve(num_cols);          // For chars sizes
     // Get offsets type from the first non-empty column's offsets child
@@ -199,6 +201,8 @@ void collect_level_info_recursive(host_span<column_view const> cols,
         info.data_sizes.push_back(chars_bytes);
         info.total_chars_bytes += chars_bytes;
         info.chars_partition_offsets.push_back(info.total_chars_bytes);
+        // Store first offset for kernel optimization (avoid redundant reads)
+        info.first_src_offsets.push_back(first_offset);
       } else {
         // Empty column - push placeholders
         info.src_offsets_ptrs.push_back(nullptr);
@@ -206,6 +210,7 @@ void collect_level_info_recursive(host_span<column_view const> cols,
         info.src_data_ptrs.push_back(nullptr);
         info.data_sizes.push_back(0);
         info.chars_partition_offsets.push_back(info.total_chars_bytes);
+        info.first_src_offsets.push_back(0);
       }
     } else if (!info.is_struct) {
       // Fixed-width type
@@ -361,17 +366,21 @@ CUDF_KERNEL void batch_concatenate_masks_kernel(bitmask_type const* const* __res
  *
  * Each thread processes one output offset element. The algorithm:
  * 1. Find which source column contributes this element
- * 2. Read the source offset value using input_offsetalator
+ * 2. Read the source offset value
  * 3. Adjust the offset: subtract the first offset of the source column
  *    and add the cumulative char offset for that column
  * 4. Write to output using output_offsetalator
  *
- * This is similar to fused_concatenate_string_offset_kernel but without null mask handling.
+ * Optimizations:
+ * - Uses shared memory to cache input_offsets and chars_partition_offsets for binary search
+ * - Pre-computes adjusted partition offsets (chars_partition - first_offset) to reduce
+ *   per-element computation
  *
  * @param src_offsets_ptrs Array of source offsets column data pointers
  * @param src_offsets_offsets Array of offsets within each source offsets column (parent offset)
  * @param input_offsets Prefix sum of row counts [num_columns + 1] - for finding source column
  * @param chars_partition_offsets Cumulative char byte offsets [num_columns + 1]
+ * @param first_src_offsets Pre-computed first offset value for each column (for adjustment)
  * @param num_columns Number of columns being concatenated
  * @param output_size Number of strings (num rows, not including final offset element)
  * @param output_data Output offsetalator
@@ -384,12 +393,27 @@ CUDF_KERNEL void batch_concatenate_string_offsets_kernel(
   size_type const* __restrict__ src_offsets_offsets,
   size_t const* __restrict__ input_offsets,
   size_t const* __restrict__ chars_partition_offsets,
+  int64_t const* __restrict__ first_src_offsets,
   size_type num_columns,
   size_type output_size,
   cudf::detail::output_offsetalator output_data,
   size_t total_chars_bytes,
   size_type offsets_type_size)
 {
+  // Use shared memory to cache input_offsets for binary search
+  __shared__ size_t smem_input_offsets[max_smem_columns + 1];
+  bool const use_smem = (num_columns <= max_smem_columns);
+
+  if (use_smem) {
+    // Cooperatively load input_offsets into shared memory
+    for (size_type i = threadIdx.x; i <= num_columns; i += block_size) {
+      smem_input_offsets[i] = input_offsets[i];
+    }
+    __syncthreads();
+  }
+
+  size_t const* offsets_ptr = use_smem ? smem_input_offsets : input_offsets;
+
   auto output_index   = cudf::detail::grid_1d::global_thread_id<block_size>();
   auto const stride   = cudf::detail::grid_1d::grid_stride<block_size>();
   bool const is_int64 = (offsets_type_size == 8);
@@ -397,8 +421,8 @@ CUDF_KERNEL void batch_concatenate_string_offsets_kernel(
   while (output_index < output_size) {
     // Find which source column contains this output index
     auto const offset_it = cuda::std::prev(
-      thrust::upper_bound(thrust::seq, input_offsets, input_offsets + num_columns, output_index));
-    size_type const col_idx = offset_it - input_offsets;
+      thrust::upper_bound(thrust::seq, offsets_ptr, offsets_ptr + num_columns, output_index));
+    size_type const col_idx = offset_it - offsets_ptr;
 
     // Index within this source column
     auto const idx_in_col    = output_index - *offset_it;
@@ -407,20 +431,18 @@ CUDF_KERNEL void batch_concatenate_string_offsets_kernel(
 
     // Read source offset value
     int64_t src_offset_value;
-    int64_t first_offset_value;
     if (is_int64) {
       auto const* typed_ptr = static_cast<int64_t const*>(src_ptr);
       src_offset_value      = typed_ptr[idx_in_col + parent_offset];
-      first_offset_value    = typed_ptr[parent_offset];
     } else {
       auto const* typed_ptr = static_cast<int32_t const*>(src_ptr);
       src_offset_value      = typed_ptr[idx_in_col + parent_offset];
-      first_offset_value    = typed_ptr[parent_offset];
     }
 
     // Compute output offset: subtract first offset and add cumulative char offset
+    // first_src_offsets[col_idx] is pre-computed on host to avoid redundant device reads
     output_data[output_index] =
-      src_offset_value - first_offset_value + chars_partition_offsets[col_idx];
+      src_offset_value - first_src_offsets[col_idx] + chars_partition_offsets[col_idx];
 
     output_index += stride;
   }
@@ -558,6 +580,8 @@ batch_process_result batch_process_levels(std::vector<level_info> const& levels,
       make_device_uvector_async(input_offsets, stream, cudf::get_current_device_resource_ref());
     auto d_chars_partition_offsets = make_device_uvector_async(
       level.chars_partition_offsets, stream, cudf::get_current_device_resource_ref());
+    auto d_first_src_offsets = make_device_uvector_async(
+      level.first_src_offsets, stream, cudf::get_current_device_resource_ref());
 
     // Get output offsetalator
     auto output_offsets_view = offsets_columns[level_idx]->mutable_view();
@@ -576,6 +600,7 @@ batch_process_result batch_process_levels(std::vector<level_info> const& levels,
         d_src_offsets_offsets.data(),
         d_input_offsets.data(),
         d_chars_partition_offsets.data(),
+        d_first_src_offsets.data(),
         static_cast<size_type>(num_columns),
         level.total_rows,
         output_offsetalator,
