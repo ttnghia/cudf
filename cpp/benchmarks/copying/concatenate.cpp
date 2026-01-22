@@ -27,7 +27,7 @@
 #endif
 
 #ifndef USE_BATCH
-#define USE_BATCH 0
+#define USE_BATCH 1
 #endif
 
 #ifndef NO_OP
@@ -68,16 +68,11 @@ static void validate_batch_concatenate_tables(std::vector<cudf::table_view> cons
 }
 #endif
 
-#if NO_OP
-#define CONCATENATE_FUNC(column_views, stream) \
-  std::unique_ptr<cudf::column> {}
-#else
 // Helper macro to call the appropriate concatenate function
 #if USE_BATCH
-#define CONCATENATE_FUNC(column_views, stream) cudf::batch_concatenate(column_views, stream)
+#define CONCATENATE_FUNC(views, stream) cudf::batch_concatenate(views, stream)
 #else
-#define CONCATENATE_FUNC(column_views, stream) cudf::concatenate(column_views, stream)
-#endif
+#define CONCATENATE_FUNC(views, stream) cudf::concatenate(views, stream)
 #endif
 
 static void bench_concatenate(nvbench::state& state)
@@ -121,14 +116,23 @@ static void bench_concatenate_strings(nvbench::state& state)
     data_profile_builder()
       .distribution(cudf::type_id::STRING, distribution_id::NORMAL, 0, row_width)
       .null_probability(nulls);
-  auto const column = create_random_column(cudf::type_id::STRING, row_count{num_rows}, profile);
-  auto const input  = column->view();
 
-  auto column_views = std::vector<cudf::column_view>(num_cols, input);
+  // Create separate columns for each entry (not reusing the same column)
+  std::vector<std::unique_ptr<cudf::column>> columns;
+  columns.reserve(num_cols);
+  for (cudf::size_type i = 0; i < num_cols; ++i) {
+    columns.push_back(create_random_column(cudf::type_id::STRING, row_count{num_rows}, profile));
+  }
+
+  std::vector<cudf::column_view> column_views;
+  column_views.reserve(num_cols);
+  for (auto const& col : columns) {
+    column_views.push_back(col->view());
+  }
 
   auto stream = cudf::get_default_stream();
   state.set_cuda_stream(nvbench::make_cuda_stream_view(stream.value()));
-  auto const sv = cudf::strings_column_view(input);
+  auto const sv = cudf::strings_column_view(column_views[0]);
   state.add_global_memory_reads<int8_t>(sv.chars_size(stream) * num_cols);
   state.add_global_memory_writes<int64_t>(sv.chars_size(stream) * num_cols);
 
@@ -234,11 +238,18 @@ static void bench_concatenate_structs(nvbench::state& state)
   auto const depth        = static_cast<cudf::size_type>(state.get_int64("depth"));
   auto const nulls        = state.get_float64("nulls");
 
-  // Create struct columns
-  auto column = create_struct_column(num_rows, num_children, depth, nulls);
-  auto input  = column->view();
+  // Create separate struct columns for each entry (not reusing the same column)
+  std::vector<std::unique_ptr<cudf::column>> columns;
+  columns.reserve(num_cols);
+  for (cudf::size_type i = 0; i < num_cols; ++i) {
+    columns.push_back(create_struct_column(num_rows, num_children, depth, nulls));
+  }
 
-  auto column_views = std::vector<cudf::column_view>(num_cols, input);
+  std::vector<cudf::column_view> column_views;
+  column_views.reserve(num_cols);
+  for (auto const& col : columns) {
+    column_views.push_back(col->view());
+  }
 
   auto stream = cudf::get_default_stream();
   state.set_cuda_stream(nvbench::make_cuda_stream_view(stream.value()));
@@ -353,11 +364,18 @@ static void bench_concatenate_lists(nvbench::state& state)
   auto const nesting_level = static_cast<cudf::size_type>(state.get_int64("nesting_level"));
   auto const nulls         = state.get_float64("nulls");
 
-  // Create nested list column
-  auto column = create_nested_list_column(num_rows, avg_list_size, nesting_level, nulls);
-  auto input  = column->view();
+  // Create separate nested list columns for each entry (not reusing the same column)
+  std::vector<std::unique_ptr<cudf::column>> columns;
+  columns.reserve(num_cols);
+  for (cudf::size_type i = 0; i < num_cols; ++i) {
+    columns.push_back(create_nested_list_column(num_rows, avg_list_size, nesting_level, nulls));
+  }
 
-  auto column_views = std::vector<cudf::column_view>(num_cols, input);
+  std::vector<cudf::column_view> column_views;
+  column_views.reserve(num_cols);
+  for (auto const& col : columns) {
+    column_views.push_back(col->view());
+  }
 
   auto stream = cudf::get_default_stream();
   state.set_cuda_stream(nvbench::make_cuda_stream_view(stream.value()));
@@ -415,7 +433,7 @@ static void bench_concatenate_tables(nvbench::state& state)
   validate_batch_concatenate_tables(table_views, stream);
 #else
   state.exec(nvbench::exec_tag::sync,
-             [&](nvbench::launch&) { auto result = cudf::batch_concatenate(table_views, stream); });
+             [&](nvbench::launch&) { auto result = CONCATENATE_FUNC(table_views, stream); });
 #endif
 }
 
@@ -469,7 +487,7 @@ static void bench_concatenate_tables_strings(nvbench::state& state)
   validate_batch_concatenate_tables(table_views, stream);
 #else
   state.exec(nvbench::exec_tag::sync,
-             [&](nvbench::launch&) { auto result = cudf::batch_concatenate(table_views, stream); });
+             [&](nvbench::launch&) { auto result = CONCATENATE_FUNC(table_views, stream); });
 #endif
 }
 
@@ -520,7 +538,7 @@ static void bench_concatenate_tables_structs(nvbench::state& state)
   validate_batch_concatenate_tables(table_views, stream);
 #else
   state.exec(nvbench::exec_tag::sync,
-             [&](nvbench::launch&) { auto result = cudf::batch_concatenate(table_views, stream); });
+             [&](nvbench::launch&) { auto result = CONCATENATE_FUNC(table_views, stream); });
 #endif
 }
 
@@ -573,7 +591,7 @@ static void bench_concatenate_tables_lists(nvbench::state& state)
   validate_batch_concatenate_tables(table_views, stream);
 #else
   state.exec(nvbench::exec_tag::sync,
-             [&](nvbench::launch&) { auto result = cudf::batch_concatenate(table_views, stream); });
+             [&](nvbench::launch&) { auto result = CONCATENATE_FUNC(table_views, stream); });
 #endif
 }
 
