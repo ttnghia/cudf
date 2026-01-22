@@ -10,12 +10,16 @@
 #include <cudf/detail/concatenate.hpp>
 #include <cudf/detail/null_mask.hpp>
 #include <cudf/detail/nvtx/ranges.hpp>
+#include <cudf/detail/offsets_iterator_factory.cuh>
 #include <cudf/detail/utilities/batched_memcpy.hpp>
 #include <cudf/detail/utilities/cuda.cuh>
 #include <cudf/detail/utilities/grid_1d.cuh>
 #include <cudf/detail/utilities/integer_utils.hpp>
 #include <cudf/detail/utilities/vector_factories.hpp>
+#include <cudf/strings/detail/utilities.hpp>
+#include <cudf/strings/strings_column_view.hpp>
 #include <cudf/structs/structs_column_view.hpp>
+#include <cudf/types.hpp>
 #include <cudf/utilities/bit.hpp>
 #include <cudf/utilities/error.hpp>
 #include <cudf/utilities/memory_resource.hpp>
@@ -27,6 +31,7 @@
 #include <rmm/device_buffer.hpp>
 #include <rmm/device_uvector.hpp>
 
+#include <cuda/std/iterator>
 #include <thrust/binary_search.h>
 
 #include <algorithm>
@@ -42,12 +47,12 @@ namespace {
 /**
  * @brief Checks if the given data type is supported by batch_concatenate.
  *
- * Supported types are: fixed-width types (plain types) and struct types.
- * Lists, strings, and dictionaries are NOT supported.
+ * Supported types are: fixed-width types (plain types), struct types, and string types.
+ * Lists and dictionaries are NOT supported.
  */
 bool is_batch_concat_supported_type(data_type type)
 {
-  return cudf::is_fixed_width(type) || type.id() == type_id::STRUCT;
+  return cudf::is_fixed_width(type) || type.id() == type_id::STRUCT || type.id() == type_id::STRING;
 }
 
 /**
@@ -62,6 +67,7 @@ bool is_column_batch_concat_supported(column_view const& col)
       if (!is_column_batch_concat_supported(col.child(i))) { return false; }
     }
   }
+  // STRING type: no need to check children - offsets and chars are handled specially
   return true;
 }
 
@@ -89,6 +95,13 @@ struct level_info {
   std::vector<size_type> mask_offsets;         // Bit offset for each mask
   std::vector<size_type> col_sizes;            // Number of rows in each column
 
+  // String-specific info (for offset concatenation)
+  std::vector<void const*> src_offsets_ptrs;         // Source offsets pointers
+  std::vector<size_type> src_offsets_offsets;        // Offset within each source offsets column
+  std::vector<std::size_t> chars_partition_offsets;  // Cumulative char offsets for each column
+  data_type offsets_dtype;                           // Type of offsets column (INT32 or INT64)
+  std::size_t total_chars_bytes;                     // Total bytes in chars buffer
+
   // Level metadata
   data_type dtype;             // Data type at this level
   size_type total_rows;        // Total number of rows
@@ -96,6 +109,7 @@ struct level_info {
   size_type num_children;      // Number of children (for struct types)
   bool has_nulls;              // Whether any column has nulls
   bool is_struct;              // Whether this level is a struct type
+  bool is_string;              // Whether this level is a string type
 };
 
 /**
@@ -110,25 +124,46 @@ void collect_level_info_recursive(host_span<column_view const> cols,
   if (cols.empty()) return;
 
   level_info info;
-  auto const& first_col = cols.front();
-  info.dtype            = first_col.type();
-  info.is_struct        = (info.dtype.id() == type_id::STRUCT);
-  info.num_children     = first_col.num_children();
-  info.has_nulls        = false;
-  info.total_rows       = 0;
-  info.total_null_count = 0;
+  auto const& first_col  = cols.front();
+  info.dtype             = first_col.type();
+  info.is_struct         = (info.dtype.id() == type_id::STRUCT);
+  info.is_string         = (info.dtype.id() == type_id::STRING);
+  info.num_children      = first_col.num_children();
+  info.has_nulls         = false;
+  info.total_rows        = 0;
+  info.total_null_count  = 0;
+  info.total_chars_bytes = 0;
 
   // Compute element size once for fixed-width types
-  std::size_t const element_size = info.is_struct ? 0 : cudf::size_of(info.dtype);
+  std::size_t const element_size =
+    (info.is_struct || info.is_string) ? 0 : cudf::size_of(info.dtype);
 
   // Reserve space to avoid reallocations
   auto const num_cols = cols.size();
   info.mask_ptrs.reserve(num_cols);
   info.mask_offsets.reserve(num_cols);
   info.col_sizes.reserve(num_cols);
-  if (!info.is_struct) {
+  if (!info.is_struct && !info.is_string) {
     info.src_data_ptrs.reserve(num_cols);
     info.data_sizes.reserve(num_cols);
+  }
+  if (info.is_string) {
+    info.src_offsets_ptrs.reserve(num_cols);
+    info.src_offsets_offsets.reserve(num_cols);
+    info.chars_partition_offsets.reserve(num_cols + 1);
+    info.chars_partition_offsets.push_back(0);  // First offset is 0
+    info.src_data_ptrs.reserve(num_cols);       // For chars data
+    info.data_sizes.reserve(num_cols);          // For chars sizes
+    // Get offsets type from the first non-empty column's offsets child
+    // Empty string columns have no children
+    info.offsets_dtype = data_type{type_id::INT32};  // Default
+    for (auto const& col : cols) {
+      if (col.size() > 0) {
+        strings_column_view scv(col);
+        info.offsets_dtype = scv.offsets().type();
+        break;
+      }
+    }
   }
 
   // Single pass over columns to collect all info
@@ -143,8 +178,37 @@ void collect_level_info_recursive(host_span<column_view const> cols,
     info.total_null_count += col.null_count();
     if (col.has_nulls()) { info.has_nulls = true; }
 
-    // Data info (only for non-struct types)
-    if (!info.is_struct) {
+    // Data info based on type
+    if (info.is_string) {
+      // String column: collect offsets and chars info
+      // Note: empty string columns have no children, so we must check size first
+      if (col_size > 0) {
+        strings_column_view scv(col);
+        auto const offsets_col = scv.offsets();
+
+        // Offsets info
+        info.src_offsets_ptrs.push_back(offsets_col.head());
+        info.src_offsets_offsets.push_back(col.offset());
+
+        // Chars info - need to get the actual char bytes for this column
+        auto const [first_offset, last_offset] =
+          cudf::strings::detail::get_first_and_last_offset(scv, stream);
+        auto const chars_bytes = last_offset - first_offset;
+        // For sliced columns, chars start at first_offset from the beginning
+        info.src_data_ptrs.push_back(scv.chars_begin(stream) + first_offset);
+        info.data_sizes.push_back(chars_bytes);
+        info.total_chars_bytes += chars_bytes;
+        info.chars_partition_offsets.push_back(info.total_chars_bytes);
+      } else {
+        // Empty column - push placeholders
+        info.src_offsets_ptrs.push_back(nullptr);
+        info.src_offsets_offsets.push_back(0);
+        info.src_data_ptrs.push_back(nullptr);
+        info.data_sizes.push_back(0);
+        info.chars_partition_offsets.push_back(info.total_chars_bytes);
+      }
+    } else if (!info.is_struct) {
+      // Fixed-width type
       info.src_data_ptrs.push_back(col.head<char>() + (col.offset() * element_size));
       info.data_sizes.push_back(col_size * element_size);
     }
@@ -167,6 +231,7 @@ void collect_level_info_recursive(host_span<column_view const> cols,
       collect_level_info_recursive(child_cols, levels, stream);
     }
   }
+  // Note: STRING type children (offsets, chars) are handled specially, not recursively
 }
 
 /**
@@ -292,14 +357,95 @@ CUDF_KERNEL void batch_concatenate_masks_kernel(bitmask_type const* const* __res
 }
 
 /**
- * @brief Performs all batch operations: data copy and mask concatenation.
+ * @brief Concatenates string offsets from multiple columns.
  *
- * Returns the output data buffers and mask buffers with null counts.
+ * Each thread processes one output offset element. The algorithm:
+ * 1. Find which source column contributes this element
+ * 2. Read the source offset value using input_offsetalator
+ * 3. Adjust the offset: subtract the first offset of the source column
+ *    and add the cumulative char offset for that column
+ * 4. Write to output using output_offsetalator
+ *
+ * This is similar to fused_concatenate_string_offset_kernel but without null mask handling.
+ *
+ * @param src_offsets_ptrs Array of source offsets column data pointers
+ * @param src_offsets_offsets Array of offsets within each source offsets column (parent offset)
+ * @param input_offsets Prefix sum of row counts [num_columns + 1] - for finding source column
+ * @param chars_partition_offsets Cumulative char byte offsets [num_columns + 1]
+ * @param num_columns Number of columns being concatenated
+ * @param output_size Number of strings (num rows, not including final offset element)
+ * @param output_data Output offsetalator
+ * @param total_chars_bytes Total bytes in concatenated chars buffer (for final offset)
+ * @param offsets_type_size Size of offset type in bytes (4 for INT32, 8 for INT64)
  */
-std::pair<std::vector<rmm::device_buffer>, std::vector<std::pair<rmm::device_buffer, size_type>>>
-batch_process_levels(std::vector<level_info> const& levels,
-                     rmm::cuda_stream_view stream,
-                     rmm::device_async_resource_ref mr)
+template <size_type block_size>
+CUDF_KERNEL void batch_concatenate_string_offsets_kernel(
+  void const* const* __restrict__ src_offsets_ptrs,
+  size_type const* __restrict__ src_offsets_offsets,
+  size_t const* __restrict__ input_offsets,
+  size_t const* __restrict__ chars_partition_offsets,
+  size_type num_columns,
+  size_type output_size,
+  cudf::detail::output_offsetalator output_data,
+  size_t total_chars_bytes,
+  size_type offsets_type_size)
+{
+  auto output_index   = cudf::detail::grid_1d::global_thread_id<block_size>();
+  auto const stride   = cudf::detail::grid_1d::grid_stride<block_size>();
+  bool const is_int64 = (offsets_type_size == 8);
+
+  while (output_index < output_size) {
+    // Find which source column contains this output index
+    auto const offset_it = cuda::std::prev(
+      thrust::upper_bound(thrust::seq, input_offsets, input_offsets + num_columns, output_index));
+    size_type const col_idx = offset_it - input_offsets;
+
+    // Index within this source column
+    auto const idx_in_col    = output_index - *offset_it;
+    auto const parent_offset = src_offsets_offsets[col_idx];
+    void const* src_ptr      = src_offsets_ptrs[col_idx];
+
+    // Read source offset value
+    int64_t src_offset_value;
+    int64_t first_offset_value;
+    if (is_int64) {
+      auto const* typed_ptr = static_cast<int64_t const*>(src_ptr);
+      src_offset_value      = typed_ptr[idx_in_col + parent_offset];
+      first_offset_value    = typed_ptr[parent_offset];
+    } else {
+      auto const* typed_ptr = static_cast<int32_t const*>(src_ptr);
+      src_offset_value      = typed_ptr[idx_in_col + parent_offset];
+      first_offset_value    = typed_ptr[parent_offset];
+    }
+
+    // Compute output offset: subtract first offset and add cumulative char offset
+    output_data[output_index] =
+      src_offset_value - first_offset_value + chars_partition_offsets[col_idx];
+
+    output_index += stride;
+  }
+
+  // Handle the final offset element (total chars bytes)
+  if (output_index == output_size) { output_data[output_size] = total_chars_bytes; }
+}
+
+/**
+ * @brief Result structure for batch_process_levels.
+ */
+struct batch_process_result {
+  std::vector<rmm::device_buffer> data_buffers;  // Data (or chars for strings)
+  std::vector<std::pair<rmm::device_buffer, size_type>> mask_results;  // Null masks with counts
+  std::vector<std::unique_ptr<column>> offsets_columns;  // Offsets columns for strings
+};
+
+/**
+ * @brief Performs all batch operations: data copy, mask concatenation, and string offset handling.
+ *
+ * Returns the output data buffers, mask buffers with null counts, and offsets columns for strings.
+ */
+batch_process_result batch_process_levels(std::vector<level_info> const& levels,
+                                          rmm::cuda_stream_view stream,
+                                          rmm::device_async_resource_ref mr)
 {
   CUDF_FUNC_RANGE();
 
@@ -308,13 +454,24 @@ batch_process_levels(std::vector<level_info> const& levels,
   // ========== PHASE 1: Allocate output buffers ==========
   std::vector<rmm::device_buffer> data_buffers;
   std::vector<rmm::device_buffer> null_masks;
+  std::vector<std::unique_ptr<column>> offsets_columns;
   data_buffers.reserve(num_levels);
   null_masks.reserve(num_levels);
+  offsets_columns.resize(num_levels);  // Initialize with nullptrs
 
-  for (auto const& level : levels) {
+  for (size_type level_idx = 0; level_idx < num_levels; ++level_idx) {
+    auto const& level = levels[level_idx];
+
     // Data buffer
     if (level.is_struct) {
       data_buffers.emplace_back(0, stream, mr);
+    } else if (level.is_string) {
+      // For strings, data_buffer holds chars
+      data_buffers.emplace_back(level.total_chars_bytes, stream, mr);
+      // Allocate offsets column
+      auto const offsets_count   = level.total_rows + 1;
+      offsets_columns[level_idx] = cudf::strings::detail::create_offsets_child_column(
+        static_cast<int64_t>(level.total_chars_bytes), offsets_count, stream, mr);
     } else {
       std::size_t const total_bytes =
         std::accumulate(level.data_sizes.begin(), level.data_sizes.end(), std::size_t{0});
@@ -334,7 +491,9 @@ batch_process_levels(std::vector<level_info> const& levels,
   // Pre-calculate total number of copy operations for efficient allocation
   size_t total_copy_ops = 0;
   for (auto const& level : levels) {
-    if (!level.is_struct) { total_copy_ops += level.src_data_ptrs.size(); }
+    if (!level.is_struct && !level.src_data_ptrs.empty()) {
+      total_copy_ops += level.src_data_ptrs.size();
+    }
   }
 
   if (total_copy_ops > 0) {
@@ -348,29 +507,83 @@ batch_process_levels(std::vector<level_info> const& levels,
 
     for (size_type level_idx = 0; level_idx < num_levels; ++level_idx) {
       auto const& level = levels[level_idx];
-      if (level.is_struct) continue;
+      if (level.is_struct || level.src_data_ptrs.empty()) continue;
 
       char* dst_ptr = static_cast<char*>(data_buffers[level_idx].data());
       for (size_t col = 0; col < level.src_data_ptrs.size(); ++col) {
-        all_src_ptrs.push_back(level.src_data_ptrs[col]);
-        all_dst_ptrs.push_back(dst_ptr);
-        all_sizes.push_back(level.data_sizes[col]);
+        if (level.src_data_ptrs[col] != nullptr && level.data_sizes[col] > 0) {
+          all_src_ptrs.push_back(level.src_data_ptrs[col]);
+          all_dst_ptrs.push_back(dst_ptr);
+          all_sizes.push_back(level.data_sizes[col]);
+        }
         dst_ptr += level.data_sizes[col];
       }
     }
 
-    auto d_src_ptrs =
-      make_device_uvector_async(all_src_ptrs, stream, cudf::get_current_device_resource_ref());
-    auto d_dst_ptrs =
-      make_device_uvector_async(all_dst_ptrs, stream, cudf::get_current_device_resource_ref());
-    auto d_sizes =
-      make_device_uvector_async(all_sizes, stream, cudf::get_current_device_resource_ref());
+    if (!all_src_ptrs.empty()) {
+      auto d_src_ptrs =
+        make_device_uvector_async(all_src_ptrs, stream, cudf::get_current_device_resource_ref());
+      auto d_dst_ptrs =
+        make_device_uvector_async(all_dst_ptrs, stream, cudf::get_current_device_resource_ref());
+      auto d_sizes =
+        make_device_uvector_async(all_sizes, stream, cudf::get_current_device_resource_ref());
 
-    batched_memcpy_async(
-      d_src_ptrs.data(), d_dst_ptrs.data(), d_sizes.data(), total_copy_ops, stream);
+      batched_memcpy_async(
+        d_src_ptrs.data(), d_dst_ptrs.data(), d_sizes.data(), all_src_ptrs.size(), stream);
+    }
   }
 
-  // ========== PHASE 3: Batch mask concatenation ==========
+  // ========== PHASE 3: String offsets concatenation ==========
+  for (size_type level_idx = 0; level_idx < num_levels; ++level_idx) {
+    auto const& level = levels[level_idx];
+    if (!level.is_string) continue;
+
+    cudf::scoped_range r{"concatenate string offsets"};
+
+    auto const num_columns = level.src_offsets_ptrs.size();
+
+    // Build input offsets (prefix sum of row counts for finding source column)
+    std::vector<size_t> input_offsets(num_columns + 1);
+    input_offsets[0] = 0;
+    for (size_t col = 0; col < num_columns; ++col) {
+      input_offsets[col + 1] = input_offsets[col] + level.col_sizes[col];
+    }
+
+    // Upload to device
+    auto d_src_offsets_ptrs = make_device_uvector_async(
+      level.src_offsets_ptrs, stream, cudf::get_current_device_resource_ref());
+    auto d_src_offsets_offsets = make_device_uvector_async(
+      level.src_offsets_offsets, stream, cudf::get_current_device_resource_ref());
+    auto d_input_offsets =
+      make_device_uvector_async(input_offsets, stream, cudf::get_current_device_resource_ref());
+    auto d_chars_partition_offsets = make_device_uvector_async(
+      level.chars_partition_offsets, stream, cudf::get_current_device_resource_ref());
+
+    // Get output offsetalator
+    auto output_offsets_view = offsets_columns[level_idx]->mutable_view();
+    auto output_offsetalator = offsetalator_factory::make_output_iterator(output_offsets_view);
+
+    // Determine offset type size
+    size_type const offsets_type_size = cudf::size_of(level.offsets_dtype);
+
+    // Launch kernel
+    constexpr size_type block_size{256};
+    cudf::detail::grid_1d config(level.total_rows + 1, block_size);  // +1 for final offset
+
+    batch_concatenate_string_offsets_kernel<block_size>
+      <<<config.num_blocks, config.num_threads_per_block, 0, stream.value()>>>(
+        d_src_offsets_ptrs.data(),
+        d_src_offsets_offsets.data(),
+        d_input_offsets.data(),
+        d_chars_partition_offsets.data(),
+        static_cast<size_type>(num_columns),
+        level.total_rows,
+        output_offsetalator,
+        level.total_chars_bytes,
+        offsets_type_size);
+  }
+
+  // ========== PHASE 4: Batch mask concatenation ==========
   // Collect levels with nulls
   std::vector<size_type> levels_with_nulls;
   for (size_type i = 0; i < num_levels; ++i) {
@@ -430,7 +643,7 @@ batch_process_levels(std::vector<level_info> const& levels,
     mask_results.emplace_back(std::move(null_masks[i]), null_counts[i]);
   }
 
-  return {std::move(data_buffers), std::move(mask_results)};
+  return {std::move(data_buffers), std::move(mask_results), std::move(offsets_columns)};
 }
 
 /**
@@ -440,6 +653,7 @@ std::unique_ptr<column> reconstruct_column(
   std::vector<level_info> const& levels,
   std::vector<rmm::device_buffer>& data_buffers,
   std::vector<std::pair<rmm::device_buffer, size_type>>& mask_results,
+  std::vector<std::unique_ptr<column>>& offsets_columns,
   size_type& level_idx,
   rmm::cuda_stream_view stream,
   rmm::device_async_resource_ref mr)
@@ -456,12 +670,19 @@ std::unique_ptr<column> reconstruct_column(
     children.reserve(level.num_children);
 
     for (size_type i = 0; i < level.num_children; ++i) {
-      children.push_back(
-        reconstruct_column(levels, data_buffers, mask_results, level_idx, stream, mr));
+      children.push_back(reconstruct_column(
+        levels, data_buffers, mask_results, offsets_columns, level_idx, stream, mr));
     }
 
     return make_structs_column(
       level.total_rows, std::move(children), null_count, std::move(null_mask), stream, mr);
+  } else if (level.is_string) {
+    // String column: construct from offsets column and chars buffer
+    return make_strings_column(level.total_rows,
+                               std::move(offsets_columns[current_level]),
+                               std::move(data_buffers[current_level]),
+                               null_count,
+                               std::move(null_mask));
   } else {
     return std::make_unique<column>(level.dtype,
                                     level.total_rows,
@@ -530,10 +751,10 @@ std::unique_ptr<column> batch_concatenate(host_span<column_view const> columns_t
 
   CUDF_EXPECTS(!columns_to_concat.empty(), "Unexpected empty list of columns to concatenate.");
 
-  // Check that all columns are supported types (plain types or struct types)
+  // Check that all columns are supported types (plain types, struct types, or string types)
   CUDF_EXPECTS(all_columns_batch_concat_supported(columns_to_concat),
-               "batch_concatenate only supports fixed-width and struct types. "
-               "Lists, strings, and dictionaries are not supported.",
+               "batch_concatenate only supports fixed-width, struct, and string types. "
+               "Lists and dictionaries are not supported.",
                cudf::logic_error);
 
   // Verify bounds and type compatibility
@@ -560,12 +781,18 @@ std::unique_ptr<column> batch_concatenate(host_span<column_view const> columns_t
   std::vector<level_info> levels;
   collect_level_info_recursive(columns_to_concat, levels, stream);
 
-  // Step 2: Batch process all data copy and mask concatenation
-  auto [data_buffers, mask_results] = batch_process_levels(levels, stream, mr);
+  // Step 2: Batch process all data copy, mask concatenation, and string offsets
+  auto result = batch_process_levels(levels, stream, mr);
 
   // Step 3: Reconstruct the column hierarchy
   size_type level_idx = 0;
-  return reconstruct_column(levels, data_buffers, mask_results, level_idx, stream, mr);
+  return reconstruct_column(levels,
+                            result.data_buffers,
+                            result.mask_results,
+                            result.offsets_columns,
+                            level_idx,
+                            stream,
+                            mr);
 }
 
 bool can_use_batch_concatenate(host_span<column_view const> columns)
