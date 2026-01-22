@@ -3,6 +3,12 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+// Set CONCAT_SEPARATE_COLUMN=1 to concatenate each column position separately
+// (calls batch_concatenate(column_view) per column instead of single batched_memcpy for all)
+#ifndef CONCAT_SEPARATE_COLUMN
+#define CONCAT_SEPARATE_COLUMN 1
+#endif
+
 #include <cudf/column/column.hpp>
 #include <cudf/column/column_factories.hpp>
 #include <cudf/concatenate.hpp>
@@ -1276,12 +1282,66 @@ table_batch_process_result batch_process_table_levels(
           std::move(offsets_columns_by_column)};
 }
 
+#if CONCAT_SEPARATE_COLUMN
+/**
+ * @brief Concatenates tables by processing each column position separately.
+ *
+ * This implementation calls batch_concatenate(column_view) for each column position,
+ * resulting in separate batched_memcpy calls per column. Used for comparison/benchmarking
+ * against the unified single batched_memcpy implementation.
+ */
+std::unique_ptr<table> batch_concatenate_separate_columns(
+  host_span<table_view const> tables_to_concat,
+  rmm::cuda_stream_view stream,
+  rmm::device_async_resource_ref mr)
+{
+  CUDF_FUNC_RANGE();
+
+  if (tables_to_concat.empty()) { return std::make_unique<table>(); }
+
+  // Validate column counts match
+  table_view const first_table = tables_to_concat.front();
+  CUDF_EXPECTS(std::all_of(tables_to_concat.begin(),
+                           tables_to_concat.end(),
+                           [&first_table](auto const& t) {
+                             return t.num_columns() == first_table.num_columns();
+                           }),
+               "Mismatch in table columns to concatenate.");
+
+  auto const num_columns = first_table.num_columns();
+  if (num_columns == 0) { return std::make_unique<table>(); }
+
+  // Process each column position separately
+  std::vector<std::unique_ptr<column>> output_columns;
+  output_columns.reserve(num_columns);
+
+  std::vector<column_view> cols_for_position;
+  cols_for_position.reserve(tables_to_concat.size());
+
+  for (size_type col_idx = 0; col_idx < num_columns; ++col_idx) {
+    cols_for_position.clear();
+    for (auto const& table : tables_to_concat) {
+      cols_for_position.push_back(table.column(col_idx));
+    }
+
+    // Call batch_concatenate for this column position (separate batched_memcpy per column)
+    output_columns.push_back(
+      detail::batch_concatenate(host_span<column_view const>{cols_for_position}, stream, mr));
+  }
+
+  return std::make_unique<table>(std::move(output_columns));
+}
+#endif
+
 std::unique_ptr<table> batch_concatenate(host_span<table_view const> tables_to_concat,
                                          rmm::cuda_stream_view stream,
                                          rmm::device_async_resource_ref mr)
 {
   CUDF_FUNC_RANGE();
 
+#if CONCAT_SEPARATE_COLUMN
+  return batch_concatenate_separate_columns(tables_to_concat, stream, mr);
+#else
   if (tables_to_concat.empty()) { return std::make_unique<table>(); }
 
   // Validate column counts match
@@ -1358,6 +1418,7 @@ std::unique_ptr<table> batch_concatenate(host_span<table_view const> tables_to_c
   }
 
   return std::make_unique<table>(std::move(output_columns));
+#endif
 }
 
 bool can_use_batch_concatenate(host_span<table_view const> tables)
