@@ -262,23 +262,13 @@ CUDF_KERNEL void batch_concatenate_masks_kernel(bitmask_type const* const* __res
         size_type const src_word_idx  = src_bit_idx / bits_per_word;
         size_type const src_bit_shift = src_bit_idx % bits_per_word;
 
-        // Read source word
-        bitmask_type src_bits = src_mask[src_word_idx];
-
-        // If we need bits from the next word, use funnel shift
-        if (src_bit_shift + bits_to_copy > bits_per_word) {
-          // Check if next word exists (need to check against column bounds)
-          size_type const total_src_bits      = mask_offsets[col_idx] + col_size;
-          size_type const next_word_start_bit = (src_word_idx + 1) * bits_per_word;
-          if (next_word_start_bit < total_src_bits) {
-            // Use hardware funnel shift: extracts bits across two words
-            src_bits = __funnelshift_r(src_bits, src_mask[src_word_idx + 1], src_bit_shift);
-          } else {
-            src_bits >>= src_bit_shift;
-          }
-        } else if (src_bit_shift > 0) {
-          src_bits >>= src_bit_shift;
-        }
+        // Read source bits using funnel shift for unaligned access
+        // __funnelshift_r(lo, hi, shift) extracts bits [shift, shift+32) from {hi, lo}
+        // When shift=0, it returns lo unchanged, so we can use it unconditionally
+        bitmask_type const lo = src_mask[src_word_idx];
+        // Only read next word if we actually need bits from it
+        bitmask_type const hi = (src_bit_shift > 0) ? src_mask[src_word_idx + 1] : 0;
+        bitmask_type src_bits = __funnelshift_r(lo, hi, src_bit_shift);
 
         // Mask to get only the bits we need
         bitmask_type const bits_mask      = (bits_to_copy == bits_per_word)
