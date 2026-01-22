@@ -4,10 +4,13 @@
  */
 #include <benchmarks/common/generate_input.hpp>
 
+#include <cudf_test/base_fixture.hpp>
+#include <cudf_test/column_utilities.hpp>
 #include <cudf_test/column_wrapper.hpp>
 
 #include <cudf/column/column_view.hpp>
 #include <cudf/concatenate.hpp>
+#include <cudf/detail/concatenate.hpp>
 #include <cudf/detail/iterator.cuh>
 #include <cudf/lists/lists_column_view.hpp>
 #include <cudf/strings/strings_column_view.hpp>
@@ -17,6 +20,40 @@
 
 #include <random>
 #include <vector>
+
+#ifndef VALIDATE
+#define VALIDATE 0
+#endif
+
+#ifndef USE_BATCH
+#define USE_BATCH 1
+#endif
+
+#if VALIDATE
+static void validate_batch_concatenate(std::vector<cudf::column_view> const& column_views,
+                                       rmm::cuda_stream_view stream)
+{
+  auto mr = cudf::get_current_device_resource_ref();
+
+  // Run both implementations directly via detail namespace
+  // cudf::concatenate may route to batch_concatenate internally, so we need
+  // to call the implementations directly to compare them
+  auto result_concat = cudf::detail::concatenate(column_views, stream, mr);
+  auto result_batch  = cudf::detail::batch_concatenate(column_views, stream, mr);
+
+  // Compare results
+  CUDF_TEST_EXPECT_COLUMNS_EQUAL(*result_concat, *result_batch);
+  printf("Validated!\n");
+  fflush(stdout);
+}
+#endif
+
+// Helper macro to call the appropriate concatenate function
+#if USE_BATCH
+#define CONCATENATE_FUNC(column_views, stream) cudf::batch_concatenate(column_views, stream)
+#else
+#define CONCATENATE_FUNC(column_views, stream) cudf::concatenate(column_views, stream)
+#endif
 
 static void bench_concatenate(nvbench::state& state)
 {
@@ -34,8 +71,12 @@ static void bench_concatenate(nvbench::state& state)
   state.add_global_memory_reads<int64_t>(num_rows * num_cols);
   state.add_global_memory_writes<int64_t>(num_rows * num_cols);
 
+#if VALIDATE
+  validate_batch_concatenate(column_views, stream);
+#else
   state.exec(nvbench::exec_tag::sync,
-             [&](nvbench::launch&) { auto result = cudf::concatenate(column_views); });
+             [&](nvbench::launch&) { auto result = CONCATENATE_FUNC(column_views, stream); });
+#endif
 }
 
 NVBENCH_BENCH(bench_concatenate)
@@ -66,8 +107,12 @@ static void bench_concatenate_strings(nvbench::state& state)
   state.add_global_memory_reads<int8_t>(sv.chars_size(stream) * num_cols);
   state.add_global_memory_writes<int64_t>(sv.chars_size(stream) * num_cols);
 
+#if VALIDATE
+  validate_batch_concatenate(column_views, stream);
+#else
   state.exec(nvbench::exec_tag::sync,
-             [&](nvbench::launch&) { auto result = cudf::concatenate(column_views); });
+             [&](nvbench::launch&) { auto result = CONCATENATE_FUNC(column_views, stream); });
+#endif
 }
 
 NVBENCH_BENCH(bench_concatenate_strings)
@@ -141,8 +186,12 @@ static void bench_concatenate_fixed_width(nvbench::state& state)
   state.add_global_memory_reads<int32_t>(num_rows * num_cols);
   state.add_global_memory_writes<int32_t>(num_rows * num_cols);
 
+#if VALIDATE
+  validate_batch_concatenate(column_views, stream);
+#else
   state.exec(nvbench::exec_tag::sync,
-             [&](nvbench::launch&) { auto result = cudf::concatenate(column_views); });
+             [&](nvbench::launch&) { auto result = CONCATENATE_FUNC(column_views, stream); });
+#endif
 }
 
 NVBENCH_BENCH(bench_concatenate_fixed_width)
@@ -175,8 +224,12 @@ static void bench_concatenate_structs(nvbench::state& state)
   state.add_global_memory_reads<int8_t>(leaf_bytes * num_cols);
   state.add_global_memory_writes<int8_t>(leaf_bytes * num_cols);
 
+#if VALIDATE
+  validate_batch_concatenate(column_views, stream);
+#else
   state.exec(nvbench::exec_tag::sync,
-             [&](nvbench::launch&) { auto result = cudf::concatenate(column_views); });
+             [&](nvbench::launch&) { auto result = CONCATENATE_FUNC(column_views, stream); });
+#endif
 }
 
 NVBENCH_BENCH(bench_concatenate_structs)
@@ -291,8 +344,12 @@ static void bench_concatenate_lists(nvbench::state& state)
   state.add_global_memory_reads<int8_t>(leaf_bytes * num_cols);
   state.add_global_memory_writes<int8_t>(leaf_bytes * num_cols);
 
+#if VALIDATE
+  validate_batch_concatenate(column_views, stream);
+#else
   state.exec(nvbench::exec_tag::sync,
-             [&](nvbench::launch&) { auto result = cudf::concatenate(column_views); });
+             [&](nvbench::launch&) { auto result = CONCATENATE_FUNC(column_views, stream); });
+#endif
 }
 
 NVBENCH_BENCH(bench_concatenate_lists)
