@@ -27,7 +27,7 @@
 #endif
 
 #ifndef USE_BATCH
-#define USE_BATCH 1
+#define USE_BATCH 0
 #endif
 
 #ifndef NO_OP
@@ -598,7 +598,7 @@ static void bench_concatenate_tables_lists(nvbench::state& state)
 NVBENCH_BENCH(bench_concatenate_tables_lists)
   .set_name("concatenate_tables_lists")
   .add_int64_axis("num_rows", {50'000, 100'000})
-  .add_int64_axis("num_cols", {1})
+  .add_int64_axis("num_cols", {4, 16, 64})
   .add_int64_axis("num_tables", {64, 128})
   .add_int64_axis("avg_list_size", {5})
   .add_int64_axis("nesting_level", {1, 2})
