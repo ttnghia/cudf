@@ -20,6 +20,7 @@
 #include <cudf/detail/offsets_iterator_factory.cuh>
 #include <cudf/detail/utilities/batched_memcpy.hpp>
 #include <cudf/detail/utilities/cuda.cuh>
+#include <cudf/detail/utilities/cuda.hpp>
 #include <cudf/detail/utilities/grid_1d.cuh>
 #include <cudf/detail/utilities/integer_utils.hpp>
 #include <cudf/detail/utilities/vector_factories.hpp>
@@ -663,9 +664,6 @@ CUDF_KERNEL void batch_concatenate_offsets_kernel_2d(
     __syncthreads();
   }
 
-  auto const output_index = blockIdx.x * block_size + threadIdx.x;
-  if (output_index > output_size) return;
-
   // Get this column's slice of the flattened arrays
   auto const src_offsets_ptrs    = all_src_offsets_ptrs + src_ptr_start;
   auto const src_offsets_offsets = all_src_offsets_offsets + src_ptr_start;
@@ -675,34 +673,65 @@ CUDF_KERNEL void batch_concatenate_offsets_kernel_2d(
 
   bool const is_int64 = (offsets_type_size == 8);
 
-  if (output_index < output_size) {
-    // Binary search to find which source column contains this output index
-    auto const offset_it = cuda::std::prev(
-      thrust::upper_bound(thrust::seq, input_offsets, input_offsets + num_columns, output_index));
-    size_type const col_idx = offset_it - input_offsets;
+  auto output_index = cudf::detail::grid_1d::global_thread_id();
+  auto const stride = cudf::detail::grid_1d::grid_stride();
 
-    // Index within this source column
-    auto const idx_in_col    = output_index - *offset_it;
-    auto const parent_offset = src_offsets_offsets[col_idx];
-    void const* src_ptr      = src_offsets_ptrs[col_idx];
+  while (output_index <= output_size) {
+    if (output_index < output_size) {
+      // Binary search to find which source column contains this output index
+      auto const offset_it = cuda::std::prev(
+        thrust::upper_bound(thrust::seq, input_offsets, input_offsets + num_columns, output_index));
+      size_type const col_idx = offset_it - input_offsets;
 
-    // Read source offset value
-    int64_t src_offset_value;
-    if (is_int64) {
-      auto const* typed_ptr = static_cast<int64_t const*>(src_ptr);
-      src_offset_value      = typed_ptr[idx_in_col + parent_offset];
-    } else {
-      auto const* typed_ptr = static_cast<int32_t const*>(src_ptr);
-      src_offset_value      = typed_ptr[idx_in_col + parent_offset];
+      // Index within this source column
+      auto const idx_in_col    = output_index - *offset_it;
+      auto const parent_offset = src_offsets_offsets[col_idx];
+      void const* src_ptr      = src_offsets_ptrs[col_idx];
+
+      // Read source offset value
+      int64_t src_offset_value;
+      if (is_int64) {
+        auto const* typed_ptr = static_cast<int64_t const*>(src_ptr);
+        src_offset_value      = typed_ptr[idx_in_col + parent_offset];
+      } else {
+        auto const* typed_ptr = static_cast<int32_t const*>(src_ptr);
+        src_offset_value      = typed_ptr[idx_in_col + parent_offset];
+      }
+
+      // Compute output offset: subtract first offset and add cumulative child offset
+      output_data[output_index] =
+        src_offset_value - first_src_offsets[col_idx] + chars_partition_offsets[col_idx];
     }
 
-    // Compute output offset: subtract first offset and add cumulative child offset
-    output_data[output_index] =
-      src_offset_value - first_src_offsets[col_idx] + chars_partition_offsets[col_idx];
-  }
+    // Handle the final offset element
+    if (output_index == output_size) { output_data[output_size] = total_child_size; }
 
-  // Handle the final offset element
-  if (output_index == output_size) { output_data[output_size] = total_child_size; }
+    output_index += stride;
+  }
+}
+
+/**
+ * @brief Get maximum active blocks per SM for batch_concatenate_offsets_kernel.
+ */
+inline int32_t max_active_blocks_offsets_kernel()
+{
+  int32_t max_active_blocks{-1};
+  constexpr size_type block_size{256};
+  CUDF_CUDA_TRY(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+    &max_active_blocks, batch_concatenate_offsets_kernel<block_size>, block_size, 0));
+  return max_active_blocks;
+}
+
+/**
+ * @brief Get maximum active blocks per SM for batch_concatenate_offsets_kernel_2d.
+ */
+inline int32_t max_active_blocks_offsets_kernel_2d()
+{
+  int32_t max_active_blocks{-1};
+  constexpr size_type block_size{256};
+  CUDF_CUDA_TRY(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+    &max_active_blocks, batch_concatenate_offsets_kernel_2d<block_size>, block_size, 0));
+  return max_active_blocks;
 }
 
 /**
@@ -862,22 +891,27 @@ batch_process_result batch_process_levels(std::vector<level_info> const& levels,
     // Determine offset type size
     size_type const offsets_type_size = cudf::size_of(level.offsets_dtype);
 
-    // Launch kernel
+    // Launch kernel with occupancy-based grid sizing
     constexpr size_type block_size{256};
-    cudf::detail::grid_1d config(level.total_rows + 1, block_size);  // +1 for final offset
+    auto const max_blocks     = max_active_blocks_offsets_kernel();
+    auto const num_sms        = cudf::detail::num_multiprocessors();
+    auto const occupancy_grid = max_blocks * num_sms;
+    auto const num_elements   = level.total_rows + 1;  // +1 for final offset
+    // Use smaller of: occupancy-based grid or element count (avoid over-launching)
+    auto const num_blocks =
+      std::min(occupancy_grid, cudf::util::div_rounding_up_safe(num_elements, block_size));
 
     batch_concatenate_offsets_kernel<block_size>
-      <<<config.num_blocks, config.num_threads_per_block, 0, stream.value()>>>(
-        d_src_offsets_ptrs.data(),
-        d_src_offsets_offsets.data(),
-        d_input_offsets.data(),
-        d_chars_partition_offsets.data(),
-        d_first_src_offsets.data(),
-        static_cast<size_type>(num_columns),
-        level.total_rows,
-        output_offsetalator,
-        level.total_child_size,
-        offsets_type_size);
+      <<<num_blocks, block_size, 0, stream.value()>>>(d_src_offsets_ptrs.data(),
+                                                      d_src_offsets_offsets.data(),
+                                                      d_input_offsets.data(),
+                                                      d_chars_partition_offsets.data(),
+                                                      d_first_src_offsets.data(),
+                                                      static_cast<size_type>(num_columns),
+                                                      level.total_rows,
+                                                      output_offsetalator,
+                                                      level.total_child_size,
+                                                      offsets_type_size);
   }
 
   // ========== PHASE 4: Batch mask concatenation ==========
@@ -1385,9 +1419,15 @@ table_batch_process_result batch_process_table_levels(
     auto d_col_offsets_type_size = make_device_uvector_async(
       group.col_offsets_type_size, stream, cudf::get_current_device_resource_ref());
 
-    // Launch 2D kernel
+    // Launch 2D kernel with occupancy-based grid sizing
     constexpr size_type block_size{256};
-    auto const num_blocks_x = cudf::util::div_rounding_up_safe(total_rows + 1, block_size);
+    auto const max_blocks     = max_active_blocks_offsets_kernel_2d();
+    auto const num_sms        = cudf::detail::num_multiprocessors();
+    auto const occupancy_grid = max_blocks * num_sms;
+    auto const num_elements   = total_rows + 1;
+    // Use smaller of: occupancy-based grid or element count (avoid over-launching)
+    auto const num_blocks_x =
+      std::min(occupancy_grid, cudf::util::div_rounding_up_safe(num_elements, block_size));
     dim3 grid(num_blocks_x, static_cast<unsigned int>(num_cols_in_group));
 
     batch_concatenate_offsets_kernel_2d<block_size>
