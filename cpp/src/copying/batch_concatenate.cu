@@ -6,7 +6,7 @@
 // Set CONCAT_SEPARATE_COLUMN=1 to concatenate each column position separately
 // (calls batch_concatenate(column_view) per column instead of single batched_memcpy for all)
 #ifndef CONCAT_SEPARATE_COLUMN
-#define CONCAT_SEPARATE_COLUMN 1
+#define CONCAT_SEPARATE_COLUMN 0
 #endif
 
 #include <cudf/column/column.hpp>
@@ -641,24 +641,37 @@ CUDF_KERNEL void batch_concatenate_offsets_kernel_2d(
   size_type output_size)
 {
   auto const col_in_group = blockIdx.y;
-  auto const output_index = blockIdx.x * block_size + threadIdx.x;
 
-  if (output_index > output_size) return;
-
-  // Get this column's slice of the flattened arrays
-  auto const src_ptr_start   = col_src_ptr_offsets[col_in_group];
-  auto const input_off_start = col_input_offsets_offsets[col_in_group];
-
-  auto const src_offsets_ptrs        = all_src_offsets_ptrs + src_ptr_start;
-  auto const src_offsets_offsets     = all_src_offsets_offsets + src_ptr_start;
-  auto const input_offsets           = all_input_offsets + input_off_start;
-  auto const chars_partition_offsets = all_chars_partition_offsets + input_off_start;
-  auto const first_src_offsets       = all_first_src_offsets + src_ptr_start;
-
+  // Get this column's metadata
+  auto const src_ptr_start     = col_src_ptr_offsets[col_in_group];
+  auto const input_off_start   = col_input_offsets_offsets[col_in_group];
   auto const num_columns       = col_num_src_columns[col_in_group];
   auto output_data             = col_output_data[col_in_group];
   auto const total_child_size  = col_total_child_size[col_in_group];
   auto const offsets_type_size = col_offsets_type_size[col_in_group];
+
+  // Use shared memory to cache input_offsets for binary search
+  __shared__ size_t smem_input_offsets[max_smem_columns + 1];
+  bool const use_smem = (num_columns <= max_smem_columns);
+
+  if (use_smem) {
+    // Cooperatively load input_offsets into shared memory
+    auto const input_offsets = all_input_offsets + input_off_start;
+    for (size_type i = threadIdx.x; i <= num_columns; i += block_size) {
+      smem_input_offsets[i] = input_offsets[i];
+    }
+    __syncthreads();
+  }
+
+  auto const output_index = blockIdx.x * block_size + threadIdx.x;
+  if (output_index > output_size) return;
+
+  // Get this column's slice of the flattened arrays
+  auto const src_offsets_ptrs    = all_src_offsets_ptrs + src_ptr_start;
+  auto const src_offsets_offsets = all_src_offsets_offsets + src_ptr_start;
+  auto const input_offsets = use_smem ? smem_input_offsets : (all_input_offsets + input_off_start);
+  auto const chars_partition_offsets = all_chars_partition_offsets + input_off_start;
+  auto const first_src_offsets       = all_first_src_offsets + src_ptr_start;
 
   bool const is_int64 = (offsets_type_size == 8);
 
