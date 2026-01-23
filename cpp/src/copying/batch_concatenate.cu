@@ -47,7 +47,6 @@
 
 #include <algorithm>
 #include <limits>
-#include <map>
 #include <numeric>
 #include <optional>
 #include <utility>
@@ -143,34 +142,6 @@ struct level_info {
   bool is_string;              // Whether this level is a string type
   bool is_list;                // Whether this level is a list type
   bool is_dictionary;          // Whether this level is a dictionary type
-};
-
-/**
- * @brief Groups string/list levels by total_rows for 2D kernel launch.
- *
- * This structure aggregates data from multiple columns that have the same total_rows,
- * allowing them to be processed with a single 2D kernel launch.
- */
-struct offsets_kernel_group {
-  size_type total_rows{0};  // All levels in this group have same total_rows
-
-  // Flattened arrays across all columns in group
-  std::vector<void const*> all_src_offsets_ptrs;
-  std::vector<size_type> all_src_offsets_offsets;
-  std::vector<size_t> all_input_offsets;
-  std::vector<size_t> all_chars_partition_offsets;
-  std::vector<int64_t> all_first_src_offsets;
-
-  // Per-column metadata (indexed by blockIdx.y in 2D kernel)
-  std::vector<size_type> col_src_ptr_offsets;        // Boundaries into all_src_* arrays
-  std::vector<size_type> col_input_offsets_offsets;  // Boundaries into all_input_offsets
-  std::vector<size_type> col_num_src_columns;
-  std::vector<cudf::detail::output_offsetalator> col_output_data;
-  std::vector<size_t> col_total_child_size;
-  std::vector<size_type> col_offsets_type_size;
-
-  // Track which (col_idx, level_idx) pairs are in this group
-  std::vector<std::pair<size_type, size_type>> col_level_indices;
 };
 
 /**
@@ -514,32 +485,33 @@ CUDF_KERNEL void batch_concatenate_masks_kernel(bitmask_type const* const* __res
 }
 
 /**
- * @brief Concatenates offsets from multiple string or list columns.
+ * @brief Concatenates string offsets from multiple columns.
  *
  * Each thread processes one output offset element. The algorithm:
  * 1. Find which source column contributes this element
  * 2. Read the source offset value
  * 3. Adjust the offset: subtract the first offset of the source column
- *    and add the cumulative child offset for that column
+ *    and add the cumulative char offset for that column
  * 4. Write to output using output_offsetalator
  *
  * Optimizations:
- * - Uses shared memory to cache input_offsets for binary search
- * - Pre-computes first offset values on host to avoid redundant device reads
+ * - Uses shared memory to cache input_offsets and chars_partition_offsets for binary search
+ * - Pre-computes adjusted partition offsets (chars_partition - first_offset) to reduce
+ *   per-element computation
  *
  * @param src_offsets_ptrs Array of source offsets column data pointers
  * @param src_offsets_offsets Array of offsets within each source offsets column (parent offset)
  * @param input_offsets Prefix sum of row counts [num_columns + 1] - for finding source column
- * @param chars_partition_offsets Cumulative child offsets [num_columns + 1]
+ * @param chars_partition_offsets Cumulative char byte offsets [num_columns + 1]
  * @param first_src_offsets Pre-computed first offset value for each column (for adjustment)
  * @param num_columns Number of columns being concatenated
- * @param output_size Number of rows (not including final offset element)
+ * @param output_size Number of strings (num rows, not including final offset element)
  * @param output_data Output offsetalator
- * @param total_child_size Total child bytes/rows (for final offset)
+ * @param total_child_size Total bytes in concatenated chars buffer (for final offset)
  * @param offsets_type_size Size of offset type in bytes (4 for INT32, 8 for INT64)
  */
 template <size_type block_size>
-CUDF_KERNEL void batch_concatenate_offsets_kernel(
+CUDF_KERNEL void batch_concatenate_string_offsets_kernel(
   void const* const* __restrict__ src_offsets_ptrs,
   size_type const* __restrict__ src_offsets_offsets,
   size_t const* __restrict__ input_offsets,
@@ -599,96 +571,6 @@ CUDF_KERNEL void batch_concatenate_offsets_kernel(
   }
 
   // Handle the final offset element (total chars bytes)
-  if (output_index == output_size) { output_data[output_size] = total_child_size; }
-}
-
-/**
- * @brief 2D kernel for batch offsets concatenation.
- *
- * Processes multiple output columns with the same total_rows in a single launch.
- * Grid: (ceil((total_rows+1)/block_size), num_cols_in_group)
- * Each column in Y dimension (blockIdx.y) processes independently.
- *
- * The flattened arrays contain data for all columns in the group concatenated together.
- * Each column's portion is accessed via boundary arrays (col_src_ptr_offsets, etc.).
- *
- * @param all_src_offsets_ptrs Flattened source offsets pointers for all columns
- * @param all_src_offsets_offsets Flattened offsets within each source offsets column
- * @param all_input_offsets Flattened prefix sums of row counts for all columns
- * @param all_chars_partition_offsets Flattened cumulative child offsets for all columns
- * @param all_first_src_offsets Flattened first offset values for all columns
- * @param col_src_ptr_offsets Boundaries into all_src_* arrays [num_cols+1]
- * @param col_input_offsets_offsets Boundaries into all_input_offsets [num_cols+1]
- * @param col_num_src_columns Number of source columns per output column [num_cols]
- * @param col_output_data Output offsetalators for each column [num_cols]
- * @param col_total_child_size Total child size for each column [num_cols]
- * @param col_offsets_type_size Offset type size for each column [num_cols]
- * @param output_size Number of rows (same for all columns in group)
- */
-template <size_type block_size>
-CUDF_KERNEL void batch_concatenate_offsets_kernel_2d(
-  void const* const* __restrict__ all_src_offsets_ptrs,
-  size_type const* __restrict__ all_src_offsets_offsets,
-  size_t const* __restrict__ all_input_offsets,
-  size_t const* __restrict__ all_chars_partition_offsets,
-  int64_t const* __restrict__ all_first_src_offsets,
-  size_type const* __restrict__ col_src_ptr_offsets,
-  size_type const* __restrict__ col_input_offsets_offsets,
-  size_type const* __restrict__ col_num_src_columns,
-  output_offsetalator const* __restrict__ col_output_data,
-  size_t const* __restrict__ col_total_child_size,
-  size_type const* __restrict__ col_offsets_type_size,
-  size_type output_size)
-{
-  auto const col_in_group = blockIdx.y;
-  auto const output_index = blockIdx.x * block_size + threadIdx.x;
-
-  if (output_index > output_size) return;
-
-  // Get this column's slice of the flattened arrays
-  auto const src_ptr_start   = col_src_ptr_offsets[col_in_group];
-  auto const input_off_start = col_input_offsets_offsets[col_in_group];
-
-  auto const src_offsets_ptrs        = all_src_offsets_ptrs + src_ptr_start;
-  auto const src_offsets_offsets     = all_src_offsets_offsets + src_ptr_start;
-  auto const input_offsets           = all_input_offsets + input_off_start;
-  auto const chars_partition_offsets = all_chars_partition_offsets + input_off_start;
-  auto const first_src_offsets       = all_first_src_offsets + src_ptr_start;
-
-  auto const num_columns       = col_num_src_columns[col_in_group];
-  auto output_data             = col_output_data[col_in_group];
-  auto const total_child_size  = col_total_child_size[col_in_group];
-  auto const offsets_type_size = col_offsets_type_size[col_in_group];
-
-  bool const is_int64 = (offsets_type_size == 8);
-
-  if (output_index < output_size) {
-    // Binary search to find which source column contains this output index
-    auto const offset_it = cuda::std::prev(
-      thrust::upper_bound(thrust::seq, input_offsets, input_offsets + num_columns, output_index));
-    size_type const col_idx = offset_it - input_offsets;
-
-    // Index within this source column
-    auto const idx_in_col    = output_index - *offset_it;
-    auto const parent_offset = src_offsets_offsets[col_idx];
-    void const* src_ptr      = src_offsets_ptrs[col_idx];
-
-    // Read source offset value
-    int64_t src_offset_value;
-    if (is_int64) {
-      auto const* typed_ptr = static_cast<int64_t const*>(src_ptr);
-      src_offset_value      = typed_ptr[idx_in_col + parent_offset];
-    } else {
-      auto const* typed_ptr = static_cast<int32_t const*>(src_ptr);
-      src_offset_value      = typed_ptr[idx_in_col + parent_offset];
-    }
-
-    // Compute output offset: subtract first offset and add cumulative child offset
-    output_data[output_index] =
-      src_offset_value - first_src_offsets[col_idx] + chars_partition_offsets[col_idx];
-  }
-
-  // Handle the final offset element
   if (output_index == output_size) { output_data[output_size] = total_child_size; }
 }
 
@@ -853,7 +735,7 @@ batch_process_result batch_process_levels(std::vector<level_info> const& levels,
     constexpr size_type block_size{256};
     cudf::detail::grid_1d config(level.total_rows + 1, block_size);  // +1 for final offset
 
-    batch_concatenate_offsets_kernel<block_size>
+    batch_concatenate_string_offsets_kernel<block_size>
       <<<config.num_blocks, config.num_threads_per_block, 0, stream.value()>>>(
         d_src_offsets_ptrs.data(),
         d_src_offsets_offsets.data(),
@@ -1279,117 +1161,57 @@ table_batch_process_result batch_process_table_levels(
     }
   }
 
-  // ========== PHASE 3: Group offsets by total_rows, launch 2D kernels ==========
-
-  // Step 3a: Group string/list levels by total_rows
-  std::map<size_type, offsets_kernel_group> offsets_groups;
+  // ========== PHASE 3: String/List offsets concatenation for each column ==========
   for (size_type col_idx = 0; col_idx < num_columns; ++col_idx) {
-    auto const& levels = levels_by_column[col_idx];
+    auto const& levels    = levels_by_column[col_idx];
+    auto& offsets_columns = offsets_columns_by_column[col_idx];
+
     for (size_type level_idx = 0; level_idx < static_cast<size_type>(levels.size()); ++level_idx) {
       auto const& level = levels[level_idx];
       if (!level.is_string && !level.is_list) continue;
 
-      auto& group      = offsets_groups[level.total_rows];
-      group.total_rows = level.total_rows;
-      group.col_level_indices.emplace_back(col_idx, level_idx);
-    }
-  }
+      auto const num_src_columns = level.src_offsets_ptrs.size();
 
-  // Step 3b: Build flattened arrays for each group
-  for (auto& [total_rows, group] : offsets_groups) {
-    group.col_src_ptr_offsets.push_back(0);
-    group.col_input_offsets_offsets.push_back(0);
-
-    for (auto [col_idx, level_idx] : group.col_level_indices) {
-      auto const& level  = levels_by_column[col_idx][level_idx];
-      auto const num_src = level.src_offsets_ptrs.size();
-
-      // Append to flattened arrays
-      group.all_src_offsets_ptrs.insert(group.all_src_offsets_ptrs.end(),
-                                        level.src_offsets_ptrs.begin(),
-                                        level.src_offsets_ptrs.end());
-      group.all_src_offsets_offsets.insert(group.all_src_offsets_offsets.end(),
-                                           level.src_offsets_offsets.begin(),
-                                           level.src_offsets_offsets.end());
-      group.all_first_src_offsets.insert(group.all_first_src_offsets.end(),
-                                         level.first_src_offsets.begin(),
-                                         level.first_src_offsets.end());
-
-      // Build input_offsets (prefix sum of col_sizes)
-      std::vector<size_t> input_offsets(num_src + 1);
+      // Build input offsets (prefix sum of row counts)
+      std::vector<size_t> input_offsets(num_src_columns + 1);
       input_offsets[0] = 0;
-      for (size_t i = 0; i < num_src; ++i) {
+      for (size_t i = 0; i < num_src_columns; ++i) {
         input_offsets[i + 1] = input_offsets[i] + level.col_sizes[i];
       }
-      group.all_input_offsets.insert(
-        group.all_input_offsets.end(), input_offsets.begin(), input_offsets.end());
 
-      // chars_partition_offsets already has num_src+1 elements
-      group.all_chars_partition_offsets.insert(group.all_chars_partition_offsets.end(),
-                                               level.chars_partition_offsets.begin(),
-                                               level.chars_partition_offsets.end());
+      // Upload to device
+      auto d_src_offsets_ptrs = make_device_uvector_async(
+        level.src_offsets_ptrs, stream, cudf::get_current_device_resource_ref());
+      auto d_src_offsets_offsets = make_device_uvector_async(
+        level.src_offsets_offsets, stream, cudf::get_current_device_resource_ref());
+      auto d_input_offsets =
+        make_device_uvector_async(input_offsets, stream, cudf::get_current_device_resource_ref());
+      auto d_chars_partition_offsets = make_device_uvector_async(
+        level.chars_partition_offsets, stream, cudf::get_current_device_resource_ref());
+      auto d_first_src_offsets = make_device_uvector_async(
+        level.first_src_offsets, stream, cudf::get_current_device_resource_ref());
 
-      // Per-column metadata
-      group.col_src_ptr_offsets.push_back(
-        static_cast<size_type>(group.all_src_offsets_ptrs.size()));
-      group.col_input_offsets_offsets.push_back(
-        static_cast<size_type>(group.all_input_offsets.size()));
-      group.col_num_src_columns.push_back(static_cast<size_type>(num_src));
+      auto output_offsets_view = offsets_columns[level_idx]->mutable_view();
+      auto output_offsetalator = offsetalator_factory::make_output_iterator(output_offsets_view);
 
-      auto output_view = offsets_columns_by_column[col_idx][level_idx]->mutable_view();
-      group.col_output_data.push_back(offsetalator_factory::make_output_iterator(output_view));
-      group.col_total_child_size.push_back(level.total_child_size);
-      group.col_offsets_type_size.push_back(cudf::size_of(level.offsets_dtype));
+      size_type const offsets_type_size = cudf::size_of(level.offsets_dtype);
+
+      constexpr size_type block_size{256};
+      cudf::detail::grid_1d config(level.total_rows + 1, block_size);
+
+      batch_concatenate_string_offsets_kernel<block_size>
+        <<<config.num_blocks, config.num_threads_per_block, 0, stream.value()>>>(
+          d_src_offsets_ptrs.data(),
+          d_src_offsets_offsets.data(),
+          d_input_offsets.data(),
+          d_chars_partition_offsets.data(),
+          d_first_src_offsets.data(),
+          static_cast<size_type>(num_src_columns),
+          level.total_rows,
+          output_offsetalator,
+          level.total_child_size,
+          offsets_type_size);
     }
-  }
-
-  // Step 3c: Launch 2D kernel for each group
-  for (auto const& [total_rows, group] : offsets_groups) {
-    auto const num_cols_in_group = group.col_level_indices.size();
-
-    // Upload all arrays to device
-    auto d_all_src_offsets_ptrs = make_device_uvector_async(
-      group.all_src_offsets_ptrs, stream, cudf::get_current_device_resource_ref());
-    auto d_all_src_offsets_offsets = make_device_uvector_async(
-      group.all_src_offsets_offsets, stream, cudf::get_current_device_resource_ref());
-    auto d_all_input_offsets = make_device_uvector_async(
-      group.all_input_offsets, stream, cudf::get_current_device_resource_ref());
-    auto d_all_chars_partition_offsets = make_device_uvector_async(
-      group.all_chars_partition_offsets, stream, cudf::get_current_device_resource_ref());
-    auto d_all_first_src_offsets = make_device_uvector_async(
-      group.all_first_src_offsets, stream, cudf::get_current_device_resource_ref());
-
-    auto d_col_src_ptr_offsets = make_device_uvector_async(
-      group.col_src_ptr_offsets, stream, cudf::get_current_device_resource_ref());
-    auto d_col_input_offsets_offsets = make_device_uvector_async(
-      group.col_input_offsets_offsets, stream, cudf::get_current_device_resource_ref());
-    auto d_col_num_src_columns = make_device_uvector_async(
-      group.col_num_src_columns, stream, cudf::get_current_device_resource_ref());
-    auto d_col_output_data = make_device_uvector_async(
-      group.col_output_data, stream, cudf::get_current_device_resource_ref());
-    auto d_col_total_child_size = make_device_uvector_async(
-      group.col_total_child_size, stream, cudf::get_current_device_resource_ref());
-    auto d_col_offsets_type_size = make_device_uvector_async(
-      group.col_offsets_type_size, stream, cudf::get_current_device_resource_ref());
-
-    // Launch 2D kernel
-    constexpr size_type block_size{256};
-    auto const num_blocks_x = cudf::util::div_rounding_up_safe(total_rows + 1, block_size);
-    dim3 grid(num_blocks_x, static_cast<unsigned int>(num_cols_in_group));
-
-    batch_concatenate_offsets_kernel_2d<block_size>
-      <<<grid, block_size, 0, stream.value()>>>(d_all_src_offsets_ptrs.data(),
-                                                d_all_src_offsets_offsets.data(),
-                                                d_all_input_offsets.data(),
-                                                d_all_chars_partition_offsets.data(),
-                                                d_all_first_src_offsets.data(),
-                                                d_col_src_ptr_offsets.data(),
-                                                d_col_input_offsets_offsets.data(),
-                                                d_col_num_src_columns.data(),
-                                                d_col_output_data.data(),
-                                                d_col_total_child_size.data(),
-                                                d_col_offsets_type_size.data(),
-                                                total_rows);
   }
 
   // ========== PHASE 4: Batch mask concatenation for each column ==========
