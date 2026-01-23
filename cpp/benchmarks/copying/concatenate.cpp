@@ -23,7 +23,7 @@
 #include <vector>
 
 #ifndef VALIDATE
-#define VALIDATE 0
+#define VALIDATE 1
 #endif
 
 #ifndef USE_BATCH
@@ -31,7 +31,7 @@
 #endif
 
 #ifndef NO_OP
-#define NO_OP 0
+#define NO_OP 1
 #endif
 
 #if VALIDATE
@@ -69,10 +69,14 @@ static void validate_batch_concatenate_tables(std::vector<cudf::table_view> cons
 #endif
 
 // Helper macro to call the appropriate concatenate function
+#if NO_OP
+#define CONCATENATE_FUNC(views, stream) nullptr
+#else
 #if USE_BATCH
 #define CONCATENATE_FUNC(views, stream) cudf::batch_concatenate(views, stream)
 #else
 #define CONCATENATE_FUNC(views, stream) cudf::concatenate(views, stream)
+#endif
 #endif
 
 static void bench_concatenate(nvbench::state& state)
