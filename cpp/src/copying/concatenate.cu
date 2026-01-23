@@ -5,7 +5,7 @@
 
 // Set USE_BATCH_CONCATENATE=1 to route concatenate calls to batch_concatenate
 #ifndef USE_BATCH_CONCATENATE
-#define USE_BATCH_CONCATENATE 0
+#define USE_BATCH_CONCATENATE 1
 #endif
 
 #include <cudf/column/column.hpp>

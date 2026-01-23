@@ -27,7 +27,7 @@
 #endif
 
 #ifndef USE_BATCH
-#define USE_BATCH 0
+#define USE_BATCH 1
 #endif
 
 #ifndef NO_OP
