@@ -1163,6 +1163,16 @@ std::unique_ptr<column> batch_concatenate(host_span<column_view const> columns_t
 
   CUDF_EXPECTS(!columns_to_concat.empty(), "Unexpected empty list of columns to concatenate.");
 
+  // Handle EMPTY type early (before support check)
+  if (columns_to_concat.front().type().id() == cudf::type_id::EMPTY) {
+    auto length = std::accumulate(
+      columns_to_concat.begin(), columns_to_concat.end(), 0, [](auto a, auto const& b) {
+        return a + b.size();
+      });
+    return std::make_unique<column>(
+      data_type(type_id::EMPTY), length, rmm::device_buffer{}, rmm::device_buffer{}, length);
+  }
+
   // Check that all columns are supported types
   CUDF_EXPECTS(all_columns_batch_concat_supported(columns_to_concat),
                "batch_concatenate only supports fixed-width, struct, string, list, and dictionary "
@@ -1177,16 +1187,6 @@ std::unique_ptr<column> batch_concatenate(host_span<column_view const> columns_t
         return c.is_empty();
       })) {
     return empty_like(columns_to_concat.front());
-  }
-
-  // Handle EMPTY type
-  if (columns_to_concat.front().type().id() == cudf::type_id::EMPTY) {
-    auto length = std::accumulate(
-      columns_to_concat.begin(), columns_to_concat.end(), 0, [](auto a, auto const& b) {
-        return a + b.size();
-      });
-    return std::make_unique<column>(
-      data_type(type_id::EMPTY), length, rmm::device_buffer{}, rmm::device_buffer{}, length);
   }
 
   // Step 1: Collect all level information in a single recursive pass
@@ -1613,10 +1613,12 @@ std::unique_ptr<table> batch_concatenate(host_span<table_view const> tables_to_c
   auto const num_columns = first_table.num_columns();
   if (num_columns == 0) { return std::make_unique<table>(); }
 
-  // Check that all columns in all tables are supported
+  // Check that all columns in all tables are supported (skip EMPTY type - handled specially)
   for (auto const& table : tables_to_concat) {
     for (size_type col_idx = 0; col_idx < num_columns; ++col_idx) {
-      CUDF_EXPECTS(is_column_batch_concat_supported(table.column(col_idx)),
+      auto const& col = table.column(col_idx);
+      if (col.type().id() == type_id::EMPTY) continue;  // EMPTY handled specially below
+      CUDF_EXPECTS(is_column_batch_concat_supported(col),
                    "batch_concatenate only supports fixed-width, struct, string, list, and "
                    "dictionary types.",
                    cudf::logic_error);
@@ -1633,6 +1635,9 @@ std::unique_ptr<table> batch_concatenate(host_span<table_view const> tables_to_c
     for (auto const& table : tables_to_concat) {
       cols_for_position.push_back(table.column(col_idx));
     }
+
+    // Skip EMPTY type columns - handled specially in reconstruction
+    if (cols_for_position.front().type().id() == type_id::EMPTY) { continue; }
 
     // Verify bounds and type compatibility
     batch_bounds_and_type_check(cols_for_position, stream);
@@ -1657,10 +1662,24 @@ std::unique_ptr<table> batch_concatenate(host_span<table_view const> tables_to_c
   for (size_type col_idx = 0; col_idx < num_columns; ++col_idx) {
     auto const& levels = levels_by_column[col_idx];
 
-    // Handle all-empty column case
+    // Handle all-empty column case or EMPTY type columns
     if (levels.empty()) {
-      // All columns at this position were empty - create empty_like
-      output_columns.push_back(empty_like(first_table.column(col_idx)));
+      auto const& first_col = first_table.column(col_idx);
+      if (first_col.type().id() == type_id::EMPTY) {
+        // EMPTY type: sum up row counts and create EMPTY column
+        size_type total_rows = 0;
+        for (auto const& table : tables_to_concat) {
+          total_rows += table.column(col_idx).size();
+        }
+        output_columns.push_back(std::make_unique<column>(data_type(type_id::EMPTY),
+                                                          total_rows,
+                                                          rmm::device_buffer{},
+                                                          rmm::device_buffer{},
+                                                          total_rows));
+      } else {
+        // All columns at this position were empty (zero rows) - create empty_like
+        output_columns.push_back(empty_like(first_col));
+      }
       continue;
     }
 
