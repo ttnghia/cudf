@@ -47,16 +47,149 @@
 #include <thrust/binary_search.h>
 
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <limits>
 #include <map>
 #include <numeric>
 #include <optional>
+#include <string>
 #include <utility>
 #include <vector>
+
+#ifdef __GNUC__
+#include <cxxabi.h>
+#include <execinfo.h>
+#endif
 
 namespace cudf {
 namespace detail {
 namespace {
+
+/**
+ * @brief Generate a stack trace string for debugging purposes.
+ *
+ * Uses backtrace() and backtrace_symbols() on GCC/Clang platforms.
+ * Attempts to demangle C++ symbol names for readability.
+ *
+ * @param max_frames Maximum number of stack frames to capture
+ * @return A string containing the formatted stack trace
+ */
+std::string get_stacktrace(int max_frames = 64)
+{
+  std::string result;
+#ifdef __GNUC__
+  std::vector<void*> frame_ptrs(max_frames);
+  int num_frames = backtrace(frame_ptrs.data(), max_frames);
+
+  char** symbols = backtrace_symbols(frame_ptrs.data(), num_frames);
+  if (symbols == nullptr) {
+    result = "  [Failed to get stack trace symbols]\n";
+    return result;
+  }
+
+  for (int i = 0; i < num_frames; ++i) {
+    std::string frame_str = symbols[i];
+
+    // Try to demangle C++ symbols (format varies by platform)
+    // macOS format: "index  module  address  symbol + offset"
+    // Linux format: "module(symbol+offset) [address]"
+    char* demangled   = nullptr;
+    char const* begin = nullptr;
+    char const* end   = nullptr;
+
+#ifdef __APPLE__
+    // macOS: find the symbol name after the address
+    // Format: "0   libfoo.dylib   0x00007fff...   _ZN3foo3barEv + 42"
+    auto space_count = 0;
+    for (char const* p = frame_str.c_str(); *p; ++p) {
+      if (*p == ' ') {
+        while (*p == ' ')
+          ++p;
+        ++space_count;
+        if (space_count == 3) {
+          begin = p;
+          while (*p && *p != ' ')
+            ++p;
+          end = p;
+          break;
+        }
+        --p;
+      }
+    }
+#else
+    // Linux: symbol is between '(' and '+' or ')'
+    begin = strchr(frame_str.c_str(), '(');
+    if (begin) {
+      ++begin;
+      end = strchr(begin, '+');
+      if (!end) end = strchr(begin, ')');
+    }
+#endif
+
+    if (begin && end && end > begin) {
+      std::string mangled(begin, end - begin);
+      int status = 0;
+      demangled  = abi::__cxa_demangle(mangled.c_str(), nullptr, nullptr, &status);
+      if (status == 0 && demangled) {
+        // Replace mangled name with demangled name in output
+        result += "  [" + std::to_string(i) + "] " + std::string(demangled) + "\n";
+        free(demangled);
+        continue;
+      }
+      if (demangled) free(demangled);
+    }
+
+    // Fallback: use original symbol string
+    result += "  [" + std::to_string(i) + "] " + frame_str + "\n";
+  }
+
+  free(symbols);
+#else
+  result = "  [Stack trace not available on this platform]\n";
+#endif
+  return result;
+}
+
+/**
+ * @brief Check for CUDA errors and print stack trace to stdout/stderr if an error occurred.
+ *
+ * @param stream The CUDA stream to check
+ * @param file Source file name for error reporting
+ * @param line Source line number for error reporting
+ */
+void check_cuda_error_with_stacktrace(cudaStream_t stream, char const* file, int line)
+{
+  cudaError_t const error = cudaGetLastError();
+  if (error != cudaSuccess) {
+    std::string const error_msg = std::string("CUDA error at ") + file + ":" +
+                                  std::to_string(line) + " - " + cudaGetErrorName(error) + ": " +
+                                  cudaGetErrorString(error);
+
+    std::string const stacktrace = get_stacktrace();
+
+    // Print to stdout
+    std::printf("\n=== CUDA ERROR DETECTED ===\n%s\n\nStack trace:\n%s\n",
+                error_msg.c_str(),
+                stacktrace.c_str());
+    std::fflush(stdout);
+
+    // Print to stderr
+    std::fprintf(stderr,
+                 "\n=== CUDA ERROR DETECTED ===\n%s\n\nStack trace:\n%s\n",
+                 error_msg.c_str(),
+                 stacktrace.c_str());
+    std::fflush(stderr);
+
+    // Throw exception with error info
+    throw cudf::cuda_error(error_msg, error);
+  }
+}
+
+// Macro to capture file and line information
+#define CHECK_CUDA_ERROR_WITH_STACKTRACE(stream) \
+  check_cuda_error_with_stacktrace(stream, __FILE__, __LINE__)
 
 /**
  * @brief Checks if the given data type is supported by batch_concatenate.
@@ -985,6 +1118,10 @@ batch_process_result batch_process_levels(std::vector<level_info> const& levels,
     mask_results.emplace_back(std::move(null_masks[i]), null_counts[i]);
   }
 
+  // Sync stream and check for any CUDA errors from kernel launches
+  stream.synchronize();
+  CHECK_CUDA_ERROR_WITH_STACKTRACE(stream.value());
+
   return {std::move(data_buffers), std::move(mask_results), std::move(offsets_columns)};
 }
 
@@ -1533,6 +1670,10 @@ table_batch_process_result batch_process_table_levels(
       mask_results.emplace_back(std::move(null_masks[i]), null_counts[i]);
     }
   }
+
+  // Sync stream and check for any CUDA errors from kernel launches
+  stream.synchronize();
+  CHECK_CUDA_ERROR_WITH_STACKTRACE(stream.value());
 
   return {std::move(data_buffers_by_column),
           std::move(mask_results_by_column),
