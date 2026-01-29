@@ -1114,6 +1114,19 @@ void batch_bounds_and_type_check(host_span<column_view const> cols, rmm::cuda_st
     }
   }
 
+  // Check string offset overflow
+  if (cols.front().type().id() == type_id::STRING) {
+    size_t const total_offset_count =
+      std::accumulate(cols.begin(),
+                      cols.end(),
+                      std::size_t{},
+                      [](size_t a, auto const& b) { return a + static_cast<size_t>(b.size()); }) +
+      1;
+    CUDF_EXPECTS(total_offset_count <= static_cast<size_t>(std::numeric_limits<size_type>::max()),
+                 "Total number of concatenated offsets exceeds the column size limit",
+                 std::overflow_error);
+  }
+
   // Recursively check list children
   if (cols.front().type().id() == type_id::LIST) {
     // Check offset overflow
