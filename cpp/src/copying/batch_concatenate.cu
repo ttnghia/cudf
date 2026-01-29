@@ -54,7 +54,7 @@
 #include <utility>
 #include <vector>
 
-namespace CUDF_EXPORT cudf {
+namespace cudf {
 namespace detail {
 namespace {
 
@@ -136,7 +136,7 @@ struct level_info {
 
   // Level metadata
   data_type dtype;             // Data type at this level
-  int64_t total_rows;          // Total number of rows (int64_t to avoid overflow)
+  size_type total_rows;        // Total number of rows
   size_type total_null_count;  // Sum of null counts from all columns
   size_type num_children;      // Number of children (for struct types)
   bool has_nulls;              // Whether any column has nulls
@@ -153,7 +153,7 @@ struct level_info {
  * allowing them to be processed with a single 2D kernel launch.
  */
 struct offsets_kernel_group {
-  int64_t total_rows{0};  // All levels in this group have same total_rows
+  size_type total_rows{0};  // All levels in this group have same total_rows
 
   // Flattened arrays across all columns in group
   std::vector<void const*> all_src_offsets_ptrs;
@@ -547,7 +547,7 @@ CUDF_KERNEL void batch_concatenate_offsets_kernel(
   size_t const* __restrict__ chars_partition_offsets,
   int64_t const* __restrict__ first_src_offsets,
   size_type num_columns,
-  int64_t output_size,
+  size_type output_size,
   cudf::detail::output_offsetalator output_data,
   size_t total_child_size,
   size_type offsets_type_size)
@@ -639,7 +639,7 @@ CUDF_KERNEL void batch_concatenate_offsets_kernel_2d(
   output_offsetalator const* __restrict__ col_output_data,
   size_t const* __restrict__ col_total_child_size,
   size_type const* __restrict__ col_offsets_type_size,
-  int64_t output_size)
+  size_type output_size)
 {
   auto const col_in_group = blockIdx.y;
 
@@ -1329,7 +1329,7 @@ table_batch_process_result batch_process_table_levels(
   // ========== PHASE 3: Group offsets by total_rows, launch 2D kernels ==========
 
   // Step 3a: Group string/list levels by total_rows
-  std::map<int64_t, offsets_kernel_group> offsets_groups;
+  std::map<size_type, offsets_kernel_group> offsets_groups;
   for (size_type col_idx = 0; col_idx < num_columns; ++col_idx) {
     auto const& levels = levels_by_column[col_idx];
     for (size_type level_idx = 0; level_idx < static_cast<size_type>(levels.size()); ++level_idx) {
@@ -1684,4 +1684,4 @@ std::unique_ptr<table> batch_concatenate(host_span<table_view const> tables_to_c
   return detail::batch_concatenate(tables_to_concat, stream, mr);
 }
 
-}  // namespace CUDF_EXPORT cudf
+}  // namespace cudf
