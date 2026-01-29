@@ -372,6 +372,62 @@ TEST_F(BatchConcatenateTest, SlicedColumnCrossingSourceWordBoundary)
   CUDF_TEST_EXPECT_COLUMNS_EQUAL(*result, *expected);
 }
 
+TEST_F(BatchConcatenateTest, SlicedColumnParentExactlyOneWord)
+{
+  // Test edge case: parent has exactly 32 rows (1 word of mask data)
+  // and slice has non-zero offset. This tests the bounds check for
+  // reading src_mask[src_word_idx + 1] which would be out of bounds
+  // without the fix.
+  std::vector<int32_t> values(32);
+  std::iota(values.begin(), values.end(), 0);
+  std::vector<bool> validity(32);
+  for (int i = 0; i < 32; ++i) {
+    validity[i] = (i % 2) == 0;  // Alternating pattern
+  }
+
+  auto full_col = make_column_with_validity(values, validity);
+
+  // Slice with non-zero offset - this triggers the funnel shift to read
+  // beyond the single word, which would be out of bounds without the fix
+  auto slices = cudf::slice(full_col, {16, 32});  // Offset 16, size 16
+
+  std::vector<cudf::column_view> columns = {slices[0]};
+
+  auto result = cudf::detail::batch_concatenate(
+    columns, cudf::get_default_stream(), cudf::get_current_device_resource_ref());
+  auto expected = cudf::concatenate(columns);
+
+  CUDF_TEST_EXPECT_COLUMNS_EQUAL(*result, *expected);
+}
+
+TEST_F(BatchConcatenateTest, SlicedColumnParentExactlyOneWordMultipleSlices)
+{
+  // Multiple sliced columns from parents with exactly 32 rows each
+  std::vector<int32_t> values1(32), values2(32);
+  std::iota(values1.begin(), values1.end(), 0);
+  std::iota(values2.begin(), values2.end(), 100);
+  std::vector<bool> validity1(32), validity2(32);
+  for (int i = 0; i < 32; ++i) {
+    validity1[i] = (i % 3) != 0;
+    validity2[i] = (i % 5) != 0;
+  }
+
+  auto full_col1 = make_column_with_validity(values1, validity1);
+  auto full_col2 = make_column_with_validity(values2, validity2);
+
+  // Different offsets within the single word
+  auto slices1 = cudf::slice(full_col1, {8, 24});   // Offset 8, size 16
+  auto slices2 = cudf::slice(full_col2, {20, 32});  // Offset 20, size 12
+
+  std::vector<cudf::column_view> columns = {slices1[0], slices2[0]};
+
+  auto result = cudf::detail::batch_concatenate(
+    columns, cudf::get_default_stream(), cudf::get_current_device_resource_ref());
+  auto expected = cudf::concatenate(columns);
+
+  CUDF_TEST_EXPECT_COLUMNS_EQUAL(*result, *expected);
+}
+
 // ============================================================================
 // Large column tests
 // ============================================================================

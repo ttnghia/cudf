@@ -418,6 +418,7 @@ constexpr size_type max_smem_columns = 1024;
 template <size_type block_size>
 CUDF_KERNEL void batch_concatenate_masks_kernel(bitmask_type const* const* __restrict__ mask_ptrs,
                                                 size_type const* __restrict__ mask_offsets,
+                                                size_type const* __restrict__ col_sizes,
                                                 size_type const* __restrict__ output_offsets,
                                                 size_type num_columns,
                                                 bitmask_type* __restrict__ dest_mask,
@@ -485,12 +486,18 @@ CUDF_KERNEL void batch_concatenate_masks_kernel(bitmask_type const* const* __res
         size_type const src_word_idx  = src_bit_idx / bits_per_word;
         size_type const src_bit_shift = src_bit_idx % bits_per_word;
 
+        // Compute the last word index that contains valid bits for this column
+        // This prevents out-of-bounds access when reading sliced columns
+        size_type const last_src_bit  = mask_offsets[col_idx] + col_sizes[col_idx] - 1;
+        size_type const last_word_idx = last_src_bit / bits_per_word;
+
         // Read source bits using funnel shift for unaligned access
         // __funnelshift_r(lo, hi, shift) extracts bits [shift, shift+32) from {hi, lo}
         // When shift=0, it returns lo unchanged, so we can use it unconditionally
         bitmask_type const lo = src_mask[src_word_idx];
-        // Only read next word if we actually need bits from it
-        bitmask_type const hi = (src_bit_shift > 0) ? src_mask[src_word_idx + 1] : 0;
+        // Only read next word if we actually need bits from it AND it's within bounds
+        bitmask_type const hi =
+          (src_bit_shift > 0 && src_word_idx < last_word_idx) ? src_mask[src_word_idx + 1] : 0;
         bitmask_type src_bits = __funnelshift_r(lo, hi, src_bit_shift);
 
         // Mask to get only the bits we need
@@ -946,6 +953,8 @@ batch_process_result batch_process_levels(std::vector<level_info> const& levels,
         make_device_uvector_async(level.mask_ptrs, stream, cudf::get_current_device_resource_ref());
       auto d_mask_offsets = make_device_uvector_async(
         level.mask_offsets, stream, cudf::get_current_device_resource_ref());
+      auto d_col_sizes =
+        make_device_uvector_async(level.col_sizes, stream, cudf::get_current_device_resource_ref());
       auto d_output_offsets =
         make_device_uvector_async(output_offsets, stream, cudf::get_current_device_resource_ref());
 
@@ -958,6 +967,7 @@ batch_process_result batch_process_levels(std::vector<level_info> const& levels,
         <<<config.num_blocks, config.num_threads_per_block, 0, stream.value()>>>(
           d_mask_ptrs.data(),
           d_mask_offsets.data(),
+          d_col_sizes.data(),
           d_output_offsets.data(),
           static_cast<size_type>(num_columns),
           static_cast<bitmask_type*>(null_masks[level_idx].data()),
@@ -1474,6 +1484,8 @@ table_batch_process_result batch_process_table_levels(
         make_device_uvector_async(level.mask_ptrs, stream, cudf::get_current_device_resource_ref());
       auto d_mask_offsets = make_device_uvector_async(
         level.mask_offsets, stream, cudf::get_current_device_resource_ref());
+      auto d_col_sizes =
+        make_device_uvector_async(level.col_sizes, stream, cudf::get_current_device_resource_ref());
       auto d_output_offsets =
         make_device_uvector_async(output_offsets, stream, cudf::get_current_device_resource_ref());
 
@@ -1485,6 +1497,7 @@ table_batch_process_result batch_process_table_levels(
         <<<config.num_blocks, config.num_threads_per_block, 0, stream.value()>>>(
           d_mask_ptrs.data(),
           d_mask_offsets.data(),
+          d_col_sizes.data(),
           d_output_offsets.data(),
           static_cast<size_type>(num_src_columns),
           static_cast<bitmask_type*>(null_masks[level_idx].data()),
