@@ -8,6 +8,11 @@
 #define USE_BATCH_CONCATENATE 1
 #endif
 
+// Set VALIDATE_BATCH_CONCATENATE=1 to validate batch_concatenate results against concatenate
+#ifndef VALIDATE_BATCH_CONCATENATE
+#define VALIDATE_BATCH_CONCATENATE 0
+#endif
+
 #include <cudf/column/column.hpp>
 #include <cudf/column/column_device_view.cuh>
 #include <cudf/concatenate.hpp>
@@ -591,6 +596,7 @@ rmm::device_buffer concatenate_masks(host_span<column_view const> views,
 
 }  // namespace detail
 
+#if VALIDATE_BATCH_CONCATENATE
 namespace {
 
 /**
@@ -988,6 +994,7 @@ void validate_concatenate_results(table_view const& expected,
 }
 
 }  // anonymous namespace
+#endif  // VALIDATE_BATCH_CONCATENATE
 
 rmm::device_buffer concatenate_masks(host_span<column_view const> views,
                                      rmm::cuda_stream_view stream,
@@ -1004,6 +1011,7 @@ std::unique_ptr<column> concatenate(host_span<column_view const> columns_to_conc
 {
   CUDF_FUNC_RANGE();
 
+#if VALIDATE_BATCH_CONCATENATE
   // Compute results from both implementations
   auto expected = detail::concatenate(columns_to_concat, stream, mr);
   auto actual   = detail::batch_concatenate(columns_to_concat, stream, mr);
@@ -1016,6 +1024,13 @@ std::unique_ptr<column> concatenate(host_span<column_view const> columns_to_conc
 #else
   return expected;
 #endif
+#else  // !VALIDATE_BATCH_CONCATENATE
+#if USE_BATCH_CONCATENATE
+  return detail::batch_concatenate(columns_to_concat, stream, mr);
+#else
+  return detail::concatenate(columns_to_concat, stream, mr);
+#endif
+#endif  // VALIDATE_BATCH_CONCATENATE
 }
 
 std::unique_ptr<table> concatenate(host_span<table_view const> tables_to_concat,
@@ -1024,6 +1039,7 @@ std::unique_ptr<table> concatenate(host_span<table_view const> tables_to_concat,
 {
   CUDF_FUNC_RANGE();
 
+#if VALIDATE_BATCH_CONCATENATE
   // Compute results from both implementations
   auto expected = detail::concatenate(tables_to_concat, stream, mr);
   auto actual   = detail::batch_concatenate(tables_to_concat, stream, mr);
@@ -1036,6 +1052,13 @@ std::unique_ptr<table> concatenate(host_span<table_view const> tables_to_concat,
 #else
   return expected;
 #endif
+#else  // !VALIDATE_BATCH_CONCATENATE
+#if USE_BATCH_CONCATENATE
+  return detail::batch_concatenate(tables_to_concat, stream, mr);
+#else
+  return detail::concatenate(tables_to_concat, stream, mr);
+#endif
+#endif  // VALIDATE_BATCH_CONCATENATE
 }
 
 }  // namespace cudf
