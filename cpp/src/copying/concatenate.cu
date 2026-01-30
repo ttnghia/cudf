@@ -20,16 +20,23 @@
 #include <cudf/detail/nvtx/ranges.hpp>
 #include <cudf/detail/utilities/cuda.cuh>
 #include <cudf/detail/utilities/grid_1d.cuh>
+#include <cudf/detail/utilities/integer_utils.hpp>
 #include <cudf/detail/utilities/vector_factories.hpp>
 #include <cudf/dictionary/detail/concatenate.hpp>
+#include <cudf/dictionary/dictionary_column_view.hpp>
+#include <cudf/io/parquet.hpp>
 #include <cudf/lists/detail/concatenate.hpp>
+#include <cudf/lists/lists_column_view.hpp>
 #include <cudf/strings/detail/concatenate.hpp>
+#include <cudf/strings/strings_column_view.hpp>
 #include <cudf/structs/detail/concatenate.hpp>
+#include <cudf/structs/structs_column_view.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/table/table_device_view.cuh>
 #include <cudf/utilities/default_stream.hpp>
 #include <cudf/utilities/error.hpp>
 #include <cudf/utilities/memory_resource.hpp>
+#include <cudf/utilities/traits.hpp>
 #include <cudf/utilities/type_checks.hpp>
 
 #include <rmm/cuda_stream_view.hpp>
@@ -38,6 +45,7 @@
 #include <cuda/std/iterator>
 #include <thrust/binary_search.h>
 #include <thrust/copy.h>
+#include <thrust/equal.h>
 #include <thrust/execution_policy.h>
 #include <thrust/functional.h>
 #include <thrust/host_vector.h>
@@ -45,7 +53,11 @@
 #include <thrust/transform_scan.h>
 
 #include <algorithm>
+#include <cstdio>
 #include <numeric>
+#include <random>
+#include <sstream>
+#include <string>
 #include <utility>
 
 namespace cudf {
@@ -579,6 +591,404 @@ rmm::device_buffer concatenate_masks(host_span<column_view const> views,
 
 }  // namespace detail
 
+namespace {
+
+/**
+ * @brief Compare two bitmasks for equality.
+ *
+ * @param lhs First bitmask
+ * @param rhs Second bitmask
+ * @param num_bits Number of bits to compare
+ * @param stream CUDA stream
+ * @return true if masks are equal, false otherwise
+ */
+bool bitmasks_equal(bitmask_type const* lhs,
+                    bitmask_type const* rhs,
+                    size_type num_bits,
+                    rmm::cuda_stream_view stream)
+{
+  if (lhs == nullptr && rhs == nullptr) { return true; }
+  if (lhs == nullptr || rhs == nullptr) { return false; }
+  if (num_bits == 0) { return true; }
+
+  size_type const num_words = cudf::util::div_rounding_up_safe(num_bits, 32);
+  return thrust::equal(rmm::exec_policy_nosync(stream), lhs, lhs + num_words, rhs);
+}
+
+/**
+ * @brief Compare two data buffers for equality.
+ *
+ * @param lhs First buffer
+ * @param rhs Second buffer
+ * @param size_bytes Size in bytes to compare
+ * @param stream CUDA stream
+ * @return true if buffers are equal, false otherwise
+ */
+bool buffers_equal(void const* lhs,
+                   void const* rhs,
+                   size_t size_bytes,
+                   rmm::cuda_stream_view stream)
+{
+  if (size_bytes == 0) { return true; }
+  if (lhs == nullptr && rhs == nullptr) { return true; }
+  if (lhs == nullptr || rhs == nullptr) { return false; }
+
+  return thrust::equal(rmm::exec_policy_nosync(stream),
+                       static_cast<char const*>(lhs),
+                       static_cast<char const*>(lhs) + size_bytes,
+                       static_cast<char const*>(rhs));
+}
+
+// Forward declaration for recursive comparison
+bool columns_equal(column_view const& lhs,
+                   column_view const& rhs,
+                   rmm::cuda_stream_view stream,
+                   std::string& error_msg,
+                   std::string const& path = "");
+
+/**
+ * @brief Compare two columns for equality.
+ *
+ * Compares type, size, null count, data buffer, null mask, and children recursively.
+ *
+ * @param lhs First column
+ * @param rhs Second column
+ * @param stream CUDA stream
+ * @param error_msg Output string for error description
+ * @param path Path string for nested column location (for error reporting)
+ * @return true if columns are equal, false otherwise
+ */
+bool columns_equal(column_view const& lhs,
+                   column_view const& rhs,
+                   rmm::cuda_stream_view stream,
+                   std::string& error_msg,
+                   std::string const& path)
+{
+  // Compare type
+  if (lhs.type() != rhs.type()) {
+    std::ostringstream oss;
+    oss << path << "Type mismatch: " << static_cast<int>(lhs.type().id()) << " vs "
+        << static_cast<int>(rhs.type().id());
+    error_msg = oss.str();
+    return false;
+  }
+
+  // Compare size
+  if (lhs.size() != rhs.size()) {
+    std::ostringstream oss;
+    oss << path << "Size mismatch: " << lhs.size() << " vs " << rhs.size();
+    error_msg = oss.str();
+    return false;
+  }
+
+  // Compare null count
+  if (lhs.null_count() != rhs.null_count()) {
+    std::ostringstream oss;
+    oss << path << "Null count mismatch: " << lhs.null_count() << " vs " << rhs.null_count();
+    error_msg = oss.str();
+    return false;
+  }
+
+  // For EMPTY type, no data to compare
+  if (lhs.type().id() == type_id::EMPTY) { return true; }
+
+  // Compare null mask (if any)
+  if (lhs.nullable() || rhs.nullable()) {
+    if (!bitmasks_equal(lhs.null_mask(), rhs.null_mask(), lhs.size(), stream)) {
+      error_msg = path + "Null mask mismatch";
+      return false;
+    }
+  }
+
+  // Compare data buffer for fixed-width types
+  if (cudf::is_fixed_width(lhs.type())) {
+    size_t const element_size = cudf::size_of(lhs.type());
+    size_t const data_size    = lhs.size() * element_size;
+    if (!buffers_equal(lhs.head<char>() + lhs.offset() * element_size,
+                       rhs.head<char>() + rhs.offset() * element_size,
+                       data_size,
+                       stream)) {
+      error_msg = path + "Data buffer mismatch";
+      return false;
+    }
+  }
+
+  // Compare children recursively
+  if (lhs.num_children() != rhs.num_children()) {
+    std::ostringstream oss;
+    oss << path << "Number of children mismatch: " << lhs.num_children() << " vs "
+        << rhs.num_children();
+    error_msg = oss.str();
+    return false;
+  }
+
+  // For strings, compare offsets and chars children
+  if (lhs.type().id() == type_id::STRING) {
+    // Empty STRING columns (from make_empty_column) have no children - they are equal if both empty
+    if (lhs.num_children() == 0 && rhs.num_children() == 0) {
+      // Both are empty STRING columns with no children - considered equal
+      return true;
+    }
+
+    strings_column_view lhs_str(lhs);
+    strings_column_view rhs_str(rhs);
+
+    // Compare offsets
+    auto lhs_offsets = lhs_str.offsets();
+    auto rhs_offsets = rhs_str.offsets();
+
+    // Get the sliced offsets (size + 1 elements)
+    size_t const offsets_bytes = (lhs.size() + 1) * sizeof(size_type);
+    if (!buffers_equal(lhs_offsets.head<char>() + lhs_str.offset() * sizeof(size_type),
+                       rhs_offsets.head<char>() + rhs_str.offset() * sizeof(size_type),
+                       offsets_bytes,
+                       stream)) {
+      error_msg = path + "String offsets mismatch";
+      return false;
+    }
+
+    // Compare chars data
+    auto const lhs_chars_size = lhs_str.chars_size(stream);
+    auto const rhs_chars_size = rhs_str.chars_size(stream);
+    if (lhs_chars_size != rhs_chars_size) {
+      std::ostringstream oss;
+      oss << path << "String chars size mismatch: " << lhs_chars_size << " vs " << rhs_chars_size;
+      error_msg = oss.str();
+      return false;
+    }
+
+    if (lhs_chars_size > 0) {
+      // Get the first offset to find the start of chars data
+      auto const lhs_chars_begin =
+        cudf::detail::get_value<size_type>(lhs_offsets, lhs_str.offset(), stream);
+      auto const rhs_chars_begin =
+        cudf::detail::get_value<size_type>(rhs_offsets, rhs_str.offset(), stream);
+
+      if (!buffers_equal(
+            lhs_str.chars_begin(stream), rhs_str.chars_begin(stream), lhs_chars_size, stream)) {
+        error_msg = path + "String chars data mismatch";
+        return false;
+      }
+    }
+    return true;
+  }
+
+  // For lists, compare offsets and child
+  if (lhs.type().id() == type_id::LIST) {
+    // Empty LIST columns (from make_empty_column) have no children - they are equal if both empty
+    if (lhs.num_children() == 0 && rhs.num_children() == 0) {
+      // Both are empty LIST columns with no children - considered equal
+      return true;
+    }
+
+    lists_column_view lhs_list(lhs);
+    lists_column_view rhs_list(rhs);
+
+    // Compare offsets
+    auto lhs_offsets = lhs_list.offsets();
+    auto rhs_offsets = rhs_list.offsets();
+
+    size_t const offsets_bytes = (lhs.size() + 1) * sizeof(size_type);
+    if (!buffers_equal(lhs_offsets.head<char>() + lhs_list.offset() * sizeof(size_type),
+                       rhs_offsets.head<char>() + rhs_list.offset() * sizeof(size_type),
+                       offsets_bytes,
+                       stream)) {
+      error_msg = path + "List offsets mismatch";
+      return false;
+    }
+
+    // Compare child column
+    auto lhs_child = lhs_list.get_sliced_child(stream);
+    auto rhs_child = rhs_list.get_sliced_child(stream);
+    if (!columns_equal(lhs_child, rhs_child, stream, error_msg, path + "list_child/")) {
+      return false;
+    }
+    return true;
+  }
+
+  // For structs, compare all children
+  if (lhs.type().id() == type_id::STRUCT) {
+    structs_column_view lhs_struct(lhs);
+    structs_column_view rhs_struct(rhs);
+
+    for (size_type i = 0; i < lhs_struct.num_children(); ++i) {
+      auto lhs_child         = lhs_struct.get_sliced_child(i, stream);
+      auto rhs_child         = rhs_struct.get_sliced_child(i, stream);
+      std::string child_path = path + "struct_child[" + std::to_string(i) + "]/";
+      if (!columns_equal(lhs_child, rhs_child, stream, error_msg, child_path)) { return false; }
+    }
+    return true;
+  }
+
+  // For dictionary, compare keys and indices
+  if (lhs.type().id() == type_id::DICTIONARY32) {
+    // Empty DICTIONARY columns (from make_empty_column) have no children - they are equal if both
+    // empty
+    if (lhs.num_children() == 0 && rhs.num_children() == 0) {
+      // Both are empty DICTIONARY columns with no children - considered equal
+      return true;
+    }
+
+    dictionary_column_view lhs_dict(lhs);
+    dictionary_column_view rhs_dict(rhs);
+
+    // Compare keys
+    if (!columns_equal(lhs_dict.keys(), rhs_dict.keys(), stream, error_msg, path + "dict_keys/")) {
+      return false;
+    }
+
+    // Compare indices
+    if (!columns_equal(
+          lhs_dict.indices(), rhs_dict.indices(), stream, error_msg, path + "dict_indices/")) {
+      return false;
+    }
+    return true;
+  }
+
+  return true;
+}
+
+/**
+ * @brief Compare two tables for equality.
+ *
+ * @param lhs First table
+ * @param rhs Second table
+ * @param stream CUDA stream
+ * @param error_msg Output string for error description
+ * @return true if tables are equal, false otherwise
+ */
+bool tables_equal(table_view const& lhs,
+                  table_view const& rhs,
+                  rmm::cuda_stream_view stream,
+                  std::string& error_msg)
+{
+  if (lhs.num_rows() != rhs.num_rows()) {
+    std::ostringstream oss;
+    oss << "Row count mismatch: " << lhs.num_rows() << " vs " << rhs.num_rows();
+    error_msg = oss.str();
+    return false;
+  }
+
+  if (lhs.num_columns() != rhs.num_columns()) {
+    std::ostringstream oss;
+    oss << "Column count mismatch: " << lhs.num_columns() << " vs " << rhs.num_columns();
+    error_msg = oss.str();
+    return false;
+  }
+
+  for (size_type i = 0; i < lhs.num_columns(); ++i) {
+    std::string col_path = "column[" + std::to_string(i) + "]/";
+    if (!columns_equal(lhs.column(i), rhs.column(i), stream, error_msg, col_path)) { return false; }
+  }
+
+  return true;
+}
+
+/**
+ * @brief Generate a random hex string for unique filenames.
+ */
+std::string generate_random_hex(size_t length = 8)
+{
+  static std::random_device rd;
+  static std::mt19937 gen(rd());
+  static std::uniform_int_distribution<> dis(0, 15);
+  static char const* hex_chars = "0123456789abcdef";
+
+  std::string result;
+  result.reserve(length);
+  for (size_t i = 0; i < length; ++i) {
+    result += hex_chars[dis(gen)];
+  }
+  return result;
+}
+
+/**
+ * @brief Write a table to a Parquet file and return the filename.
+ */
+std::string write_table_to_parquet(table_view const& tbl, std::string const& prefix)
+{
+  std::string filename = "/tmp/" + prefix + "_" + generate_random_hex() + ".parquet";
+  try {
+    cudf::io::parquet_writer_options options =
+      cudf::io::parquet_writer_options::builder(cudf::io::sink_info{filename}, tbl).build();
+    cudf::io::write_parquet(options);
+  } catch (std::exception const& e) {
+    std::fprintf(stderr, "Warning: Failed to write %s: %s\n", filename.c_str(), e.what());
+    return "";
+  }
+  return filename;
+}
+
+/**
+ * @brief Validate that batch_concatenate produces the same result as concatenate.
+ *
+ * @param expected Result from detail::concatenate
+ * @param actual Result from detail::batch_concatenate
+ * @param stream CUDA stream
+ * @throws cudf::logic_error if the results differ
+ */
+void validate_concatenate_results(column_view const& expected,
+                                  column_view const& actual,
+                                  rmm::cuda_stream_view stream)
+{
+  std::string error_msg;
+  if (!columns_equal(expected, actual, stream, error_msg)) {
+    std::string full_msg =
+      "batch_concatenate produced different result than concatenate: " + error_msg;
+
+    // Write mismatched outputs to Parquet files for debugging
+    auto expected_tbl  = table_view{{expected}};
+    auto actual_tbl    = table_view{{actual}};
+    auto expected_file = write_table_to_parquet(expected_tbl, "concat_expected");
+    auto actual_file   = write_table_to_parquet(actual_tbl, "concat_actual");
+
+    if (!expected_file.empty()) { full_msg += "\nExpected output written to: " + expected_file; }
+    if (!actual_file.empty()) { full_msg += "\nActual output written to: " + actual_file; }
+
+    // Print to stdout and stderr
+    std::printf("\n=== CONCATENATE VALIDATION FAILURE ===\n%s\n", full_msg.c_str());
+    std::fflush(stdout);
+    std::fprintf(stderr, "\n=== CONCATENATE VALIDATION FAILURE ===\n%s\n", full_msg.c_str());
+    std::fflush(stderr);
+    throw cudf::logic_error(full_msg);
+  }
+}
+
+/**
+ * @brief Validate that batch_concatenate produces the same result as concatenate for tables.
+ *
+ * @param expected Result from detail::concatenate
+ * @param actual Result from detail::batch_concatenate
+ * @param stream CUDA stream
+ * @throws cudf::logic_error if the results differ
+ */
+void validate_concatenate_results(table_view const& expected,
+                                  table_view const& actual,
+                                  rmm::cuda_stream_view stream)
+{
+  std::string error_msg;
+  if (!tables_equal(expected, actual, stream, error_msg)) {
+    std::string full_msg =
+      "batch_concatenate produced different result than concatenate: " + error_msg;
+
+    // Write mismatched outputs to Parquet files for debugging
+    auto expected_file = write_table_to_parquet(expected, "concat_expected");
+    auto actual_file   = write_table_to_parquet(actual, "concat_actual");
+
+    if (!expected_file.empty()) { full_msg += "\nExpected output written to: " + expected_file; }
+    if (!actual_file.empty()) { full_msg += "\nActual output written to: " + actual_file; }
+
+    // Print to stdout and stderr
+    std::printf("\n=== CONCATENATE VALIDATION FAILURE ===\n%s\n", full_msg.c_str());
+    std::fflush(stdout);
+    std::fprintf(stderr, "\n=== CONCATENATE VALIDATION FAILURE ===\n%s\n", full_msg.c_str());
+    std::fflush(stderr);
+    throw cudf::logic_error(full_msg);
+  }
+}
+
+}  // anonymous namespace
+
 rmm::device_buffer concatenate_masks(host_span<column_view const> views,
                                      rmm::cuda_stream_view stream,
                                      rmm::device_async_resource_ref mr)
@@ -593,10 +1003,18 @@ std::unique_ptr<column> concatenate(host_span<column_view const> columns_to_conc
                                     rmm::device_async_resource_ref mr)
 {
   CUDF_FUNC_RANGE();
+
+  // Compute results from both implementations
+  auto expected = detail::concatenate(columns_to_concat, stream, mr);
+  auto actual   = detail::batch_concatenate(columns_to_concat, stream, mr);
+
+  // Validate that results match
+  validate_concatenate_results(expected->view(), actual->view(), stream);
+
 #if USE_BATCH_CONCATENATE
-  return detail::batch_concatenate(columns_to_concat, stream, mr);
+  return actual;
 #else
-  return detail::concatenate(columns_to_concat, stream, mr);
+  return expected;
 #endif
 }
 
@@ -605,10 +1023,18 @@ std::unique_ptr<table> concatenate(host_span<table_view const> tables_to_concat,
                                    rmm::device_async_resource_ref mr)
 {
   CUDF_FUNC_RANGE();
+
+  // Compute results from both implementations
+  auto expected = detail::concatenate(tables_to_concat, stream, mr);
+  auto actual   = detail::batch_concatenate(tables_to_concat, stream, mr);
+
+  // Validate that results match
+  validate_concatenate_results(expected->view(), actual->view(), stream);
+
 #if USE_BATCH_CONCATENATE
-  return detail::batch_concatenate(tables_to_concat, stream, mr);
+  return actual;
 #else
-  return detail::concatenate(tables_to_concat, stream, mr);
+  return expected;
 #endif
 }
 

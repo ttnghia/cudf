@@ -377,7 +377,8 @@ void collect_level_info_recursive(host_span<column_view const> cols,
     // Empty string columns have no children
     info.offsets_dtype = data_type{type_id::INT32};  // Default
     for (auto const& col : cols) {
-      if (col.size() > 0) {
+      // Check both size > 0 AND has children (offsets) to avoid crash on malformed columns
+      if (col.size() > 0 && col.num_children() > 0) {
         strings_column_view scv(col);
         info.offsets_dtype = scv.offsets().type();
         break;
@@ -395,7 +396,8 @@ void collect_level_info_recursive(host_span<column_view const> cols,
     // Store child info for empty list reconstruction
     // Find first non-empty column to get child type and view
     for (auto const& col : cols) {
-      if (col.size() > 0) {
+      // Check num_children() > 0 to avoid crash on malformed columns
+      if (col.size() > 0 && col.num_children() > 0) {
         lists_column_view lcv(col);
         info.child_dtype      = lcv.child().type();
         info.empty_child_like = lcv.child();  // Store for empty_like on nested types
@@ -419,8 +421,9 @@ void collect_level_info_recursive(host_span<column_view const> cols,
     // Data info based on type
     if (info.is_string) {
       // String column: collect offsets and chars info
-      // Note: empty string columns have no children, so we must check size first
-      if (col_size > 0) {
+      // Note: empty string columns have no children, so we must check size AND children
+      // Check num_children() > 0 to avoid crash on malformed columns
+      if (col_size > 0 && col.num_children() > 0) {
         strings_column_view scv(col);
         auto const offsets_col = scv.offsets();
 
@@ -450,7 +453,8 @@ void collect_level_info_recursive(host_span<column_view const> cols,
       }
     } else if (info.is_list) {
       // List column: collect offsets info (child data handled via recursion)
-      if (col_size > 0) {
+      // Check num_children() > 0 to avoid crash on malformed columns
+      if (col_size > 0 && col.num_children() > 0) {
         lists_column_view lcv(col);
         auto const offsets_col = lcv.offsets();
 
@@ -509,7 +513,8 @@ void collect_level_info_recursive(host_span<column_view const> cols,
     child_cols.reserve(num_cols);
 
     for (auto const& col : cols) {
-      if (col.size() > 0) {
+      // Check num_children() > 0 to avoid crash on malformed columns
+      if (col.size() > 0 && col.num_children() > 0) {
         lists_column_view lcv(col);
         child_cols.push_back(lcv.get_sliced_child(stream));
       }
@@ -1297,7 +1302,6 @@ std::unique_ptr<column> batch_concatenate(host_span<column_view const> columns_t
                                           rmm::device_async_resource_ref mr)
 {
   CUDF_FUNC_RANGE();
-
   CUDF_EXPECTS(!columns_to_concat.empty(), "Unexpected empty list of columns to concatenate.");
 
   // Handle EMPTY type early (before support check)
@@ -1323,7 +1327,24 @@ std::unique_ptr<column> batch_concatenate(host_span<column_view const> columns_t
   if (std::all_of(columns_to_concat.begin(), columns_to_concat.end(), [](column_view const& c) {
         return c.is_empty();
       })) {
-    return empty_like(columns_to_concat.front());
+    auto const& front = columns_to_concat.front();
+    // Handle types that need special construction for empty columns
+    auto const tid = front.type().id();
+
+    // DICTIONARY columns: delegate to specialized implementation
+    if (tid == cudf::type_id::DICTIONARY32) {
+      return cudf::dictionary::detail::concatenate(columns_to_concat, stream, mr);
+    }
+
+    // LIST columns with no children: create minimal empty list structure
+    if (tid == cudf::type_id::LIST && front.num_children() == 0) {
+      auto offsets = make_empty_column(cudf::data_type{cudf::type_id::INT32});
+      auto child   = make_empty_column(cudf::data_type{cudf::type_id::INT8});
+      return make_lists_column(
+        0, std::move(offsets), std::move(child), 0, rmm::device_buffer{}, stream, mr);
+    }
+
+    return empty_like(front);
   }
 
   // Step 1: Collect all level information in a single recursive pass
