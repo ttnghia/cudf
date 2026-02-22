@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import decimal
+import inspect
 import operator
 import textwrap
 import warnings
@@ -21,6 +22,14 @@ import pylibcudf as plc
 import cudf
 from cudf.core._compat import PANDAS_GE_210, PANDAS_LT_300
 from cudf.core.abc import Serializable
+from cudf.core.dtype.validators import (
+    is_dtype_obj_datetime_tz,
+    is_dtype_obj_interval,
+    is_dtype_obj_list,
+    is_dtype_obj_numeric,
+    is_dtype_obj_string,
+    is_dtype_obj_struct,
+)
 from cudf.utils.docutils import doc_apply
 from cudf.utils.dtypes import (
     CUDF_STRING_DTYPE,
@@ -28,6 +37,7 @@ from cudf.utils.dtypes import (
     cudf_dtype_from_pa_type,
     cudf_dtype_to_pa_type,
     is_pandas_nullable_extension_dtype,
+    min_unsigned_type,
 )
 
 if PANDAS_GE_210:
@@ -37,8 +47,7 @@ else:
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping
-
-    from typing_extensions import Self
+    from typing import Self
 
     from cudf._typing import Dtype, DtypeObj
     from cudf.core.buffer import Buffer
@@ -62,9 +71,16 @@ def dtype(arbitrary: Any) -> DtypeObj:
     dtype: the cuDF-supported dtype that best matches `arbitrary`
     """
     #  first, check if `arbitrary` is one of our extension types:
-    if isinstance(arbitrary, (_BaseDtype, pd.DatetimeTZDtype)):
+    if isinstance(arbitrary, _BaseDtype):
         return arbitrary
-
+    if inspect.isclass(arbitrary) and issubclass(
+        arbitrary, pd.api.extensions.ExtensionDtype
+    ):
+        msg = (
+            f"Expected an instance of {arbitrary.__name__}, "
+            "but got the class instead. Try instantiating 'dtype'."
+        )
+        raise TypeError(msg)
     # next, try interpreting arbitrary as a NumPy dtype that we support:
     try:
         np_dtype = np.dtype(arbitrary)
@@ -75,44 +91,31 @@ def dtype(arbitrary: Any) -> DtypeObj:
             return CUDF_STRING_DTYPE
         elif np_dtype.kind == "U":
             if cudf.get_option("mode.pandas_compatible"):
+                # Like pandas, allow users to pass this object to signal "string"
+                # but the dtype metadata should result in np.dtype(object)
                 return np_dtype
             return CUDF_STRING_DTYPE
         elif np_dtype not in SUPPORTED_NUMPY_TO_PYLIBCUDF_TYPES:
             raise TypeError(f"Unsupported type {np_dtype}")
         return np_dtype
 
-    # use `pandas_dtype` to try and interpret
-    # `arbitrary` as a Pandas extension type.
-    #  Return the corresponding NumPy/cuDF type.
+    # lastly, try interpreting arbitrary as a pandas dtype that we support:
     pd_dtype = pd.api.types.pandas_dtype(arbitrary)  # noqa: TID251
-    if is_pandas_nullable_extension_dtype(pd_dtype):
-        if isinstance(pd_dtype, pd.ArrowDtype):
-            arrow_type = pd_dtype.pyarrow_dtype
-            if (
-                arrow_type == pa.date32()
-                or arrow_type == pa.binary()
-                or isinstance(arrow_type, pa.DictionaryType)
-            ) or (
-                cudf.get_option("mode.pandas_compatible")
-                and isinstance(arrow_type, pa.TimestampType)
-                and getattr(arrow_type, "tz", None) is not None
-            ):
-                raise NotImplementedError(
-                    f"cuDF does not yet support {pd_dtype}"
-                )
-        if cudf.get_option("mode.pandas_compatible"):
-            return pd_dtype
-        elif isinstance(pd_dtype, pd.StringDtype):
-            return CUDF_STRING_DTYPE
-        else:
-            return dtype(pd_dtype.numpy_dtype)
-    elif isinstance(pd_dtype, PANDAS_NUMPY_DTYPE):
+    if isinstance(pd_dtype, PANDAS_NUMPY_DTYPE):
         return dtype(pd_dtype.numpy_dtype)
     elif isinstance(pd_dtype, pd.CategoricalDtype):
         return CategoricalDtype(pd_dtype.categories, pd_dtype.ordered)
     elif isinstance(pd_dtype, pd.IntervalDtype):
         return IntervalDtype(pd_dtype.subtype, pd_dtype.closed)
-    elif isinstance(pd_dtype, pd.DatetimeTZDtype):
+    elif (
+        pd_dtype.kind in "mM"
+        or is_dtype_obj_string(pd_dtype)
+        or is_dtype_obj_list(pd_dtype)
+        or is_dtype_obj_struct(pd_dtype)
+        or is_dtype_obj_interval(pd_dtype)
+        or is_dtype_obj_numeric(pd_dtype, include_decimal=True)
+        or is_dtype_obj_datetime_tz(pd_dtype)
+    ):
         return pd_dtype
     else:
         raise TypeError(f"Cannot interpret {arbitrary} as a valid cuDF dtype")
@@ -242,6 +245,11 @@ class CategoricalDtype(_BaseDtype):
         Whether the categories have an ordered relationship.
         """
         return self._ordered
+
+    @cached_property
+    def _codes_dtype(self) -> np.dtype:
+        """Return the dtype used for categorical codes."""
+        return min_unsigned_type(len(self.categories))
 
     def to_pandas(self) -> pd.CategoricalDtype:
         """
@@ -562,6 +570,17 @@ class ListDtype(_BaseDtype):
             ]
         return result
 
+    @classmethod
+    def from_list_dtype(cls, obj) -> Self:
+        if isinstance(obj, ListDtype):
+            return obj
+        elif isinstance(obj, pa.ListType):
+            return cls.from_arrow(obj)
+        elif isinstance(obj, pd.ArrowDtype):
+            return cls.from_arrow(obj.pyarrow_dtype)
+        else:
+            raise TypeError(f"Cannot convert {type(obj)} to StructDtype")
+
 
 class StructDtype(_BaseDtype):
     """
@@ -586,15 +605,15 @@ class StructDtype(_BaseDtype):
     Examples
     --------
     >>> import cudf
-    >>> struct_dtype = cudf.StructDtype({"a": "int64", "b": "string"})
+    >>> struct_dtype = cudf.StructDtype({"a": "int64", "b": "float64"})
     >>> struct_dtype
-    StructDtype({'a': dtype('int64'), 'b': dtype('O')})
+    StructDtype({'a': dtype('int64'), 'b': dtype('float64')})
 
     A nested ``StructDtype`` can also be constructed in the following way:
 
     >>> nested_struct_dtype = cudf.StructDtype({"dict_data": struct_dtype, "c": "uint8"})
     >>> nested_struct_dtype
-    StructDtype({'dict_data': StructDtype({'a': dtype('int64'), 'b': dtype('O')}), 'c': dtype('uint8')})
+    StructDtype({'dict_data': StructDtype({'a': dtype('int64'), 'b': dtype('float64')}), 'c': dtype('uint8')})
     """
 
     name = "struct"
@@ -613,11 +632,11 @@ class StructDtype(_BaseDtype):
         Examples
         --------
         >>> import cudf
-        >>> struct_dtype = cudf.StructDtype({"a": "int64", "b": "string"})
+        >>> struct_dtype = cudf.StructDtype({"a": "int64", "b": "float64"})
         >>> struct_dtype
-        StructDtype({'a': dtype('int64'), 'b': dtype('O')})
+        StructDtype({'a': dtype('int64'), 'b': dtype('float64')})
         >>> struct_dtype.fields
-        {'a': dtype('int64'), 'b': dtype('O')}
+        {'a': dtype('int64'), 'b': dtype('float64')}
         """
         return self._fields
 
@@ -653,11 +672,11 @@ class StructDtype(_BaseDtype):
         Examples
         --------
         >>> import cudf
-        >>> struct_type = cudf.StructDtype({"x": "int32", "y": "string"})
+        >>> struct_type = cudf.StructDtype({"x": "int32", "y": "float64"})
         >>> struct_type
-        StructDtype({'x': dtype('int32'), 'y': dtype('O')})
+        StructDtype({'x': dtype('int32'), 'y': dtype('float64')})
         >>> struct_type.to_arrow()
-        StructType(struct<x: int32, y: string>)
+        StructType(struct<x: int32, y: double>)
         """
         return pa.struct(
             # dict[str, DataType] should be compatible but pyarrow stubs are too strict
@@ -843,11 +862,13 @@ class DecimalDtype(_BaseDtype):
         # might need to account for precision and scale here
         return decimal.Decimal
 
-    def to_arrow(self) -> pa.Decimal128Type:
+    def to_arrow(
+        self,
+    ) -> pa.Decimal128Type | pa.Decimal32Type | pa.Decimal64Type:
         """
         Return the equivalent ``pyarrow`` dtype.
         """
-        return pa.decimal128(self.precision, self.scale)
+        return type(self).PA_TYPE(self.precision, self.scale)
 
     @classmethod
     def from_arrow(
@@ -941,6 +962,7 @@ class Decimal32Dtype(DecimalDtype):
     name = "decimal32"
     MAX_PRECISION = np.floor(np.log10(np.iinfo("int32").max))
     ITEMSIZE = 4
+    PA_TYPE = pa.decimal32
 
 
 @doc_apply(
@@ -952,6 +974,7 @@ class Decimal64Dtype(DecimalDtype):
     name = "decimal64"
     MAX_PRECISION = np.floor(np.log10(np.iinfo("int64").max))
     ITEMSIZE = 8
+    PA_TYPE = pa.decimal64
 
 
 @doc_apply(
@@ -963,6 +986,7 @@ class Decimal128Dtype(DecimalDtype):
     name = "decimal128"
     MAX_PRECISION = 38
     ITEMSIZE = 16
+    PA_TYPE = pa.decimal128
 
 
 class IntervalDtype(_BaseDtype):
@@ -996,9 +1020,13 @@ class IntervalDtype(_BaseDtype):
             self._fields = {}
         else:
             self._subtype = cudf.dtype(subtype)
-            if isinstance(
-                self._subtype, cudf.CategoricalDtype
-            ) or cudf.utils.dtypes.is_dtype_obj_string(self._subtype):
+            # TODO: Remove self._subtype.kind == "U" once cudf.dtype no longer accepts
+            # numpy string types
+            if (
+                isinstance(self._subtype, CategoricalDtype)
+                or is_dtype_obj_string(self._subtype)
+                or self._subtype.kind == "U"
+            ):
                 raise TypeError(
                     "category, object, and string subtypes are not supported "
                     "for IntervalDtype"
@@ -1048,14 +1076,12 @@ class IntervalDtype(_BaseDtype):
         )
 
     def to_pandas(self) -> pd.IntervalDtype:
-        if cudf.get_option("mode.pandas_compatible"):
-            return pd.IntervalDtype(
-                subtype=self.subtype.numpy_dtype
-                if is_pandas_nullable_extension_dtype(self.subtype)
-                else self.subtype,
-                closed=self.closed,
-            )
-        return pd.IntervalDtype(subtype=self.subtype, closed=self.closed)
+        return pd.IntervalDtype(
+            subtype=self.subtype.numpy_dtype
+            if is_pandas_nullable_extension_dtype(self.subtype)
+            else self.subtype,
+            closed=self.closed,
+        )
 
     def __eq__(self, other) -> bool:
         if isinstance(other, str):
@@ -1124,6 +1150,17 @@ class IntervalDtype(_BaseDtype):
         _check_type(cls, header, frames)
         subtype, closed = header["fields"]
         return cls(subtype, closed=closed)
+
+    @classmethod
+    def from_interval_dtype(cls, obj) -> Self:
+        if isinstance(obj, IntervalDtype):
+            return obj
+        elif isinstance(obj, ArrowIntervalType):
+            return cls.from_arrow(obj)
+        elif isinstance(obj, pd.ArrowDtype):
+            return cls.from_arrow(obj.pyarrow_dtype)
+        else:
+            raise TypeError(f"Cannot convert {type(obj)} to IntervalDtype")
 
 
 def _is_categorical_dtype(obj):
@@ -1328,26 +1365,30 @@ def is_interval_dtype(obj):
 def is_decimal32_dtype(obj):
     return (
         type(obj) is Decimal32Dtype
-        or obj is Decimal32Dtype
-        or (isinstance(obj, str) and obj == Decimal32Dtype.name)
         or (hasattr(obj, "dtype") and is_decimal32_dtype(obj.dtype))
+        or (
+            isinstance(obj, pd.ArrowDtype)
+            and pa.types.is_decimal(obj.pyarrow_dtype)
+            and isinstance(obj.pyarrow_dtype, pa.lib.Decimal32Type)
+        )
     )
 
 
 def is_decimal64_dtype(obj):
     return (
         type(obj) is Decimal64Dtype
-        or obj is Decimal64Dtype
-        or (isinstance(obj, str) and obj == Decimal64Dtype.name)
         or (hasattr(obj, "dtype") and is_decimal64_dtype(obj.dtype))
+        or (
+            isinstance(obj, pd.ArrowDtype)
+            and pa.types.is_decimal(obj.pyarrow_dtype)
+            and isinstance(obj.pyarrow_dtype, pa.lib.Decimal64Type)
+        )
     )
 
 
 def is_decimal128_dtype(obj):
     return (
         type(obj) is Decimal128Dtype
-        or obj is Decimal128Dtype
-        or (isinstance(obj, str) and obj == Decimal128Dtype.name)
         or (hasattr(obj, "dtype") and is_decimal128_dtype(obj.dtype))
         or (
             isinstance(obj, pd.ArrowDtype)

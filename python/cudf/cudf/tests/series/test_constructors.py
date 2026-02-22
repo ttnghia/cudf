@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2023-2025, NVIDIA CORPORATION.
+# SPDX-FileCopyrightText: Copyright (c) 2023-2026, NVIDIA CORPORATION.
 # SPDX-License-Identifier: Apache-2.0
 import array
 import datetime
@@ -1573,3 +1573,42 @@ def test_series_type_invalid_error():
     with cudf.option_context("mode.pandas_compatible", True):
         with pytest.raises(ValueError):
             cudf.Series(["a", "b", "c"], dtype="Int64")
+
+
+def test_series_constructor_numpy_dtype_str(pandas_compatible):
+    data = ["a"]
+    dtype = np.dtype(str)
+    expected = pd.Series(data, dtype=dtype)
+    result = cudf.Series(data, dtype=dtype)
+    assert result.dtype == np.dtype(object)
+    assert_eq(result, expected)
+
+
+def test_series_constructor_dtype_is_pandas_nullable_extension_type(
+    all_supported_pandas_nullable_extension_dtypes,
+):
+    scalar, dtype = all_supported_pandas_nullable_extension_dtypes
+    result = cudf.Series([scalar], dtype=dtype)
+    expected = pd.Series([scalar], dtype=dtype)
+    assert result.dtype == expected.dtype
+    assert_eq(result, expected)
+
+
+def test_series_constructor_dtype_is_pandas_arrowdtype(
+    all_supported_pandas_arrowdtypes,
+    request,
+):
+    scalar, dtype = all_supported_pandas_arrowdtypes
+    if PANDAS_VERSION < PANDAS_CURRENT_SUPPORTED_VERSION:
+        if dtype.kind == "M" and dtype.pyarrow_dtype.tz is not None:
+            pytest.skip(
+                f"RecursionError occurs in older versions of pandas/pyarrow for {dtype}"
+            )
+        elif pa.types.is_decimal(dtype.pyarrow_dtype):
+            pytest.skip(
+                "Decimal types coerced to object in older versions of pandas/pyarrow"
+            )
+    result = cudf.Series([scalar], dtype=dtype)
+    expected = pd.Series([scalar], dtype=dtype)
+    assert result.dtype == expected.dtype
+    assert_eq(result, expected)

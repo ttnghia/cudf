@@ -17,11 +17,11 @@ authors = [
     { name = "NVIDIA Corporation" },
 ]
 license = "Apache-2.0"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 dependencies = [
     "cachetools",
     "cuda-python>=13.0.1,<14.0",
-    "cupy-cuda13x>=13.6.0",
+    "cupy-cuda13x>=13.6.0,!=14.0.0",
     "fsspec>=0.6.0",
     "libcudf==26.4.*,>=0.0.0a0",
     "numba-cuda>=0.22.2",
@@ -41,7 +41,6 @@ classifiers = [
     "Topic :: Database",
     "Topic :: Scientific/Engineering",
     "Programming Language :: Python",
-    "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
