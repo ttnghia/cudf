@@ -308,6 +308,47 @@ struct offsets_kernel_group {
 };
 
 /**
+ * @brief Counts the total number of nesting levels for a column structure.
+ *
+ * This mirrors the recursion pattern of collect_level_info_recursive but only counts
+ * levels without allocating any data. Used to pre-reserve the levels vector to avoid
+ * repeated reallocations when there are many nested columns (e.g., structs with 1000+ children).
+ *
+ * @param cols The columns to count levels for (all must have the same type structure)
+ * @return The total number of levels that collect_level_info_recursive would produce
+ */
+size_type count_nesting_levels(host_span<column_view const> cols)
+{
+  if (cols.empty()) return 0;
+
+  auto const& first_col = cols.front();
+  size_type count       = 1;  // Current level
+  auto const tid        = first_col.type().id();
+
+  if (tid == type_id::DICTIONARY32) return count;
+
+  if (tid == type_id::STRUCT) {
+    for (size_type i = 0; i < first_col.num_children(); ++i) {
+      // Struct children are accessible even on empty columns
+      column_view child = first_col.child(i);
+      count += count_nesting_levels(host_span<column_view const>{&child, 1});
+    }
+  } else if (tid == type_id::LIST) {
+    // Find first non-empty column to get child structure
+    for (auto const& col : cols) {
+      if (col.size() > 0 && col.num_children() > 0) {
+        lists_column_view lcv(col);
+        column_view child = lcv.child();
+        count += count_nesting_levels(host_span<column_view const>{&child, 1});
+        break;
+      }
+    }
+  }
+
+  return count;
+}
+
+/**
  * @brief Recursively collects all level information in a single pass.
  *
  * This consolidates what was previously done in multiple passes.
@@ -1349,6 +1390,7 @@ std::unique_ptr<column> batch_concatenate(host_span<column_view const> columns_t
 
   // Step 1: Collect all level information in a single recursive pass
   std::vector<level_info> levels;
+  levels.reserve(count_nesting_levels(columns_to_concat));
   collect_level_info_recursive(columns_to_concat, levels, stream);
 
   // Step 2: Batch process all data copy, mask concatenation, and string offsets
@@ -1810,6 +1852,7 @@ std::unique_ptr<table> batch_concatenate(host_span<table_view const> tables_to_c
                                  [](auto const& c) { return c.is_empty(); });
 
     if (!all_empty) {
+      levels_by_column[col_idx].reserve(count_nesting_levels(cols_for_position));
       collect_level_info_recursive(cols_for_position, levels_by_column[col_idx], stream);
     }
   }
