@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2021-2025, NVIDIA CORPORATION.
+ * SPDX-FileCopyrightText: Copyright (c) 2021-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  */
 
@@ -352,4 +352,104 @@ TEST_F(SegmentedSortInt, UnbalancedOffsets)
   CUDF_TEST_EXPECT_COLUMNS_EQUIVALENT(result->view().column(0), expected->view().column(0));
   result = cudf::stable_segmented_sort_by_key(input_view, input_view, segments);
   CUDF_TEST_EXPECT_COLUMNS_EQUIVALENT(result->view().column(0), expected->view().column(0));
+}
+
+// The unstable single-column explicit-order fast paths (tiered, packed-radix, and strings -- each
+// now folding any explicit (order, null_order) into its keys) label elements by dense segment
+// ordinal and index the output by raw offset, so they are correct only when the offsets span every
+// row `[0, num_rows]`. The public contract explicitly allows offsets that skip
+// leading/trailing rows (those rows stay unsorted) and single-index offsets (no rows sorted). The
+// offsets-coverage guard routes such non-normalized inputs to the comparison/CUB path instead.
+// These tests exercise that guard directly on the public API -- the same driver
+// `segmented_top_k_order` delegates into -- for each fast-path family; without the guard each
+// returns the wrong order (or, for a single index, shifts a packed key by 64 bits). `sort_lists`
+// always normalizes its offsets, so it is unaffected.
+
+// Partial-coverage offsets {3, 7} on a no-null INT32 column route to the tiered fast path when the
+// guard is absent; with the guard they take the comparison/CUB path, which sorts only [3, 7) and
+// leaves the out-of-segment rows in place.
+TEST_F(SegmentedSortInt, FastPathPartialOffsetsNumeric)
+{
+  using T = int;
+  column_wrapper<T> col{{50, 51, 52, 40, 10, 30, 20, 57, 58, 59}};
+  column_wrapper<int> segments{{3, 7}};
+  cudf::table_view input{{col}};
+  // Rows 0-2 and 7-9 stay identity; [3, 7) = {40, 10, 30, 20} sorts ascending to {10, 20, 30, 40}.
+  column_wrapper<T> expected{{50, 51, 52, 10, 20, 30, 40, 57, 58, 59}};
+  auto result = cudf::segmented_sort_by_key(
+    input, input, segments, {cudf::order::ASCENDING}, {cudf::null_order::AFTER});
+  CUDF_TEST_EXPECT_TABLES_EQUAL(result->view(), cudf::table_view{{expected}});
+}
+
+// One-sided partial coverage: each case satisfies exactly one half of the guard's
+// `first == 0 and last == num_rows` conjunction, so the halves are pinned independently (offsets
+// like {3, 7} violate both at once and cannot distinguish `and` from `or`). Rows outside the
+// offsets stay in place, per the public contract above.
+TEST_F(SegmentedSortInt, FastPathOneSidedOffsets)
+{
+  using T = int;
+  column_wrapper<T> col{{50, 51, 52, 40, 10, 30, 20, 57, 58, 59}};
+  cudf::table_view input{{col}};
+  {  // starts at 0, stops short: only [0, 7) sorts; rows 7-9 stay in place
+    column_wrapper<int> segments{{0, 7}};
+    column_wrapper<T> expected{{10, 20, 30, 40, 50, 51, 52, 57, 58, 59}};
+    auto result = cudf::segmented_sort_by_key(
+      input, input, segments, {cudf::order::ASCENDING}, {cudf::null_order::AFTER});
+    CUDF_TEST_EXPECT_TABLES_EQUAL(result->view(), cudf::table_view{{expected}});
+  }
+  {  // skips leading rows, ends at num_rows: only [3, 10) sorts; rows 0-2 stay in place
+    column_wrapper<int> segments{{3, 10}};
+    column_wrapper<T> expected{{50, 51, 52, 10, 20, 30, 40, 57, 58, 59}};
+    auto result = cudf::segmented_sort_by_key(
+      input, input, segments, {cudf::order::ASCENDING}, {cudf::null_order::AFTER});
+    CUDF_TEST_EXPECT_TABLES_EQUAL(result->view(), cudf::table_view{{expected}});
+  }
+}
+
+// Partial-coverage offsets on a no-null INT32 column whose average list size reaches the
+// packed-radix band: {100, 300} over 400 rows (average 200) would take the packed-radix fast path,
+// which globally sorts a permutation of [0, num_rows) and mislabels partial coverage. With the
+// guard it sorts only [100, 300).
+TEST_F(SegmentedSortInt, FastPathPartialOffsetsPackedRadix)
+{
+  using T                 = int;
+  cudf::size_type const n = 400;
+  std::vector<T> vals(n);
+  std::vector<T> ex(n);
+  for (cudf::size_type i = 0; i < n; ++i) {
+    vals[i] = 1'000 - i;  // strictly descending, distinct
+    // [100, 300) sorts ascending (701..900); the rest stay identity.
+    ex[i] = (i < 100 or i >= 300) ? vals[i] : (701 + (i - 100));
+  }
+  column_wrapper<T> col(vals.begin(), vals.end());
+  column_wrapper<T> expected(ex.begin(), ex.end());
+  column_wrapper<int> segments{{100, 300}};
+  cudf::table_view input{{col}};
+  auto result = cudf::segmented_sort_by_key(
+    input, input, segments, {cudf::order::ASCENDING}, {cudf::null_order::AFTER});
+  CUDF_TEST_EXPECT_TABLES_EQUAL(result->view(), cudf::table_view{{expected}});
+}
+
+// Single-index offsets (num_segments == 0) sort no values -- the documented contract. The guard
+// requires at least two offsets, so these fall through to the comparison/CUB path (which treats
+// zero segments as identity) rather than a fast path whose zero-width segment field would shift a
+// 64-bit packed key by 64 (undefined behavior). Covers a fixed-width and a STRING column.
+TEST_F(SegmentedSortInt, FastPathSingleIndexOffsets)
+{
+  column_wrapper<int> segments{{5}};  // one index -> num_segments == 0 -> no values sorted
+  {
+    using T = int;
+    column_wrapper<T> col{{50, 40, 30, 20, 10, 90, 80, 70, 60, 55}};
+    cudf::table_view input{{col}};
+    auto result = cudf::segmented_sort_by_key(
+      input, input, segments, {cudf::order::ASCENDING}, {cudf::null_order::AFTER});
+    CUDF_TEST_EXPECT_TABLES_EQUAL(result->view(), input);  // unchanged: no values sorted
+  }
+  {
+    cudf::test::strings_column_wrapper col{"e", "d", "c", "b", "a", "j", "i", "h", "g", "f"};
+    auto const input = cudf::table_view{{col}};
+    auto result      = cudf::segmented_sort_by_key(
+      input, input, segments, {cudf::order::ASCENDING}, {cudf::null_order::AFTER});
+    CUDF_TEST_EXPECT_TABLES_EQUAL(result->view(), input);  // unchanged: no values sorted
+  }
 }

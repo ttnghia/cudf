@@ -21,15 +21,13 @@
 
 // Benchmark for cudf::lists::sort_lists on a LIST<numeric> column -- the operation Spark array_sort
 // lowers to. The type axis spans the integral, floating-point, and decimal128 fixed-width paths.
-// The segmented sort routes in a single split today: a no-null integral or non-DECIMAL128
-// fixed-point column goes to CUB DeviceSegmentedSort while the average list size stays under 100 or
-// the total row count under 2^18; everything else (float, double, DECIMAL128, or any nulls) takes
-// the generic fallback, a lexicographic comparator sort over a prepended segment-id column. The
-// shape axes bracket that boundary: max_list_size 4 and 32 keep eligible types on the CUB path at
-// both row counts; 256 (average ~128) stays on it only at 100k rows (total-size arm) and falls back
-// at 1M rows. null_frequency 0.1 forces every type onto the fallback; 0 exercises the no-null
-// routing. The order and null_order axes complete the sort-parameter matrix: the CUB path honors
-// order (its gate excludes nulls) and the fallback honors both.
+// For an explicit ascending / nulls-after sort, an integral or floating-point column now takes the
+// global packed-radix path when it carries nulls or its average list size reaches 100; the short
+// no-null remainder keeps CUB DeviceSegmentedSort (integral) or the comparator fallback (floating
+// point). DECIMAL128 and every other (order, null_order) combination keep the base routing: CUB
+// for eligible no-null integrals, otherwise the lexicographic comparator over a prepended
+// segment-id column. The shape axes bracket those boundaries; cells outside ascending /
+// nulls-after measure the base paths.
 template <typename Type>
 void bench_sort_list_of_numbers(nvbench::state& state, nvbench::type_list<Type>)
 {
@@ -84,10 +82,9 @@ void bench_sort_list_of_numbers(nvbench::state& state, nvbench::type_list<Type>)
     mem_stats_logger.peak_memory_usage(), "peak_memory_usage", "peak_memory_usage");
 }
 
-// Chrono is not on the type axis: timestamps are neither integral nor fixed-point to the fast-path
-// gate, so they take the same comparator fallback the float/double cells already measure.
-// decimal128 is likewise excluded from the CUB path (128-bit storage exceeds its fast-sort
-// support) and needs its own type-string mapping.
+// Chrono is not on the type axis: its packed key is byte-identical to the int32/int64 rep it
+// extracts to, so those cells already measure it. decimal128 stays on the comparator fallback at
+// this stage and needs its own type-string mapping.
 NVBENCH_DECLARE_TYPE_STRINGS(numeric::decimal128, "decimal128", "decimal128");
 
 NVBENCH_BENCH_TYPES(
@@ -96,13 +93,13 @@ NVBENCH_BENCH_TYPES(
     nvbench::type_list<std::int32_t, std::int64_t, float, double, numeric::decimal128>))
   .set_name("sort_list_of_numbers")
   .add_int64_axis("num_rows", {100'000, 1'000'000})
-  // 4 and 32 keep eligible no-null types on the CUB fast path (average under its 100 cutoff); 256
-  // (average ~128) stays on it only at 100k rows via the total-size arm and falls back at 1M.
+  // 4 and 32 keep no-null cells below the packed-radix average gate (100); 256 (average ~128)
+  // crosses it, routing eligible ascending / nulls-after cells to the packed radix.
   .add_int64_axis("max_list_size", {4, 32, 256})
-  // No-null vs a realistic null rate; any nulls disqualify the CUB fast path, so 0.1 forces every
-  // type onto the comparator fallback.
+  // No-null vs a realistic null rate; nulls route eligible ascending / nulls-after cells to the
+  // packed radix (validity folds into its key) and leave every other combination on its base path.
   .add_float64_axis("null_frequency", {0, 0.1})
-  // Full (order, null_order) matrix: the CUB path honors order (no nulls by its gate); the
-  // fallback honors both.
+  // Full (order, null_order) matrix: the packed-radix gate engages only for explicit ascending /
+  // nulls-after; the other combinations measure the base routing.
   .add_string_axis("order", {"ASC", "DESC"})
   .add_string_axis("null_order", {"AFTER", "BEFORE"});
