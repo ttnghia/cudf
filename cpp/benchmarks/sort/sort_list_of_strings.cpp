@@ -32,11 +32,11 @@
 // Overwrites the first `min(plen, byte_length)` bytes of every non-null leaf string of a
 // LIST<STRING> column with the constant byte 'A' (0x41), returning a new LIST<STRING> column. The
 // strings keep their original lengths and offsets, so they stay distinct in their tails while now
-// sharing a `plen`-byte leading prefix -- the regime where every compare must scan past the shared
-// prefix before it can distinguish two strings. This is data setup, not a measured operation, so a
-// host round-trip is acceptable and keeps the helper host-compilable (the benchmark is a .cpp).
-// Offset values may be int32 or int64; both are normalized to int64 on the host. The leaf is
-// assumed unsliced (offset 0), which holds for the freshly generated benchmark column.
+// sharing a `plen`-byte leading prefix -- the regime where the packed-prefix key is uninformative
+// and the tie-break does the real work. This is data setup, not a measured operation, so a host
+// round-trip is acceptable and keeps the helper host-compilable (the benchmark is a .cpp). Offset
+// values may be int32 or int64; both are normalized to int64 on the host. The leaf is assumed
+// unsliced (offset 0), which holds for the freshly generated benchmark column.
 static std::unique_ptr<cudf::column> apply_shared_prefix(cudf::column_view const& list_col,
                                                          cudf::size_type plen,
                                                          rmm::cuda_stream_view stream)
@@ -186,13 +186,10 @@ static std::unique_ptr<cudf::column> trim_forced_last_row(cudf::column_view cons
 }
 
 // Benchmark for cudf::lists::sort_lists on a LIST<STRING> column, the operation Spark
-// array_sort(array<string>) lowers to and which a plain table sort does not exercise. STRING is
-// never eligible for the segmented sort's CUB fast path (neither integral nor fixed-point), so
-// every cell measures the generic fallback: a lexicographic comparator sort over a prepended
-// segment-id column, whose string compares scan bytes until they differ. The axes span the shape
-// space that stresses that comparator: list-length regimes, string width, and -- the compare-cost
-// stressor -- how many leading bytes the elements share. The order and null_order axes complete
-// the sort-parameter matrix.
+// array_sort(array<string>) lowers to and which a plain table sort does not exercise. The axes span
+// the shape space a reviewer needs to see the whole picture of the string fast path: list-length
+// regimes, string width, and -- the tie-break stressor -- how many leading bytes the elements
+// share. The order and null_order axes complete the sort-parameter matrix.
 static void bench_sort_list_of_strings(nvbench::state& state)
 {
   auto const num_rows       = static_cast<cudf::size_type>(state.get_int64("num_rows"));
@@ -219,7 +216,7 @@ static void bench_sort_list_of_strings(nvbench::state& state)
   // Build a LIST<STRING> column: list length is uniform in [0, max_list_size] and each string's
   // width is normally distributed in [0, row_width]. Leaf strings are all-distinct (cardinality 0)
   // to match the near-unique elements of the real array_sort workload -- the hardest case for the
-  // comparator, and the one the shared_prefix_len axis stresses further; leaf cardinality is
+  // tie-break, and the one the shared_prefix_len axis stresses further; leaf cardinality is
   // therefore not a separate axis. Nulls are applied at both the list-row and string-element levels
   // so the sort exercises null ordering at the leaf.
   data_profile const profile =
@@ -265,12 +262,9 @@ NVBENCH_BENCH(bench_sort_list_of_strings)
   .add_int64_axis("num_rows", {1'000'000})
   // Tiny / typical / large list lengths: tiny stresses per-segment overhead, large amortizes it.
   .add_int64_axis("max_list_size", {4, 32, 256})
-  // Short strings resolve compares within a few bytes; wide strings give the comparator more bytes
-  // to scan before two strings differ.
+  // Short strings mostly fit the packed key; wide strings push work into the byte-window tie-break.
   .add_int64_axis("row_width", {16, 64})
-  // 0 control (no forced prefix); 8 and 32 make every compare scan at least that many identical
-  // leading bytes. At row_width 16 a 32-byte prefix saturates every string (lengths are clamped to
-  // [0, row_width]), an intentional all-identical-content extreme differing only in length.
+  // 0 control; 8 shares exactly the packed-key width (first tie-break window); 32 spans several.
   .add_int64_axis("shared_prefix_len", {0, 8, 32})
   // No-null vs a realistic null rate to exercise the leaf null ordering.
   .add_float64_axis("null_frequency", {0, 0.1})

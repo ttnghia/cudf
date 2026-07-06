@@ -142,5 +142,75 @@ fixed_width_sort_path choose_fixed_width_sort_path(column_view const& key,
   rmm::cuda_stream_view stream,
   rmm::device_async_resource_ref mr);
 
+/**
+ * @brief Faster segmented sorted-order for a single STRING key column via iterative radix sort
+ *
+ * Lexicographic string comparison is replaced by radix sorts over a compact key holding the
+ * element's segment and the big-endian-packed leading bytes of its string. The first key is a
+ * single `uint64` laid out `[segment : S bits][class : 1 bit when nullable][prefix : P bits]`
+ * (see `packed_key_layout`), so one global `cub::DeviceRadixSort` over its full 64 bits -- eight
+ * byte-passes, not the twelve the 96-bit iterative key needs -- orders elements by segment, then by
+ * the requested null placement (the `polarity` class bit), then by their leading `P` prefix bits
+ * (complemented under a descending sort). Distinct strings in one segment
+ * sharing those bits remain tied, so instead of a single-threaded comparison tie-break, only the
+ * still-tied elements are compacted out and re-sorted by successive eight-byte windows: each pass
+ * radixes that compacted subset by a 96-bit key whose most-significant field is a dense run rank
+ * (encoding the order resolved so far) and whose low field is the next eight bytes. The run rank
+ * keeps every already-separated element fixed, so a pass only reorders within a tied run, and a
+ * parallel radix replaces the serial per-run sort that made a fully-shared-prefix segment a
+ * multi-second straggler. After each pass the elements that became singletons are frozen at their
+ * final positions and dropped, so the subset shrinks and the loop exits as soon as nothing stays
+ * tied -- a prefix that resolves in one window costs one pass, not the full cap. Whatever stays
+ * tied after the pass cap is finished by one comparison cleanup, so correctness never needs it.
+ *
+ * Correctness equals the lexicographic comparison sort under the requested `polarity` exactly:
+ * - The packed prefix is the top `P` bits of the same big-endian leading-byte value the windows
+ *   pack, so an unsigned compare of the `uint64` reproduces unsigned-byte order over those bits.
+ *   Because `P` is not necessarily a byte multiple, a packed-key match proves only `floor(P/8)`
+ *   *whole* leading bytes equal; the windows and the comparison cleanup therefore both begin at
+ *   `floor(P/8)`, and the iterative run rank is seeded from the packed keys (not a wider prefix) so
+ *   two strings tied on `P` bits are left in one run rather than frozen apart on their lower bits.
+ * - Each window packs bytes big-endian just as the first key does, so an unsigned comparison of the
+ *   packed window reproduces unsigned-byte order over those bytes -- the same ordering the
+ *   comparison path uses.
+ * - A string with no byte left in a window packs to zero (the minimum), so a shorter string that is
+ *   a prefix of a longer one sorts first, reproducing the comparison sort's shorter-is-less length
+ *   tie-break. The residual case where a shorter string and a longer one agree on every byte and
+ *   the longer one's tail is all zero bytes cannot be separated by any window; it is resolved by
+ *   the final comparison cleanup, whose `compare_suffix` returns the length difference.
+ * - The class bit sits just below the segment field -- above every prefix bit -- so a non-null
+ *   string can never set it, and nulls collect on the polarity's requested side within their
+ *   segment with no sentinel prefix needed (closing the all-0xFF-vs-null collision the sentinel
+ *   scheme risked). A null is thus position-final after the first pass; the tie-break never counts
+ *   it tied, so it keeps its first-pass slot, exactly as the comparison path places it.
+ * - `polarity` folds the requested (order, null_order) into these keys: `element_class` sets the
+ *   class bit so nulls land on the requested side, and a descending sort XOR-complements only the
+ *   byte fields (the packed prefix and every window), reversing byte order while leaving the
+ *   segment and null placement untouched. The complement sends an exhausted window's zero to the
+ *   maximum, so the shorter-is-less rule and the cleanup's length tie-break both invert to
+ *   shorter-is-greater -- the length-uniform exhausted-run drop stays valid under either order (it
+ *   reads real lengths and equal-key runs, both complement-invariant). ASCENDING / nulls-after
+ *   keeps every key bit-identical to the shipped configuration (`element_class` and the complement
+ *   are both no-ops there).
+ *
+ * Unlike a rank-encoding approach, no sort of the distinct strings is performed, so the per-pass
+ * cost does not grow with key cardinality. All four explicit (order, null_order) combinations
+ * engage this path; a zero-null column is relaxed to nulls-last so its keys match the shipped
+ * ascending configuration exactly.
+ *
+ * @param input The STRING column whose elements are sorted within each segment
+ * @param segment_offsets Identifies the segments to sort within
+ * @param polarity The requested sort direction and null placement, folded into the radix keys
+ * @param stream CUDA stream used for device memory operations and kernel launches
+ * @param mr Device memory resource used to allocate the returned column's device memory
+ * @return Indices that map the column to a segmented sorted order
+ */
+[[nodiscard]] std::unique_ptr<column> fast_segmented_sorted_order_strings_prefix(
+  column_view const& input,
+  column_view const& segment_offsets,
+  sort_polarity polarity,
+  rmm::cuda_stream_view stream,
+  rmm::device_async_resource_ref mr);
+
 }  // namespace detail
 }  // namespace cudf

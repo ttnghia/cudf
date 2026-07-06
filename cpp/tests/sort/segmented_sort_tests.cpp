@@ -430,6 +430,21 @@ TEST_F(SegmentedSortInt, FastPathPartialOffsetsPackedRadix)
   CUDF_TEST_EXPECT_TABLES_EQUAL(result->view(), cudf::table_view{{expected}});
 }
 
+// Partial-coverage offsets {3, 7} on a STRING column route to the STRING prefix fast path when the
+// guard is absent; with the guard they take the comparison path, which sorts only [3, 7).
+TEST_F(SegmentedSortInt, FastPathPartialOffsetsStrings)
+{
+  cudf::test::strings_column_wrapper col{
+    "a0", "a1", "a2", "banana", "apple", "cherry", "date", "z7", "z8", "z9"};
+  cudf::test::strings_column_wrapper expected{
+    "a0", "a1", "a2", "apple", "banana", "cherry", "date", "z7", "z8", "z9"};
+  column_wrapper<int> segments{{3, 7}};
+  auto const input = cudf::table_view{{col}};
+  auto result      = cudf::segmented_sort_by_key(
+    input, input, segments, {cudf::order::ASCENDING}, {cudf::null_order::AFTER});
+  CUDF_TEST_EXPECT_TABLES_EQUAL(result->view(), cudf::table_view{{expected}});
+}
+
 // Single-index offsets (num_segments == 0) sort no values -- the documented contract. The guard
 // requires at least two offsets, so these fall through to the comparison/CUB path (which treats
 // zero segments as identity) rather than a fast path whose zero-width segment field would shift a

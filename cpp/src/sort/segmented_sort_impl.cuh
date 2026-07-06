@@ -336,6 +336,25 @@ std::unique_ptr<column> segmented_sorted_order_common(
       keys.column(0), segment_offsets, col_order, stream, mr);
   }
 
+  // fast-path for a single STRING key column sorted ascending with nulls last (unstable only).
+  // A radix sort over a packed key of each element's leading bytes orders them, and the rare prefix
+  // ties are resolved by successive byte windows and a final byte comparison of the remainder,
+  // replacing the lexicographic comparison sort without any cost that scales with key cardinality.
+  // The order and null precedence must be stated explicitly so any other configuration -- including
+  // the defaulted-argument cases -- falls through to the comparison path below with its order
+  // unchanged.
+  if constexpr (method == sort_method::UNSTABLE) {
+    // As at the fixed-width gate: the cheap scalar checks precede the synchronizing coverage probe.
+    if (keys.num_columns() == 1 and keys.column(0).type().id() == type_id::STRING and
+        (segment_offsets.size() > 0) and column_order.size() == 1 and
+        column_order.front() == order::ASCENDING and null_precedence.size() == 1 and
+        null_precedence.front() == null_order::AFTER and
+        fast_path_offsets_cover_all_rows(segment_offsets, keys.num_rows(), stream)) {
+      return fast_segmented_sorted_order_strings_prefix(
+        keys.column(0), segment_offsets, sort_polarity{}, stream, mr);
+    }
+  }
+
   // Get segment id of each element in all segments.
   auto segment_ids = get_segment_indices(keys.num_rows(), segment_offsets, stream);
 

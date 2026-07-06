@@ -14,6 +14,8 @@
 
 #include <algorithm>
 #include <limits>
+#include <random>
+#include <string>
 #include <vector>
 
 using namespace cudf::test::iterators;
@@ -183,6 +185,183 @@ TEST_F(SortListsInt, NullRows)
   CUDF_TEST_EXPECT_COLUMNS_EQUAL(stable_sorted_lists->view(), l);
 }
 
+using SortListsString = SortLists<cudf::string_view>;
+
+// E = STRING: the element type Spark `array_sort(array<string>)` lowers to. Uses the default order
+// (ascending, nulls-after). Covers nulls-last element ordering within a row and a preserved null
+// list row.
+TEST_F(SortListsString, Strings)
+{
+  using StrLCW = cudf::test::lists_column_wrapper<cudf::string_view>;
+
+  // Row 0 holds a null element (at index 2) among unsorted strings; row 2 is a whole null list row.
+  std::vector<bool> const valids{true, true, false, true};
+  StrLCW input{{StrLCW{{"pear", "apple", "fig", "kiwi"}, null_at(2)},
+                StrLCW{"banana"},
+                StrLCW{"unused"},
+                StrLCW{"melon", "cherry"}},
+               valids.begin()};
+
+  // Default order ascending, nulls-after: row 0's non-null strings sort to {apple, kiwi, pear}
+  // with the null moved to the end. The null slot's placeholder value is not compared. Row 2 stays
+  // a null list row, unchanged by the sort.
+  StrLCW expected{{StrLCW{{"apple", "kiwi", "pear", "fig"}, null_at(3)},
+                   StrLCW{"banana"},
+                   StrLCW{"unused"},
+                   StrLCW{"cherry", "melon"}},
+                  valids.begin()};
+
+  auto const [sorted_lists, stable_sorted_lists] =
+    generate_sorted_lists(cudf::lists_column_view{input}, {}, {});
+  CUDF_TEST_EXPECT_COLUMNS_EQUAL(sorted_lists->view(), expected);
+  CUDF_TEST_EXPECT_COLUMNS_EQUAL(stable_sorted_lists->view(), expected);
+}
+
+// The Prefix* tests target the STRING ascending/nulls-after fast path, which orders elements by a
+// packed key of their leading bytes and then resolves prefix ties by successive byte windows and a
+// final byte comparison. Each asserts both sort_lists (the fast path) and stable_sort_lists (the
+// comparison path) match a host-built expected column, so any divergence in the fast path from the
+// comparison semantics is caught directly.
+
+// Distinct strings whose first eight bytes are identical force the prefix to tie, exercising the
+// full-string tie-break. "abcdefgh" is a proper prefix of the other two, so it sorts first.
+TEST_F(SortListsString, PrefixEqualFirstEightBytes)
+{
+  using StrLCW = cudf::test::lists_column_wrapper<cudf::string_view>;
+
+  StrLCW input{{"abcdefgh1", "abcdefgh0", "abcdefgh"}};
+  StrLCW expected{{"abcdefgh", "abcdefgh0", "abcdefgh1"}};
+
+  auto const [sorted_lists, stable_sorted_lists] = generate_sorted_lists(
+    cudf::lists_column_view{input}, cudf::order::ASCENDING, cudf::null_order::AFTER);
+  CUDF_TEST_EXPECT_COLUMNS_EQUAL(sorted_lists->view(), expected);
+  CUDF_TEST_EXPECT_COLUMNS_EQUAL(stable_sorted_lists->view(), expected);
+}
+
+// A short string that is a prefix of a longer one must sort first ("aa" < "aaa"). With both under
+// eight bytes, the longer string's prefix has a non-zero byte where the shorter is zero-padded, so
+// the prefix alone already orders them.
+TEST_F(SortListsString, PrefixSubstringShorterFirst)
+{
+  using StrLCW = cudf::test::lists_column_wrapper<cudf::string_view>;
+
+  StrLCW input{{"aaa", "aa", "a"}};
+  StrLCW expected{{"a", "aa", "aaa"}};
+
+  auto const [sorted_lists, stable_sorted_lists] = generate_sorted_lists(
+    cudf::lists_column_view{input}, cudf::order::ASCENDING, cudf::null_order::AFTER);
+  CUDF_TEST_EXPECT_COLUMNS_EQUAL(sorted_lists->view(), expected);
+  CUDF_TEST_EXPECT_COLUMNS_EQUAL(stable_sorted_lists->view(), expected);
+}
+
+// Empty strings carry an all-zero prefix and must sort before any non-empty string. Multiple empty
+// strings tie on both prefix and full string, so their relative order is unconstrained.
+TEST_F(SortListsString, PrefixEmptyStringsFirst)
+{
+  using StrLCW = cudf::test::lists_column_wrapper<cudf::string_view>;
+
+  StrLCW input{{"banana", "", "apple", "", "fig"}};
+  StrLCW expected{{"", "", "apple", "banana", "fig"}};
+
+  auto const [sorted_lists, stable_sorted_lists] = generate_sorted_lists(
+    cudf::lists_column_view{input}, cudf::order::ASCENDING, cudf::null_order::AFTER);
+  CUDF_TEST_EXPECT_COLUMNS_EQUAL(sorted_lists->view(), expected);
+  CUDF_TEST_EXPECT_COLUMNS_EQUAL(stable_sorted_lists->view(), expected);
+}
+
+// Several null elements in one row must collect at the end under null_order::AFTER while the
+// non-null strings sort ascending ahead of them. The null slots' placeholder values are not
+// compared.
+TEST_F(SortListsString, PrefixMultipleNullsLast)
+{
+  using StrLCW = cudf::test::lists_column_wrapper<cudf::string_view>;
+
+  StrLCW input{StrLCW{{"pear", "apple", "fig", "kiwi", "lime"}, nulls_at({1, 3})}};
+  StrLCW expected{StrLCW{{"fig", "lime", "pear", "apple", "kiwi"}, nulls_at({3, 4})}};
+
+  auto const [sorted_lists, stable_sorted_lists] = generate_sorted_lists(
+    cudf::lists_column_view{input}, cudf::order::ASCENDING, cudf::null_order::AFTER);
+  CUDF_TEST_EXPECT_COLUMNS_EQUAL(sorted_lists->view(), expected);
+  CUDF_TEST_EXPECT_COLUMNS_EQUAL(stable_sorted_lists->view(), expected);
+}
+
+// A whole null list row sits next to populated rows; the sort leaves the null row untouched and
+// orders the others, exercising the fast path alongside a null row in the same column.
+TEST_F(SortListsString, PrefixAllNullListRow)
+{
+  using StrLCW = cudf::test::lists_column_wrapper<cudf::string_view>;
+
+  std::vector<bool> const valids{true, false, true};
+  StrLCW input{{StrLCW{"cherry", "apple", "banana"}, StrLCW{"unused"}, StrLCW{"date", "egg"}},
+               valids.begin()};
+  StrLCW expected{{StrLCW{"apple", "banana", "cherry"}, StrLCW{"unused"}, StrLCW{"date", "egg"}},
+                  valids.begin()};
+
+  auto const [sorted_lists, stable_sorted_lists] = generate_sorted_lists(
+    cudf::lists_column_view{input}, cudf::order::ASCENDING, cudf::null_order::AFTER);
+  CUDF_TEST_EXPECT_COLUMNS_EQUAL(sorted_lists->view(), expected);
+  CUDF_TEST_EXPECT_COLUMNS_EQUAL(stable_sorted_lists->view(), expected);
+}
+
+// Every element of the row shares one eight-byte prefix, so the entire row is a single prefix tie
+// run resolved wholly by full-string comparison. This is the worst case for the tie-break: one run
+// spanning the whole segment.
+TEST_F(SortListsString, PrefixWholeRowShared)
+{
+  using StrLCW = cudf::test::lists_column_wrapper<cudf::string_view>;
+
+  StrLCW input{{"prefix__zebra", "prefix__apple", "prefix__mango", "prefix__"}};
+  StrLCW expected{{"prefix__", "prefix__apple", "prefix__mango", "prefix__zebra"}};
+
+  auto const [sorted_lists, stable_sorted_lists] = generate_sorted_lists(
+    cudf::lists_column_view{input}, cudf::order::ASCENDING, cudf::null_order::AFTER);
+  CUDF_TEST_EXPECT_COLUMNS_EQUAL(sorted_lists->view(), expected);
+  CUDF_TEST_EXPECT_COLUMNS_EQUAL(stable_sorted_lists->view(), expected);
+}
+
+// UTF-8 multibyte strings must order by raw byte value, which is what the fast path's byte-packed
+// prefix and full-string compare both use. The two-byte (é, U+00E9 -> 0xC3 0xA9), three-byte
+// (€, U+20AC -> 0xE2 0x82 0xAC), and four-byte (U+1F600 -> 0xF0 0x9F 0x98 0x80) lead bytes order
+// after the ASCII strings and by lead-byte class among themselves (0xC3 < 0xE2 < 0xF0), so all four
+// UTF-8 sequence lengths are pinned through the packed key.
+TEST_F(SortListsString, PrefixUtf8Multibyte)
+{
+  using StrLCW = cudf::test::lists_column_wrapper<cudf::string_view>;
+
+  StrLCW input{
+    {"\xE2\x82\xAC\x75\x72\x6F", "zoo", "\xF0\x9F\x98\x80", "\xC3\xA9\x70\xC3\xA9\x65", "apple"}};
+  StrLCW expected{
+    {"apple", "zoo", "\xC3\xA9\x70\xC3\xA9\x65", "\xE2\x82\xAC\x75\x72\x6F", "\xF0\x9F\x98\x80"}};
+
+  auto const [sorted_lists, stable_sorted_lists] = generate_sorted_lists(
+    cudf::lists_column_view{input}, cudf::order::ASCENDING, cudf::null_order::AFTER);
+  CUDF_TEST_EXPECT_COLUMNS_EQUAL(sorted_lists->view(), expected);
+  CUDF_TEST_EXPECT_COLUMNS_EQUAL(stable_sorted_lists->view(), expected);
+}
+
+// Multiple rows in one column exercise the segment_id key field: each row sorts independently and
+// the per-row prefix ties (rows 0 and 3 share an eight-byte prefix within the row) resolve without
+// crossing row boundaries. An empty row (row 1) checks that dense segment-ordinal labeling skips a
+// zero-length segment without misaligning the populated rows around it.
+TEST_F(SortListsString, PrefixMultipleSegments)
+{
+  using StrLCW = cudf::test::lists_column_wrapper<cudf::string_view>;
+
+  StrLCW input{StrLCW{"commonpx_b", "commonpx_a", "commonpx_c"},
+               StrLCW{},
+               StrLCW{"melon", "apple", "cherry"},
+               StrLCW{"sharedpx2", "sharedpx0", "sharedpx1"}};
+  StrLCW expected{StrLCW{"commonpx_a", "commonpx_b", "commonpx_c"},
+                  StrLCW{},
+                  StrLCW{"apple", "cherry", "melon"},
+                  StrLCW{"sharedpx0", "sharedpx1", "sharedpx2"}};
+
+  auto const [sorted_lists, stable_sorted_lists] = generate_sorted_lists(
+    cudf::lists_column_view{input}, cudf::order::ASCENDING, cudf::null_order::AFTER);
+  CUDF_TEST_EXPECT_COLUMNS_EQUAL(sorted_lists->view(), expected);
+  CUDF_TEST_EXPECT_COLUMNS_EQUAL(stable_sorted_lists->view(), expected);
+}
+
 namespace {
 // Sorts `input` under the given explicit (order, null_order) -- ascending / nulls-after by default
 // -- through the fast path (`sort_lists`) and the comparison path (`stable_sort_lists`), asserting
@@ -226,6 +405,533 @@ std::unique_ptr<cudf::column> as_single_row_list(std::unique_ptr<cudf::column> l
   return cudf::make_lists_column(1, offsets.release(), std::move(leaf), 0, {});
 }
 }  // namespace
+
+// Short distinct strings, each shorter than the packed key, ordered entirely by the key with no
+// tie-break. Adds multi-byte discrimination ("aaa" < "ab" turns on the second byte) beyond the
+// simpler substring case.
+TEST_F(SortListsString, PrefixShortStrings)
+{
+  using StrLCW = cudf::test::lists_column_wrapper<cudf::string_view>;
+
+  StrLCW input{{"aaa", "aa", "a", "ab", "b"}};
+  StrLCW expected{{"a", "aa", "aaa", "ab", "b"}};
+  expect_both_sort_paths_match(cudf::lists_column_view{input}, expected);
+}
+
+// Shared-prefix data with a null and a duplicate: the realistic regime the shared_prefix_len
+// benchmark axis targets, where distinct strings agree on a leading run of bytes so the packed key
+// is uninformative and the tie-break does the real ordering. Row 0's strings share an eight-byte
+// "AAAAAAAA" prefix, forcing the comparison past the leading bytes, and include a null (sorts last
+// under null_order::AFTER) and a duplicate. Row 1's strings share a five-byte "food_" prefix.
+TEST_F(SortListsString, PrefixSharedPrefixWithNullAndDuplicate)
+{
+  using StrLCW = cudf::test::lists_column_wrapper<cudf::string_view>;
+
+  StrLCW input{
+    StrLCW{{"AAAAAAAAzebra", "AAAAAAAAapple", "AAAAAAAAmango", "unused", "AAAAAAAAapple"},
+           null_at(3)},
+    StrLCW{"food_pear", "food_kiwi", "food_pear"}};
+  StrLCW expected{
+    StrLCW{{"AAAAAAAAapple", "AAAAAAAAapple", "AAAAAAAAmango", "AAAAAAAAzebra", "unused"},
+           null_at(4)},
+    StrLCW{"food_kiwi", "food_pear", "food_pear"}};
+  expect_both_sort_paths_match(cudf::lists_column_view{input}, expected);
+}
+
+// Guards the null/0xFF distinction. A naive 0xFF..FF null sentinel would collide with a non-null
+// string whose leading bytes are all 0xFF, making the two indistinguishable to the radix and
+// leaving the non-null 0xFF strings unordered and misplaced relative to the real null under
+// null_order::AFTER. `packed_key_builder`'s dedicated is_null bit avoids that by construction: it
+// sits above every prefix bit a non-null value can set, so the null separates cleanly in the first
+// pass. The two 0xFF strings instead tie with each other -- they run 72 and 73 bytes of 0xFF, so
+// every byte window the iterative passes inspect is also all-0xFF, and they reach the comparison
+// cleanup as one run. The correct order sorts the non-nulls ascending by unsigned byte value --
+// both 0xFF strings after the ASCII strings, the shorter 0xFF string before the longer (a prefix
+// sorts first) -- with the genuine null last. Built against a host reference so the fast path's
+// divergence is caught directly.
+TEST_F(SortListsString, PrefixNullSentinelCollisionFF)
+{
+  using StrCW = cudf::test::strings_column_wrapper;
+
+  std::string const ff72(72, '\xff');
+  std::string const ff73(73, '\xff');
+
+  // One row: two ASCII strings, two all-0xFF strings, and a genuine null (placeholder value
+  // unused).
+  std::vector<std::string> const in_strings{"apple", ff73, "mango", ff72, ""};
+  std::vector<bool> const in_valids{true, true, true, true, false};
+
+  // Host reference: non-nulls ascending by raw bytes (0xFF strings sort after ASCII; ff72 < ff73 as
+  // a prefix), then the null last under null_order::AFTER.
+  std::vector<std::string> const ex_strings{"apple", "mango", ff72, ff73, ""};
+  std::vector<bool> const ex_valids{true, true, true, true, false};
+
+  auto const make_single_row_list = [](std::vector<std::string> const& strs,
+                                       std::vector<bool> const& valids) {
+    StrCW leaf{strs.begin(), strs.end(), valids.begin()};
+    auto const n = static_cast<cudf::size_type>(strs.size());
+    cudf::test::fixed_width_column_wrapper<cudf::size_type> offsets{0, n};
+    return cudf::make_lists_column(1, offsets.release(), leaf.release(), 0, {});
+  };
+
+  auto const input    = make_single_row_list(in_strings, in_valids);
+  auto const expected = make_single_row_list(ex_strings, ex_valids);
+  expect_both_sort_paths_match(cudf::lists_column_view{input->view()}, expected->view());
+}
+
+// A single row whose non-null elements all share an 80-byte prefix -- past the 71 bytes any
+// iterative radix window reaches (see PrefixTrueHeapsortRun) -- forms one prefix tie run longer
+// than TIE_HEAPSORT_THRESHOLD, so the tie-break takes its heapsort branch, not insertion sort.
+// Exceeding STRINGS_GRAD_WARP_CAP (64) keeps the column on the prefix path. The run holds seventy
+// distinct two-digit-tail strings plus two exact duplicates (72 non-null) in a deterministic
+// shuffle, with two nulls that collect last under null_order::AFTER, so heapsort is exercised
+// alongside null placement and checked against std::sort and the comparison path.
+TEST_F(SortListsString, PrefixSharedPrefixHeapsortRun)
+{
+  std::string const prefix(80, 'A');  // 80 > 7 + 8*8 = 71, so ties survive every iterative window.
+  std::vector<std::string> non_null;
+  for (int i = 0; i < 70; ++i) {
+    non_null.push_back(prefix + std::to_string(i / 10) + std::to_string(i % 10));
+  }
+  // Two exact duplicates land among genuine distinct strings; their relative order is immaterial.
+  non_null.push_back(prefix + "05");
+  non_null.push_back(prefix + "17");
+
+  // The fast path is unstable, so the input must arrive unsorted to prove the heapsort orders it.
+  auto shuffled = non_null;
+  std::shuffle(shuffled.begin(), shuffled.end(), std::mt19937{0xC0'FFEE});
+
+  // Interleave two nulls so the row mixes the long shared-prefix run with null elements.
+  auto const null_pos_a = shuffled.size() / 3;
+  auto const null_pos_b = (shuffled.size() * 2) / 3 + 1;
+  std::vector<std::string> in_strings;
+  std::vector<bool> in_valids;
+  for (std::size_t i = 0; i <= shuffled.size(); ++i) {
+    if (i == null_pos_a || i == null_pos_b) {
+      in_strings.emplace_back("");  // Placeholder for a null element; its value is never compared.
+      in_valids.push_back(false);
+    }
+    if (i < shuffled.size()) {
+      in_strings.push_back(shuffled[i]);
+      in_valids.push_back(true);
+    }
+  }
+
+  // Host reference: non-null strings ascending by raw bytes, the two nulls last (nulls AFTER).
+  auto sorted = non_null;
+  std::sort(sorted.begin(), sorted.end());
+  std::vector<std::string> ex_strings = sorted;
+  std::vector<bool> ex_valids(sorted.size(), true);
+  ex_strings.emplace_back("");
+  ex_valids.push_back(false);
+  ex_strings.emplace_back("");
+  ex_valids.push_back(false);
+
+  using StrCW                     = cudf::test::strings_column_wrapper;
+  auto const make_single_row_list = [](std::vector<std::string> const& strs,
+                                       std::vector<bool> const& valids) {
+    StrCW leaf{strs.begin(), strs.end(), valids.begin()};
+    auto const n = static_cast<cudf::size_type>(strs.size());
+    cudf::test::fixed_width_column_wrapper<cudf::size_type> offsets{0, n};
+    return cudf::make_lists_column(1, offsets.release(), leaf.release(), 0, {});
+  };
+
+  auto const input    = make_single_row_list(in_strings, in_valids);
+  auto const expected = make_single_row_list(ex_strings, ex_valids);
+  expect_both_sort_paths_match(cudf::lists_column_view{input->view()}, expected->view());
+}
+
+// Worst case for the iterative-radix tie-break: leading runs far longer than the eight-byte key,
+// so the order is decided only after several windows past the initial prefix. Row 0 mixes a
+// twenty-byte shared prefix (more than twice the eight-byte key and five times the four-byte key)
+// with distinct tails of varying length (mixed run lengths), two exact duplicates, an empty string,
+// a whole-element null, and -- crucially -- a length tie that no byte window can resolve: a string
+// and that same string plus a trailing embedded null byte, separable only by the comparison
+// cleanup's shorter-is-less rule. Row 1 is an outlier of thousands of strings sharing a twenty-four
+// byte prefix with distinct four-digit tails, exercising the pass cap and the parallel re-sort that
+// replaces the serial straggler. The host reference sorts each row's non-null strings by
+// std::string ordering (raw-byte lexicographic with the same length tie-break) and appends the
+// nulls last, and the assertion checks the fast path against the comparison path.
+TEST_F(SortListsString, PrefixIterativeDeepLongSharedPrefix)
+{
+  using StrCW = cudf::test::strings_column_wrapper;
+
+  std::string const prefix0(20, 'A');  // Twenty shared bytes: > 2x the 8-byte key, 5x the 4-byte.
+  std::vector<std::string> row0_non_null{
+    prefix0 + "zebra",
+    prefix0 + "ant",  // Shorter tail than its neighbors -> mixed run lengths within the shared run.
+    prefix0 + "mango",
+    prefix0 + "ant",                 // Exact duplicate of an earlier element.
+    prefix0,                         // The shared prefix with no tail (the prefix-of element).
+    prefix0 + std::string(1, '\0'),  // Same bytes as `prefix0` plus a trailing embedded null byte;
+                                     // a pure length tie that no byte window can separate.
+    prefix0 + "mango",               // Second exact duplicate.
+    ""};                             // Empty string: all-zero key, must sort first in the row.
+
+  // Row 1: a large outlier sharing a long prefix, with distinct tails forcing many tied passes.
+  std::string const prefix1(24, 'Q');  // Twenty-four shared bytes -> three windows past an 8B key.
+  std::vector<std::string> row1;
+  row1.reserve(5'000);
+  for (int i = 0; i < 5'000; ++i) {
+    auto tail = std::to_string(i);
+    tail.insert(tail.begin(), 4 - tail.size(), '0');  // Zero-pad to four digits for a fixed width.
+    row1.push_back(prefix1 + tail);
+  }
+  // Arrive unsorted so the sort must do real work; a fixed shuffle keeps the test deterministic.
+  std::shuffle(row1.begin(), row1.end(), std::mt19937{0x5EED});
+
+  // Assemble the leaf strings and validity: row 0 (with one null appended), then row 1 (no nulls).
+  std::vector<std::string> in_strings;
+  std::vector<bool> in_valids;
+  for (auto const& s : row0_non_null) {
+    in_strings.push_back(s);
+    in_valids.push_back(true);
+  }
+  in_strings.emplace_back("");  // Placeholder for a null element; its value is never compared.
+  in_valids.push_back(false);
+  auto const row0_len = static_cast<cudf::size_type>(in_strings.size());
+  for (auto const& s : row1) {
+    in_strings.push_back(s);
+    in_valids.push_back(true);
+  }
+  auto const total_len = static_cast<cudf::size_type>(in_strings.size());
+
+  // Host reference: each row's non-null strings ascending by std::string (raw-byte order with the
+  // same length tie-break), then the row 0 null last.
+  auto row0_sorted = row0_non_null;
+  std::sort(row0_sorted.begin(), row0_sorted.end());
+  auto row1_sorted = row1;
+  std::sort(row1_sorted.begin(), row1_sorted.end());
+
+  std::vector<std::string> ex_strings;
+  std::vector<bool> ex_valids;
+  for (auto const& s : row0_sorted) {
+    ex_strings.push_back(s);
+    ex_valids.push_back(true);
+  }
+  ex_strings.emplace_back("");
+  ex_valids.push_back(false);
+  for (auto const& s : row1_sorted) {
+    ex_strings.push_back(s);
+    ex_valids.push_back(true);
+  }
+
+  auto const make_two_row_list = [&](std::vector<std::string> const& strs,
+                                     std::vector<bool> const& valids) {
+    StrCW leaf{strs.begin(), strs.end(), valids.begin()};
+    cudf::test::fixed_width_column_wrapper<cudf::size_type> offsets{0, row0_len, total_len};
+    return cudf::make_lists_column(2, offsets.release(), leaf.release(), 0, {});
+  };
+
+  auto const input    = make_two_row_list(in_strings, in_valids);
+  auto const expected = make_two_row_list(ex_strings, ex_valids);
+  expect_both_sort_paths_match(cudf::lists_column_view{input->view()}, expected->view());
+}
+
+// Exercises the length-uniform exhausted-run drop directly: a run of many byte-identical strings
+// longer than the packed key enters the window loop as one tie run, and once the windows cover
+// their length the run is length-uniform and exhausted, so it is frozen in one step instead of
+// being dragged through the pass cap and the comparison cleanup. A distinct-tailed string (a
+// singleton) and a shorter proper prefix round out the row. The frozen order must still match the
+// comparison path.
+TEST_F(SortListsString, PrefixExhaustedIdenticalRunDropped)
+{
+  using StrCW = cudf::test::strings_column_wrapper;
+  std::vector<std::string> in;
+  for (int i = 0; i < 40; ++i) {
+    in.emplace_back("abcdefghijkl");  // Forty copies of one 12-byte string: a byte-identical run.
+  }
+  in.emplace_back("abcdefghijkZ");  // Shares the twelve-byte prefix but the last byte: a singleton.
+  in.emplace_back("abcdefgh");      // Shorter proper prefix: its own run, sorts first.
+
+  auto expected = in;
+  std::sort(expected.begin(), expected.end());
+
+  auto const input        = as_single_row_list(StrCW{in.begin(), in.end()}.release());
+  auto const expected_col = as_single_row_list(StrCW{expected.begin(), expected.end()}.release());
+  expect_both_sort_paths_match(cudf::lists_column_view{input->view()}, expected_col->view());
+}
+
+// Regression guard for the drop's length-uniformity condition. A string and its zero-extension (the
+// same bytes plus a trailing embedded null) collide in every byte window and in the packed key --
+// only their length differs -- so the stable radix keeps whichever arrived first. Here the LONGER
+// one is placed before the shorter, so the stable order is the WRONG lexicographic order (a proper
+// prefix sorts first). An exhaustion-only drop would freeze that wrong order; the length-uniform
+// guard keeps this mixed-length run for the comparison cleanup, which orders shorter-first. The
+// shared bytes exceed the eight-byte window and the packed key, so the run exhausts well inside the
+// loop where a naive drop would fire.
+TEST_F(SortListsString, PrefixZeroExtensionLongerFirstNotDropped)
+{
+  using StrCW = cudf::test::strings_column_wrapper;
+  std::string const base(20, 'A');   // Twenty shared bytes.
+  std::string const shorter = base;  // Length twenty.
+  std::string const longer =
+    base + std::string(1, '\0');  // Length twenty-one: `base` + a NUL byte.
+
+  // Longer first, then shorter: stable radix keeps this order, so only a length-aware step can fix
+  // it. Two strings diverging at the twenty-first byte keep the run non-trivial and resolve as
+  // singletons.
+  std::vector<std::string> in{longer, shorter, base + "B", base + "C"};
+  auto expected = in;
+  std::sort(expected.begin(), expected.end());  // shorter < longer < base+"B" < base+"C".
+
+  auto const input        = as_single_row_list(StrCW{in.begin(), in.end()}.release());
+  auto const expected_col = as_single_row_list(StrCW{expected.begin(), expected.end()}.release());
+  expect_both_sort_paths_match(cudf::lists_column_view{input->view()}, expected_col->view());
+}
+
+// Targets the singleton-compaction path: a column mixing many rows whose elements are all distinct
+// in their first bytes (resolved by the first pass, so they must be left untouched by the iterative
+// windows) with one deep-shared-prefix row that drives several windows. The compaction must extract
+// only the deep row's still-tied elements, re-sort just those, and scatter them back without
+// disturbing the already-resolved rows. Built as many short distinct-prefix rows surrounding one
+// giant row of strings sharing a long prefix; the host reference sorts each row independently so a
+// stray reorder of any resolved row -- or a misplaced scatter -- is caught against the comparison
+// path.
+TEST_F(SortListsString, PrefixCompactionMixedSingletonAndDeepRows)
+{
+  using StrCW = cudf::test::strings_column_wrapper;
+
+  std::vector<std::vector<std::string>> rows;
+  // Twelve "easy" rows: every element differs within the first byte, so each is its own run after
+  // the first pass and the iterative passes must not touch them.
+  for (int r = 0; r < 12; ++r) {
+    rows.push_back({std::string(1, static_cast<char>('a' + r)) + "_zzz",
+                    std::string(1, static_cast<char>('A' + r)) + "_aaa",
+                    std::string(1, static_cast<char>('0' + r)) + "_mmm"});
+  }
+  // One "deep" row: 1500 strings sharing a thirty-two byte prefix (four windows past an 8-byte
+  // key), distinct four-digit tails, shuffled. This is the only row the compaction should re-sort.
+  std::string const deep_prefix(32, 'D');
+  std::vector<std::string> deep;
+  deep.reserve(1'500);
+  for (int i = 0; i < 1'500; ++i) {
+    auto tail = std::to_string(i);
+    tail.insert(tail.begin(), 4 - tail.size(), '0');
+    deep.push_back(deep_prefix + tail);
+  }
+  std::shuffle(deep.begin(), deep.end(), std::mt19937{0xD00D});
+  // Place the deep row in the middle so resolved rows sit on both sides of the compacted block.
+  rows.insert(rows.begin() + 6, deep);
+
+  // Flatten to leaf strings + per-row offsets; build the host-sorted expected the same way.
+  std::vector<std::string> in_strings;
+  std::vector<std::string> ex_strings;
+  std::vector<cudf::size_type> offsets{0};
+  for (auto const& row : rows) {
+    for (auto const& s : row) {
+      in_strings.push_back(s);
+    }
+    auto sorted = row;
+    std::sort(sorted.begin(), sorted.end());
+    for (auto const& s : sorted) {
+      ex_strings.push_back(s);
+    }
+    offsets.push_back(static_cast<cudf::size_type>(in_strings.size()));
+  }
+
+  auto const num_rows  = static_cast<cudf::size_type>(rows.size());
+  auto const make_list = [&](std::vector<std::string> const& strs) {
+    StrCW leaf{strs.begin(), strs.end()};
+    cudf::test::fixed_width_column_wrapper<cudf::size_type> off(offsets.begin(), offsets.end());
+    return cudf::make_lists_column(num_rows, off.release(), leaf.release(), 0, {});
+  };
+
+  auto const input    = make_list(in_strings);
+  auto const expected = make_list(ex_strings);
+  expect_both_sort_paths_match(cudf::lists_column_view{input->view()}, expected->view());
+}
+
+// Guards the packed-key tie-break offset. The single-uint64 first key holds only P prefix bits,
+// where P follows the segment-label width S = bit_width(num_segments). The labels are dense
+// segment ordinals, so a single list row is one segment: S = bit_width(1) = 1, and with nulls
+// present P = 64 - 1 - 1 = 62, which is NOT a byte multiple. The key thus proves only
+// floor(62/8) = 7 whole leading bytes equal plus the top six bits of byte 7 -- never byte 7's low
+// two bits. The two probe strings "AAAAAA\0\x01" and "AAAAAA\0\x02" agree on their first seven
+// bytes and on byte 7's top six bits (both 0x01 and 0x02 are below 4, so byte 7 >> 2 is 0 for
+// each), so they tie on the packed key; they differ only in byte 7's low two bits. A correct
+// tie-break resumes its byte windows at byte 7 and separates them (\x01 < \x02); a stale offset
+// that skipped a fixed eight bytes would compare past both eight-byte strings, leave them tied,
+// and order them arbitrarily. The row holds 200 elements -- the probe pair, two nulls, and
+// distinct "B"-prefixed singletons -- but the count no longer drives S (one row fixes
+// num_segments = 1); it only keeps the probe pair its own two-element prefix-tie run amid many
+// first-pass singletons. Built against a host std::sort reference (raw-byte order, embedded nulls
+// and all) so any offset drift is caught against the comparison path.
+TEST_F(SortListsString, PrefixPackedKeyPartialByteTieOffset)
+{
+  using StrCW = cudf::test::strings_column_wrapper;
+
+  std::string const probe_lo = std::string("AAAAAA") + '\0' + '\x01';  // 8 bytes, byte 7 = 0x01.
+  std::string const probe_hi = std::string("AAAAAA") + '\0' + '\x02';  // 8 bytes, byte 7 = 0x02.
+
+  // Distinct "B"-prefixed fillers: each differs within its first bytes, so they resolve in the
+  // first pass and never merge into the probe pair's "A"-prefixed run. Two nulls force the layout's
+  // null bit (P = 62, not 63) and must collect last under null_order::AFTER.
+  std::vector<std::string> in_strings;
+  std::vector<bool> in_valids;
+  in_strings.push_back(probe_hi);  // Arrive out of order so the tie-break must reorder the pair.
+  in_valids.push_back(true);
+  in_strings.push_back(probe_lo);
+  in_valids.push_back(true);
+  in_strings.emplace_back("");  // Null placeholder; its value is never compared.
+  in_valids.push_back(false);
+  for (int i = 0; in_strings.size() < 199; ++i) {
+    auto tail = std::to_string(i);
+    tail.insert(tail.begin(), 4 - tail.size(), '0');
+    in_strings.push_back("B" + tail);
+    in_valids.push_back(true);
+  }
+  in_strings.emplace_back("");  // Second null placeholder.
+  in_valids.push_back(false);
+  // 200 elements total, but all in one list row => num_segments = 1 => S = bit_width(1) = 1, and
+  // with nulls P = 62, floor(P/8) = 7 (a non-byte-multiple P, the offset this test probes).
+  auto const num_elements = static_cast<cudf::size_type>(in_strings.size());
+
+  // Host reference: non-null strings ascending by raw bytes (std::string compares unsigned bytes
+  // and respects the embedded null), then the two nulls last.
+  std::vector<std::string> non_null;
+  for (std::size_t i = 0; i < in_strings.size(); ++i) {
+    if (in_valids[i]) { non_null.push_back(in_strings[i]); }
+  }
+  std::sort(non_null.begin(), non_null.end());
+  std::vector<std::string> ex_strings = non_null;
+  std::vector<bool> ex_valids(non_null.size(), true);
+  ex_strings.emplace_back("");
+  ex_valids.push_back(false);
+  ex_strings.emplace_back("");
+  ex_valids.push_back(false);
+
+  auto const make_single_row_list = [](std::vector<std::string> const& strs,
+                                       std::vector<bool> const& valids) {
+    StrCW leaf{strs.begin(), strs.end(), valids.begin()};
+    auto const n = static_cast<cudf::size_type>(strs.size());
+    cudf::test::fixed_width_column_wrapper<cudf::size_type> offsets{0, n};
+    return cudf::make_lists_column(1, offsets.release(), leaf.release(), 0, {});
+  };
+
+  auto const input    = make_single_row_list(in_strings, in_valids);
+  auto const expected = make_single_row_list(ex_strings, ex_valids);
+  // One list row fixes num_segments = 1 (so S = 1, P = 62); pin the element count only to keep the
+  // probe pair amid a bulk of first-pass singletons rather than alone.
+  EXPECT_EQ(num_elements, 200);
+  expect_both_sort_paths_match(cudf::lists_column_view{input->view()}, expected->view());
+}
+
+// One row mixes three adjacent null elements with genuine non-null tie groups: an eight-byte
+// "AAAAAAAA" shared-prefix trio with distinct tails (a first-pass prefix tie the windows resolve)
+// and a duplicated "apple" (an exact tie). Under null_order::AFTER the nulls collect last while
+// the non-nulls sort ascending, verifying that excluding nulls from the tie-break set (they are
+// position-final after the first pass, never counted tied) keeps their placement correct. Were a
+// null instead dragged through the windows, this would still be correct but slower; the check here
+// guards the exclusion against ever misplacing a null.
+TEST_F(SortListsString, PrefixNullRunsNeverTied)
+{
+  using StrCW = cudf::test::strings_column_wrapper;
+
+  std::vector<std::string> const in_strings{
+    "AAAAAAAA3", "", "", "", "AAAAAAAA1", "AAAAAAAA2", "zebra", "apple", "apple"};
+  std::vector<bool> const in_valids{true, false, false, false, true, true, true, true, true};
+
+  // Non-nulls ascending by raw bytes ('A' 0x41 < 'a' 0x61 < 'z' 0x7A), then the three nulls last.
+  std::vector<std::string> const ex_strings{
+    "AAAAAAAA1", "AAAAAAAA2", "AAAAAAAA3", "apple", "apple", "zebra", "", "", ""};
+  std::vector<bool> const ex_valids{true, true, true, true, true, true, false, false, false};
+
+  auto const make_single_row_list = [](std::vector<std::string> const& strs,
+                                       std::vector<bool> const& valids) {
+    StrCW leaf{strs.begin(), strs.end(), valids.begin()};
+    auto const n = static_cast<cudf::size_type>(strs.size());
+    cudf::test::fixed_width_column_wrapper<cudf::size_type> offsets{0, n};
+    return cudf::make_lists_column(1, offsets.release(), leaf.release(), 0, {});
+  };
+
+  auto const input    = make_single_row_list(in_strings, in_valids);
+  auto const expected = make_single_row_list(ex_strings, ex_valids);
+  expect_both_sort_paths_match(cudf::lists_column_view{input->view()}, expected->view());
+}
+
+// One row is nothing but ten copies of a single non-empty string -- a whole segment collapsing to
+// one all-duplicate tie run (equal keys and equal bytes, so their order is immaterial) -- beside
+// ordinary rows. A known suite gap: exercises the tie-break on a segment-spanning run of exact
+// duplicates, which must leave every row correctly ordered.
+TEST_F(SortListsString, PrefixWholeSegmentDuplicate)
+{
+  using StrCW = cudf::test::strings_column_wrapper;
+
+  std::vector<std::string> const dup_row(10, "duplicate");
+  std::vector<std::vector<std::string>> const rows{
+    {"cherry", "apple", "banana"}, dup_row, {"melon", "date", "fig"}};
+
+  std::vector<std::string> in_strings;
+  std::vector<std::string> ex_strings;
+  std::vector<cudf::size_type> offsets{0};
+  for (auto const& row : rows) {
+    for (auto const& s : row) {
+      in_strings.push_back(s);
+    }
+    auto sorted = row;
+    std::sort(sorted.begin(), sorted.end());
+    for (auto const& s : sorted) {
+      ex_strings.push_back(s);
+    }
+    offsets.push_back(static_cast<cudf::size_type>(in_strings.size()));
+  }
+
+  auto const num_rows  = static_cast<cudf::size_type>(rows.size());
+  auto const make_list = [&](std::vector<std::string> const& strs) {
+    StrCW leaf{strs.begin(), strs.end()};
+    cudf::test::fixed_width_column_wrapper<cudf::size_type> off(offsets.begin(), offsets.end());
+    return cudf::make_lists_column(num_rows, off.release(), leaf.release(), 0, {});
+  };
+
+  auto const input    = make_list(in_strings);
+  auto const expected = make_list(ex_strings);
+  expect_both_sort_paths_match(cudf::lists_column_view{input->view()}, expected->view());
+}
+
+// Forces the comparison cleanup's heapsort branch, which no other test reaches: >= 40 elements in
+// ONE row share a prefix long enough that every iterative window sees only shared bytes, so the
+// whole run survives to the cleanup as one run >= TIE_HEAPSORT_THRESHOLD (32) and is sorted by
+// heapsort rather than insertion. Layout arithmetic for this test: one list row => num_segments = 1
+// => S = bit_width(1) = 1; no nulls => P = 64 - 1 = 63, so the first pass proves floor(63/8) = 7
+// whole bytes. The MAX_RADIX_PASSES (8) windows then consume 8 * prefix_bytes (8) = 64 more, so the
+// last window ends at byte 7 + 64 = 71. An 80-byte shared prefix exceeds 71, so no window can
+// separate any element and the distinct two-digit tails (at byte 80, beyond every window) are
+// resolved only by the cleanup. Two exact duplicates check the heapsort's handling of equal keys.
+TEST_F(SortListsString, PrefixTrueHeapsortRun)
+{
+  using StrCW = cudf::test::strings_column_wrapper;
+
+  std::string const prefix(80, 'Z');  // 80 > 7 + 8*8 = 71, so ties survive every iterative window.
+  std::vector<std::string> non_null;
+  // Exceeding STRINGS_GRAD_WARP_CAP (> 64 elements) sends the column down the prefix path
+  // (not the graduated-warp path), so the tie run genuinely reaches TIE_HEAPSORT_THRESHOLD.
+  for (int i = 0; i < 70; ++i) {
+    non_null.push_back(prefix + std::to_string(i / 10) + std::to_string(i % 10));
+  }
+  // Two exact duplicates land among the distinct strings; their relative order is immaterial.
+  non_null.push_back(prefix + "05");
+  non_null.push_back(prefix + "17");
+
+  // The fast path is unstable, so the input must arrive unsorted to prove the heapsort orders it.
+  auto shuffled = non_null;
+  std::shuffle(shuffled.begin(), shuffled.end(), std::mt19937{0x8EA7});
+
+  // Host reference: ascending by raw bytes; all share the prefix, so ordered by the two-digit tail.
+  auto sorted = non_null;
+  std::sort(sorted.begin(), sorted.end());
+
+  auto const make_single_row_list = [](std::vector<std::string> const& strs) {
+    StrCW leaf{strs.begin(), strs.end()};
+    auto const n = static_cast<cudf::size_type>(strs.size());
+    cudf::test::fixed_width_column_wrapper<cudf::size_type> offsets{0, n};
+    return cudf::make_lists_column(1, offsets.release(), leaf.release(), 0, {});
+  };
+
+  auto const input    = make_single_row_list(shuffled);
+  auto const expected = make_single_row_list(sorted);
+  expect_both_sort_paths_match(cudf::lists_column_view{input->view()}, expected->view());
+}
 
 // Sign-flip correctness at the signed-integer boundaries: INT_MIN must sort first and INT_MAX last
 // among the non-nulls, with every negative ahead of every non-negative, for both rep widths. The
@@ -536,6 +1242,23 @@ TEST_F(SortListsInt, SlicedWithNulls)
     cudf::lists_column_view{sliced_list}, cudf::order::ASCENDING, cudf::null_order::AFTER);
   CUDF_TEST_EXPECT_COLUMNS_EQUAL(sorted_lists->view(), expected);
   CUDF_TEST_EXPECT_COLUMNS_EQUAL(stable_sorted_lists->view(), expected);
+}
+
+// Nonzero column offset for the strings prefix path: slicing off row 0 gives the surviving rows'
+// leaf strings column a genuine nonzero offset, which the packed-key builder, the window tie-break,
+// and the null handling must all honor. Mirrors SlicedWithNulls (the tiered engine's offset + null
+// combo) for the string engine.
+TEST_F(SortListsString, PrefixSlicedWithNulls)
+{
+  using StrLCW = cudf::test::lists_column_wrapper<cudf::string_view>;
+  StrLCW l{StrLCW{"zz", "aa"},
+           StrLCW{{"banana", "apple", "x", "cherry"}, null_at(2)},
+           StrLCW{"b", "a"},
+           StrLCW{"x"}};
+  auto const sliced_list = cudf::slice(l, {1, 4})[0];  // drops row 0 -> nonzero child offset
+  StrLCW expected{
+    StrLCW{{"apple", "banana", "cherry", "x"}, null_at(3)}, StrLCW{"a", "b"}, StrLCW{"x"}};
+  expect_both_sort_paths_match(cudf::lists_column_view{sliced_list}, expected);
 }
 
 // The tiered kernel's warp tier in isolation: three single-row columns within the warp cap (64) and
