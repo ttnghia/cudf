@@ -13,6 +13,18 @@
 namespace cudf {
 namespace detail {
 
+// Class of an element within the tiered ordering key. The ranks are load-bearing: classes 0 and 1
+// go to valid-then-null under the nulls-last polarity and null-then-valid under nulls-first (via
+// `sort_polarity::element_class`), and both sort before the pad the network / `WarpMergeSort`
+// assigns to the slots past a segment's real elements. `tier_pad` MUST rank strictly above both
+// element classes: `cub::BlockMergeSortStrategy::Sort` fills those slots with the pad key and
+// requires it ordered after every valid item, so a flag value tying an element class with the pad
+// could let the merge displace a real element past the valid-item boundary and drop it.
+enum tiered_element_class : cuda::std::uint32_t { tier_valid = 0, tier_null = 1, tier_pad = 2 };
+
+/// Block size hosting the register/warp tiered virtual warps and the graduated-string warp bands.
+constexpr int TIERED_BLOCK_THREADS = 128;
+
 /**
  * @brief Runtime key polarity realizing one explicit (order, null_order) on the segmented-sort
  * fast paths

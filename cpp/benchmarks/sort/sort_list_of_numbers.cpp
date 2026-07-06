@@ -21,13 +21,15 @@
 
 // Benchmark for cudf::lists::sort_lists on a LIST<numeric> column -- the operation Spark array_sort
 // lowers to. The type axis spans the integral, floating-point, and decimal128 fixed-width paths.
-// For an explicit ascending / nulls-after sort, an integral or floating-point column now takes the
-// global packed-radix path when it carries nulls or its average list size reaches 100; the short
-// no-null remainder keeps CUB DeviceSegmentedSort (integral) or the comparator fallback (floating
-// point). DECIMAL128 and every other (order, null_order) combination keep the base routing: CUB
-// for eligible no-null integrals, otherwise the lexicographic comparator over a prepended
-// segment-id column. The shape axes bracket those boundaries; cells outside ascending /
-// nulls-after measure the base paths.
+// For an explicit ascending / nulls-after sort, the shape axes straddle the fast-path routing's
+// measured crossovers: max_list_size 4 gives tiny lists, which the tiered network / warp tiers
+// claim; 32 the mid-size band the tiered kernel also claims; and 256 the long-list band the packed
+// radix claims. null_frequency 0.1 injects element-level (leaf) nulls, which route every supported
+// column to the tiered kernel (it orders nulls last in-register / in-warp), racing the comparison
+// sort the nullable case would otherwise use; 0 exercises the no-null routing that also weighs the
+// packed radix. DECIMAL128 and every other (order, null_order) combination keep the base routing:
+// CUB for eligible no-null integrals, otherwise the lexicographic comparator over a prepended
+// segment-id column.
 template <typename Type>
 void bench_sort_list_of_numbers(nvbench::state& state, nvbench::type_list<Type>)
 {
@@ -93,13 +95,13 @@ NVBENCH_BENCH_TYPES(
     nvbench::type_list<std::int32_t, std::int64_t, float, double, numeric::decimal128>))
   .set_name("sort_list_of_numbers")
   .add_int64_axis("num_rows", {100'000, 1'000'000})
-  // 4 and 32 keep no-null cells below the packed-radix average gate (100); 256 (average ~128)
-  // crosses it, routing eligible ascending / nulls-after cells to the packed radix.
+  // 4 keeps lists tiny (the tiered network/warp tiers claim them); 32 is the mid band the tiered
+  // kernel also claims; 256 pushes the average past the packed-radix cutoff.
   .add_int64_axis("max_list_size", {4, 32, 256})
-  // No-null vs a realistic null rate; nulls route eligible ascending / nulls-after cells to the
-  // packed radix (validity folds into its key) and leave every other combination on its base path.
+  // No-null vs a realistic null rate; the null-bearing ascending / nulls-after cells route to the
+  // tiered kernel (nulls ordered last in-register / in-warp).
   .add_float64_axis("null_frequency", {0, 0.1})
-  // Full (order, null_order) matrix: the packed-radix gate engages only for explicit ascending /
+  // Full (order, null_order) matrix: the fast-path gate engages only for explicit ascending /
   // nulls-after; the other combinations measure the base routing.
   .add_string_axis("order", {"ASC", "DESC"})
   .add_string_axis("null_order", {"AFTER", "BEFORE"});

@@ -86,6 +86,35 @@ fixed_width_sort_path choose_fixed_width_sort_path(column_view const& key,
                                                    rmm::cuda_stream_view stream);
 
 /**
+ * @brief Faster segmented sorted-order for a single fixed-width key column via a tiered sort
+ *
+ * Classifies segments by size into three tiers whose cost tracks the segment size rather than the
+ * key width -- the win over the packed-radix path when segments are tiny but values are wide: a
+ * segment of
+ * <= `TIERED_NETWORK_CAP` elements is sorted by one thread with a fixed Batcher network, a segment
+ * of
+ * <= `TIERED_WARP_CAP` by a full warp with `cub::WarpMergeSort`, and a rare radix-tier outlier by a
+ * packed radix over just that segment's elements (scattered into place). Nulls are ordered on the
+ * polarity's side within each segment by a three-valued class flag in the sort key, and a
+ * descending order complements the key's value bits; the result is the same order the comparison
+ * path produces. Engages for any explicit (order, null_order), which the caller resolves into
+ * `polarity`; handles both nullable and non-nullable columns.
+ *
+ * @param input The fixed-width column whose elements are sorted within each segment
+ * @param segment_offsets Identifies the segments to sort within
+ * @param polarity Key polarity resolved from the requested (order, null_order)
+ * @param stream CUDA stream used for device memory operations and kernel launches
+ * @param mr Device memory resource used to allocate the returned column's device memory
+ * @return Indices that map the column to a segmented sorted order
+ */
+[[nodiscard]] std::unique_ptr<column> fast_segmented_sorted_order_tiered(
+  column_view const& input,
+  column_view const& segment_offsets,
+  sort_polarity polarity,
+  rmm::cuda_stream_view stream,
+  rmm::device_async_resource_ref mr);
+
+/**
  * @brief Faster segmented sorted-order for a single fixed-width key column via one radix sort
  *
  * Replaces the comparison sort (used for null-bearing or large columns) and

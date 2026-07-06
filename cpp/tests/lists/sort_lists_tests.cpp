@@ -330,6 +330,304 @@ TEST_F(SortListsInt, NumericPackedBoolWithNulls)
   expect_both_sort_paths_match(cudf::lists_column_view{input->view()}, expected->view());
 }
 
+// The tiered kernel's class-composition seam: one int32 column whose row sizes straddle both
+// internal tier boundaries -- network (<=8): 0, 1, 3, 8; warp (9..64): 9, 33, 64; radix (>64): 65,
+// 600, 3000 -- so the Batcher-network kernel, the full-warp kernel, and the compact large-segment
+// radix fallback all run and must merge into one gather map with no cross-row contamination. The
+// sizes include both exact caps (8 and 64) and their first over-cap neighbours (9 and 65).
+// Scattered element nulls make the column null-bearing, which is what routes it to the tiered
+// kernel regardless of its average size; each row is reverse-sorted with a duplicate, and the
+// expected column is an independent host sort per row (ascending, nulls last). This is the
+// likeliest bug site for a tiered design.
+TEST_F(SortListsInt, NumericTieredThreeSizeClasses)
+{
+  std::vector<cudf::size_type> const sizes{0, 1, 3, 8, 9, 33, 64, 65, 600, 3'000};
+  std::vector<int32_t> in_vals;
+  std::vector<bool> in_valids;
+  std::vector<int32_t> ex_vals;
+  std::vector<bool> ex_valids;
+  std::vector<cudf::size_type> offsets{0};
+  for (auto const s : sizes) {
+    std::vector<int32_t> rv(s);
+    std::vector<bool> rok(s);
+    for (cudf::size_type i = 0; i < s; ++i) {
+      rv[i]  = static_cast<int32_t>(s - i);  // distinct, descending -> the sort must fully reorder
+      rok[i] = (i % 7 != 3);                 // scattered element nulls
+    }
+    if (s >= 2) { rv[1] = rv[0]; }  // a duplicate value among the non-nulls
+    std::vector<int32_t> nn;
+    for (cudf::size_type i = 0; i < s; ++i) {
+      in_vals.push_back(rv[i]);
+      in_valids.push_back(rok[i]);
+      if (rok[i]) { nn.push_back(rv[i]); }
+    }
+    std::sort(nn.begin(), nn.end());
+    for (auto const v : nn) {
+      ex_vals.push_back(v);
+      ex_valids.push_back(true);
+    }
+    for (cudf::size_type k = static_cast<cudf::size_type>(nn.size()); k < s; ++k) {
+      ex_vals.push_back(0);
+      ex_valids.push_back(false);
+    }
+    offsets.push_back(static_cast<cudf::size_type>(in_vals.size()));
+  }
+  auto const num_rows  = static_cast<cudf::size_type>(sizes.size());
+  auto const make_list = [&](std::vector<int32_t> const& vals, std::vector<bool> const& valids) {
+    cudf::test::fixed_width_column_wrapper<int32_t> leaf(vals.begin(), vals.end(), valids.begin());
+    cudf::test::fixed_width_column_wrapper<cudf::size_type> off(offsets.begin(), offsets.end());
+    return cudf::make_lists_column(num_rows, off.release(), leaf.release(), 0, {});
+  };
+  auto const input    = make_list(in_vals, in_valids);
+  auto const expected = make_list(ex_vals, ex_valids);
+  expect_both_sort_paths_match(cudf::lists_column_view{input->view()}, expected->view());
+}
+
+// Every other tiered-kernel test keeps each tier's segment count small enough that `grid_1d` needs
+// only one block (TIERED_BLOCK_THREADS is 128, and the warp tier packs 128/32 = 4 virtual warps per
+// block). This drives 200 network-tier and 10 warp-tier segments into one no-null int32 column
+// (which routes to the tiered kernel), so both kernels' grids span >= 2 blocks, exercising
+// `global_thread_id<BLOCK_THREADS>()` across a block boundary.
+TEST_F(SortListsInt, NumericTieredMultiBlockGrid)
+{
+  std::vector<cudf::size_type> sizes;
+  for (int i = 0; i < 200; ++i) {
+    sizes.push_back(1 + (i % 8));
+  }  // 200 network-tier segments
+  for (int i = 0; i < 10; ++i) {
+    sizes.push_back(16 + (i % 40));
+  }  // 10 warp-tier segments
+  std::vector<int32_t> in_vals;
+  std::vector<int32_t> ex_vals;
+  std::vector<cudf::size_type> offsets{0};
+  for (auto const s : sizes) {
+    std::vector<int32_t> rv(s);
+    for (cudf::size_type i = 0; i < s; ++i) {
+      rv[i] = static_cast<int32_t>(s - i);
+    }
+    for (auto const v : rv) {
+      in_vals.push_back(v);
+    }
+    std::sort(rv.begin(), rv.end());
+    for (auto const v : rv) {
+      ex_vals.push_back(v);
+    }
+    offsets.push_back(static_cast<cudf::size_type>(in_vals.size()));
+  }
+  auto const num_rows  = static_cast<cudf::size_type>(sizes.size());
+  auto const make_list = [&](std::vector<int32_t> const& vals) {
+    cudf::test::fixed_width_column_wrapper<int32_t> leaf(vals.begin(), vals.end());
+    cudf::test::fixed_width_column_wrapper<cudf::size_type> off(offsets.begin(), offsets.end());
+    return cudf::make_lists_column(num_rows, off.release(), leaf.release(), 0, {});
+  };
+  auto const input    = make_list(in_vals);
+  auto const expected = make_list(ex_vals);
+  expect_both_sort_paths_match(cudf::lists_column_view{input->view()}, expected->view());
+}
+
+// Zero-one principle, in-repo: the eight-slot Batcher network sorts every 0/1 pattern at every list
+// size 1 through 8 (510 lists, 3586 elements; a no-null int32 column of this shape routes to the
+// tiered kernel with every segment in the network tier). A comparison network that sorts every 0/1
+// input sorts every totally ordered input, so this permanently pins the hand-unrolled
+// 19-comparator sequence against future edits.
+TEST_F(SortListsInt, NumericTieredNetworkZeroOneExhaustive)
+{
+  std::vector<int32_t> vals;
+  std::vector<int32_t> ex_vals;
+  std::vector<cudf::size_type> offsets{0};
+  for (int n = 1; n <= 8; ++n) {
+    for (int pattern = 0; pattern < (1 << n); ++pattern) {
+      int ones = 0;
+      for (int b = 0; b < n; ++b) {
+        int const bit = (pattern >> b) & 1;
+        vals.push_back(bit);
+        ones += bit;
+      }
+      for (int b = 0; b < n; ++b) {
+        ex_vals.push_back(b < n - ones ? 0 : 1);
+      }
+      offsets.push_back(static_cast<cudf::size_type>(vals.size()));
+    }
+  }
+  auto const num_lists = static_cast<cudf::size_type>(offsets.size() - 1);
+  auto const make_list = [&](std::vector<int32_t> const& v) {
+    cudf::test::fixed_width_column_wrapper<int32_t> leaf(v.begin(), v.end());
+    cudf::test::fixed_width_column_wrapper<cudf::size_type> off(offsets.begin(), offsets.end());
+    return cudf::make_lists_column(num_lists, off.release(), leaf.release(), 0, {});
+  };
+  auto const input    = make_list(vals);
+  auto const expected = make_list(ex_vals);
+  expect_both_sort_paths_match(cudf::lists_column_view{input->view()}, expected->view());
+}
+
+// Nonzero column offset (from cudf::slice) combined with a retained null element: slicing off row 0
+// gives the surviving rows' child column a genuine nonzero column_view::offset() (via
+// lists_column_view::get_sliced_child), and row 1's null must still be read correctly through
+// column_device_view::is_null() at that offset by the tiered engine (a null-bearing int column
+// routes there). SortListsInt.Sliced covers the offset alone (no nulls); this adds the offset +
+// null combo.
+TEST_F(SortListsInt, SlicedWithNulls)
+{
+  using T = int;
+  std::vector<bool> const valids{true, false, true};  // row 1's middle element (5) is null
+  LCW<T> l{{3, 2, 1, 4}, {{7, 5, 6}, valids.begin()}, {8, 9}, {10}};
+
+  auto const sliced_list = cudf::slice(l, {1, 4})[0];  // drops row 0 -> nonzero child offset
+  std::vector<bool> const ex_valids{true, true, false};
+  auto const expected = LCW<T>{{{6, 7, 0}, ex_valids.begin()}, {8, 9}, {10}};
+  auto const [sorted_lists, stable_sorted_lists] = generate_sorted_lists(
+    cudf::lists_column_view{sliced_list}, cudf::order::ASCENDING, cudf::null_order::AFTER);
+  CUDF_TEST_EXPECT_COLUMNS_EQUAL(sorted_lists->view(), expected);
+  CUDF_TEST_EXPECT_COLUMNS_EQUAL(stable_sorted_lists->view(), expected);
+}
+
+// The tiered kernel's warp tier in isolation: three single-row columns within the warp cap (64) and
+// no larger segment, so the radix fallback never runs and the full-warp kernels alone must be
+// correct. Scattered element nulls route each column to the tiered kernel. An int64
+// sixty-four-element row fills the 32*2 warp tile exactly (no pads); a DECIMAL128 fifty-element row
+// leaves pad slots; a double sixty-four-element row fills the generic tiered_warp_sort_kernel's
+// tile exactly (zero pads on the shared non-int32/int64 path). Each is reverse-sorted with a
+// duplicate; the expected column is an independent host sort (ascending, nulls last).
+TEST_F(SortListsInt, NumericTieredWarpSegments)
+{
+  auto constexpr scale = numeric::scale_type{0};
+  {  // int64 warp tier.
+    cudf::size_type const n = 64;
+    std::vector<int64_t> in(n);
+    std::vector<bool> in_v(n);
+    for (cudf::size_type i = 0; i < n; ++i) {
+      in[i] =
+        static_cast<int64_t>(n - i) * 1'000'000'007LL;  // distinct, descending, beyond 32 bits
+      in_v[i] = (i % 5 != 2);                           // scattered nulls
+    }
+    in[1] = in[0];  // a duplicate value among the non-nulls
+    std::vector<int64_t> nn;
+    for (cudf::size_type i = 0; i < n; ++i) {
+      if (in_v[i]) { nn.push_back(in[i]); }
+    }
+    std::sort(nn.begin(), nn.end());
+    std::vector<int64_t> ex = nn;
+    std::vector<bool> ex_v(nn.size(), true);
+    ex.resize(n, int64_t{0});
+    ex_v.resize(n, false);
+    auto input = as_single_row_list(
+      cudf::test::fixed_width_column_wrapper<int64_t>(in.begin(), in.end(), in_v.begin())
+        .release());
+    auto expected = as_single_row_list(
+      cudf::test::fixed_width_column_wrapper<int64_t>(ex.begin(), ex.end(), ex_v.begin())
+        .release());
+    expect_both_sort_paths_match(cudf::lists_column_view{input->view()}, expected->view());
+  }
+  {  // decimal128 warp tier (24-byte key).
+    cudf::size_type const n = 50;
+    std::vector<__int128_t> in(n);
+    std::vector<bool> in_v(n);
+    for (cudf::size_type i = 0; i < n; ++i) {
+      in[i]   = static_cast<__int128_t>(n - i) * (i % 2 == 0 ? 1 : -1);  // mixed sign, distinct
+      in_v[i] = (i % 6 != 4);
+    }
+    in[3] = in[2];  // a duplicate value
+    std::vector<__int128_t> nn;
+    for (cudf::size_type i = 0; i < n; ++i) {
+      if (in_v[i]) { nn.push_back(in[i]); }
+    }
+    std::sort(nn.begin(), nn.end());
+    std::vector<__int128_t> ex = nn;
+    std::vector<bool> ex_v(nn.size(), true);
+    ex.resize(n, __int128_t{0});
+    ex_v.resize(n, false);
+    auto input = as_single_row_list(
+      cudf::test::fixed_point_column_wrapper<__int128_t>(in.begin(), in.end(), in_v.begin(), scale)
+        .release());
+    auto expected = as_single_row_list(
+      cudf::test::fixed_point_column_wrapper<__int128_t>(ex.begin(), ex.end(), ex_v.begin(), scale)
+        .release());
+    expect_both_sort_paths_match(cudf::lists_column_view{input->view()}, expected->view());
+  }
+  {  // double warp tier at exactly TIERED_WARP_CAP: zero pad slots, full-tile occupancy of the
+     // generic tiered_warp_sort_kernel (the path float/double/chrono/decimal128 share).
+    cudf::size_type const n = 64;
+    std::vector<double> in(n);
+    std::vector<bool> in_v(n);
+    for (cudf::size_type i = 0; i < n; ++i) {
+      in[i]   = static_cast<double>(n - i);  // distinct, descending
+      in_v[i] = (i % 5 != 2);                // scattered nulls
+    }
+    in[1] = in[0];  // a duplicate value among the non-nulls
+    std::vector<double> nn;
+    for (cudf::size_type i = 0; i < n; ++i) {
+      if (in_v[i]) { nn.push_back(in[i]); }
+    }
+    std::sort(nn.begin(), nn.end());
+    std::vector<double> ex = nn;
+    std::vector<bool> ex_v(nn.size(), true);
+    ex.resize(n, 0.0);
+    ex_v.resize(n, false);
+    auto input = as_single_row_list(
+      cudf::test::fixed_width_column_wrapper<double>(in.begin(), in.end(), in_v.begin()).release());
+    auto expected = as_single_row_list(
+      cudf::test::fixed_width_column_wrapper<double>(ex.begin(), ex.end(), ex_v.begin()).release());
+    expect_both_sort_paths_match(cudf::lists_column_view{input->view()}, expected->view());
+  }
+}
+
+// int64 no-null mid band on the tiered kernel's network and warp tiers for the eight-byte rep. A
+// single row of eight elements lands in the network tier (Batcher-8); one of sixteen in the warp
+// tier, where a no-null int64 sorts via the register bitonic (raw key). Values exceed INT32_MAX and
+// span the sign boundary; both paths must reproduce the comparison sort's ascending order. The
+// no-null int64 mid band no longer prefers CUB `DeviceSegmentedSort` -- the tiered warp kernels
+// beat it, so `choose_fixed_width_sort_path` routes the whole no-null int64 range below the
+// packed-radix cutoff to the tiered path.
+TEST_F(SortListsInt, NumericMidBandInt64Tiered)
+{
+  auto constexpr big          = int64_t{5} * 1'000 * 1'000 * 1'000;  // > INT32_MAX
+  auto const check_single_row = [big](cudf::size_type n) {
+    std::vector<int64_t> in(n);
+    for (cudf::size_type i = 0; i < n; ++i) {
+      in[i] = (static_cast<int64_t>(n / 2) - i) * big;
+    }
+    std::vector<int64_t> ex(in);
+    std::sort(ex.begin(), ex.end());
+    auto input = as_single_row_list(
+      cudf::test::fixed_width_column_wrapper<int64_t>(in.begin(), in.end()).release());
+    auto expected = as_single_row_list(
+      cudf::test::fixed_width_column_wrapper<int64_t>(ex.begin(), ex.end()).release());
+    expect_both_sort_paths_match(cudf::lists_column_view{input->view()}, expected->view());
+  };
+  check_single_row(8);   // one segment of eight -> network tier (Batcher-8)
+  check_single_row(16);  // one segment of sixteen -> warp tier, register bitonic (raw key)
+}
+
+// No-null 8-byte chrono (TIMESTAMP/DURATION) in the mid band. `dispatch_storage_type` does not
+// reduce chrono to its integer rep, so the CUB fast path (`column_fast_sort_fn`) cannot sort it;
+// routing an 8-byte no-null chrono to CUB (as an integer of the same width would go) throws
+// CUDF_FAIL. A single row of sixteen (average eight, past the tiered tiny cutoff) must therefore
+// stay on the tiered kernel, which encodes chrono via `radix_encode_*`. Guards that routing for a
+// timestamp and a duration rep against the comparison oracle.
+TEST_F(SortListsInt, NumericMidBandChronoNoNull)
+{
+  std::vector<int64_t> in(16);
+  for (cudf::size_type i = 0; i < 16; ++i) {
+    in[i] = (8 - i) * int64_t{1'000'000'000};
+  }
+  std::vector<int64_t> ex(in);
+  std::sort(ex.begin(), ex.end());
+  {  // TIMESTAMP_MILLISECONDS (int64 rep)
+    auto input = as_single_row_list(
+      cudf::test::fixed_width_column_wrapper<cudf::timestamp_ms>(in.begin(), in.end()).release());
+    auto expected = as_single_row_list(
+      cudf::test::fixed_width_column_wrapper<cudf::timestamp_ms>(ex.begin(), ex.end()).release());
+    expect_both_sort_paths_match(cudf::lists_column_view{input->view()}, expected->view());
+  }
+  {  // DURATION_MICROSECONDS (int64 rep)
+    auto input = as_single_row_list(
+      cudf::test::fixed_width_column_wrapper<cudf::duration_us>(in.begin(), in.end()).release());
+    auto expected = as_single_row_list(
+      cudf::test::fixed_width_column_wrapper<cudf::duration_us>(ex.begin(), ex.end()).release());
+    expect_both_sort_paths_match(cudf::lists_column_view{input->view()}, expected->view());
+  }
+}
+
 // The exact average-list-size cells of the packed-radix gate (avg >= 100): a 200-element single row
 // (two offsets -> average exactly 100) is the first packed-radix shape, and a 198-element row
 // (average 99) the last tiered shape. Both must reproduce the comparison order, pinning the gate's
@@ -455,6 +753,151 @@ TEST_F(SortListsInt, NumericPackedRadixNoNullNarrowTypes)
   };
   check_decimal(int32_t{});  // DECIMAL32.
   check_decimal(int64_t{});  // DECIMAL64.
+}
+
+// No-null INT32 warp tier: the register bitonic across its three sub-bands (<=16, <=32, <=64). One
+// column of segments straddling every tier boundary -- network (8), the bitonic bands (9, 16, 17,
+// 32, 33, 48, 64), and a radix outlier (65) -- with INT32_MAX (which radix-encodes to the raw-key
+// pad sentinel, so the bitonic pad tie-break must keep it inside the segment), INT32_MIN, and a
+// duplicate. The 8/9, 32/33 and 64/65 boundaries are all present in one column. Verified against
+// the oracle.
+TEST_F(SortListsInt, NumericTieredBitonicNoNullInt32)
+{
+  std::vector<cudf::size_type> const sizes{8, 9, 16, 17, 32, 33, 48, 64, 65};
+  auto constexpr lo = std::numeric_limits<int32_t>::min();
+  auto constexpr hi = std::numeric_limits<int32_t>::max();
+  std::vector<int32_t> in_vals;
+  std::vector<int32_t> ex_vals;
+  std::vector<cudf::size_type> offsets{0};
+  for (auto const s : sizes) {
+    std::vector<int32_t> rv(s);
+    for (cudf::size_type i = 0; i < s; ++i) {
+      rv[i] = static_cast<int32_t>(s - i);
+    }
+    rv[0] = hi;                     // a real INT32_MAX (radix-encodes to the raw-key pad sentinel)
+    if (s >= 2) { rv[1] = lo; }     // INT32_MIN
+    if (s >= 4) { rv[2] = rv[3]; }  // a duplicate value
+    for (auto const v : rv) {
+      in_vals.push_back(v);
+    }
+    std::sort(rv.begin(), rv.end());
+    for (auto const v : rv) {
+      ex_vals.push_back(v);
+    }
+    offsets.push_back(static_cast<cudf::size_type>(in_vals.size()));
+  }
+  auto const num_rows  = static_cast<cudf::size_type>(sizes.size());
+  auto const make_list = [&](std::vector<int32_t> const& vals) {
+    cudf::test::fixed_width_column_wrapper<int32_t> leaf(vals.begin(), vals.end());
+    cudf::test::fixed_width_column_wrapper<cudf::size_type> off(offsets.begin(), offsets.end());
+    return cudf::make_lists_column(num_rows, off.release(), leaf.release(), 0, {});
+  };
+  auto const input    = make_list(in_vals);
+  auto const expected = make_list(ex_vals);
+  expect_both_sort_paths_match(cudf::lists_column_view{input->view()}, expected->view());
+}
+
+// No-null INT64 warp tier, pinning the bitonic/narrow split: the register bitonic handles segments
+// up to 32, a raw-key `WarpMergeSort` (narrow) segments 33..64. Sizes 9, 32, 33, 64, 65 pin the
+// 32/33 (bitonic->narrow) and 64/65 (warp->radix) boundaries; 40 and 48 add interior narrow-band
+// shapes where pad slots coexist with the INT64_MAX element. Values exceed INT32_MAX and include
+// INT64_MAX (which encodes to exactly the raw-key pad sentinel, so the merge must keep the real
+// element inside the valid range whatever pads exist), INT64_MIN, and a duplicate. Verified against
+// the comparison oracle.
+TEST_F(SortListsInt, NumericTieredBitonicNarrowNoNullInt64)
+{
+  std::vector<cudf::size_type> const sizes{9, 32, 33, 40, 48, 64, 65};
+  auto constexpr lo  = std::numeric_limits<int64_t>::min();
+  auto constexpr hi  = std::numeric_limits<int64_t>::max();
+  auto constexpr big = int64_t{5} * 1'000 * 1'000 * 1'000;  // > INT32_MAX
+  std::vector<int64_t> in_vals;
+  std::vector<int64_t> ex_vals;
+  std::vector<cudf::size_type> offsets{0};
+  for (auto const s : sizes) {
+    std::vector<int64_t> rv(s);
+    for (cudf::size_type i = 0; i < s; ++i) {
+      rv[i] = (static_cast<int64_t>(s) - i) * big;
+    }
+    rv[0] = hi;                     // a real INT64_MAX (encodes to the raw-key pad sentinel)
+    if (s >= 2) { rv[1] = lo; }     // INT64_MIN
+    if (s >= 4) { rv[2] = rv[3]; }  // a duplicate value
+    for (auto const v : rv) {
+      in_vals.push_back(v);
+    }
+    std::sort(rv.begin(), rv.end());
+    for (auto const v : rv) {
+      ex_vals.push_back(v);
+    }
+    offsets.push_back(static_cast<cudf::size_type>(in_vals.size()));
+  }
+  auto const num_rows  = static_cast<cudf::size_type>(sizes.size());
+  auto const make_list = [&](std::vector<int64_t> const& vals) {
+    cudf::test::fixed_width_column_wrapper<int64_t> leaf(vals.begin(), vals.end());
+    cudf::test::fixed_width_column_wrapper<cudf::size_type> off(offsets.begin(), offsets.end());
+    return cudf::make_lists_column(num_rows, off.release(), leaf.release(), 0, {});
+  };
+  auto const input    = make_list(in_vals);
+  auto const expected = make_list(ex_vals);
+  expect_both_sort_paths_match(cudf::lists_column_view{input->view()}, expected->view());
+}
+
+// Null-bearing INT32 and INT64 warp tier: a null-flagged column routes to the tiered path, whose
+// warp tier uses the full-warp packed-key `WarpMergeSort` at one item per lane up to 32 then two to
+// 64 (the w32x1 shape) for both widths. One column per width with segments 8, 9, 32, 33, 64, 65
+// (spanning the network / warp / radix tiers and the 8/9, 32/33, 64/65 boundaries), scattered nulls
+// placed last, and INT_MIN/MAX plus a duplicate among the non-nulls. Verified against the
+// comparison oracle.
+TEST_F(SortListsInt, NumericTieredW32x1Nulls)
+{
+  std::vector<cudf::size_type> const sizes{8, 9, 32, 33, 64, 65};
+  auto const run = [&](auto tag) {
+    using T           = decltype(tag);
+    auto constexpr lo = std::numeric_limits<T>::min();
+    auto constexpr hi = std::numeric_limits<T>::max();
+    std::vector<T> in_vals;
+    std::vector<bool> in_valids;
+    std::vector<T> ex_vals;
+    std::vector<bool> ex_valids;
+    std::vector<cudf::size_type> offsets{0};
+    for (auto const s : sizes) {
+      std::vector<T> rv(s);
+      std::vector<bool> rok(s);
+      for (cudf::size_type i = 0; i < s; ++i) {
+        rv[i]  = static_cast<T>(s - i);
+        rok[i] = (i % 5 != 2);  // scattered element nulls
+      }
+      rv[0] = hi;
+      if (s >= 2) { rv[1] = lo; }
+      if (s >= 4) { rv[2] = rv[3]; }  // a duplicate among the non-nulls
+      std::vector<T> nn;
+      for (cudf::size_type i = 0; i < s; ++i) {
+        in_vals.push_back(rv[i]);
+        in_valids.push_back(rok[i]);
+        if (rok[i]) { nn.push_back(rv[i]); }
+      }
+      std::sort(nn.begin(), nn.end());
+      for (auto const v : nn) {
+        ex_vals.push_back(v);
+        ex_valids.push_back(true);
+      }
+      for (cudf::size_type k = static_cast<cudf::size_type>(nn.size()); k < s; ++k) {
+        ex_vals.push_back(T{0});
+        ex_valids.push_back(false);
+      }
+      offsets.push_back(static_cast<cudf::size_type>(in_vals.size()));
+    }
+    auto const num_rows  = static_cast<cudf::size_type>(sizes.size());
+    auto const make_list = [&](std::vector<T> const& vals, std::vector<bool> const& valids) {
+      cudf::test::fixed_width_column_wrapper<T> leaf(vals.begin(), vals.end(), valids.begin());
+      cudf::test::fixed_width_column_wrapper<cudf::size_type> off(offsets.begin(), offsets.end());
+      return cudf::make_lists_column(num_rows, off.release(), leaf.release(), 0, {});
+    };
+    auto const input    = make_list(in_vals, in_valids);
+    auto const expected = make_list(ex_vals, ex_valids);
+    expect_both_sort_paths_match(cudf::lists_column_view{input->view()}, expected->view());
+  };
+  run(int32_t{});
+  run(int64_t{});
 }
 
 TEST_F(SortListsInt, NestedListElement)
