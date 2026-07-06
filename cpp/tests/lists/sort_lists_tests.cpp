@@ -13,6 +13,7 @@
 #include <cudf/lists/sorting.hpp>
 
 #include <algorithm>
+#include <array>
 #include <limits>
 #include <random>
 #include <string>
@@ -393,6 +394,45 @@ void expect_both_sort_paths_equivalent(cudf::lists_column_view const& input,
   CUDF_TEST_EXPECT_COLUMNS_EQUIVALENT(sorted->view(), expected);
   auto const stable_sorted = cudf::lists::stable_sort_lists(input, column_order, null_precedence);
   CUDF_TEST_EXPECT_COLUMNS_EQUIVALENT(stable_sorted->view(), expected);
+}
+
+// Host oracle for one list row under an explicit (order, null_order): sorts the non-null values
+// (descending reverses) and rebuilds the row with its nulls on the side the combo produces. cudf's
+// null_order is comparator-level and a DESCENDING sort swaps the comparison operands, inverting
+// null placement too, so nulls land first exactly when (BEFORE) != (DESCENDING) -- the placement
+// the pre-existing comparison-path combo tests pin, and which the paired stable_sort_lists
+// assertion re-verifies at run time. Null slots carry a zeroed payload; their bytes are never
+// compared.
+template <typename T>
+std::pair<std::vector<T>, std::vector<bool>> host_sorted_row(std::vector<T> const& vals,
+                                                             std::vector<bool> const& valids,
+                                                             cudf::order column_order,
+                                                             cudf::null_order null_precedence)
+{
+  std::vector<T> nn;
+  for (std::size_t i = 0; i < vals.size(); ++i) {
+    if (valids[i]) { nn.push_back(vals[i]); }
+  }
+  std::sort(nn.begin(), nn.end());
+  if (column_order == cudf::order::DESCENDING) { std::reverse(nn.begin(), nn.end()); }
+  auto const num_nulls = vals.size() - nn.size();
+  auto const nulls_first =
+    (null_precedence == cudf::null_order::BEFORE) != (column_order == cudf::order::DESCENDING);
+  std::vector<T> out;
+  std::vector<bool> out_valids;
+  auto const push_nulls = [&] {
+    for (std::size_t k = 0; k < num_nulls; ++k) {
+      out.push_back(T{});
+      out_valids.push_back(false);
+    }
+  };
+  if (nulls_first) { push_nulls(); }
+  for (auto const& v : nn) {
+    out.push_back(v);
+    out_valids.push_back(true);
+  }
+  if (not nulls_first) { push_nulls(); }
+  return {std::move(out), std::move(out_valids)};
 }
 
 // Wraps a leaf column as a single-row LIST (every element in one list row) -- the shape the
@@ -931,6 +971,243 @@ TEST_F(SortListsString, PrefixTrueHeapsortRun)
   auto const input    = make_single_row_list(shuffled);
   auto const expected = make_single_row_list(sorted);
   expect_both_sort_paths_match(cudf::lists_column_view{input->view()}, expected->view());
+}
+
+namespace {
+// Builds a LIST<STRING> column from per-row (string, validity) data: flattens the rows into one
+// leaf strings column carrying the validity plus a matching offsets column. Embedded NUL bytes ride
+// through unchanged (a string is a byte sequence), so callers pass explicit-length `std::string`s.
+std::unique_ptr<cudf::column> make_string_lists(std::vector<std::vector<std::string>> const& rows,
+                                                std::vector<std::vector<bool>> const& valids)
+{
+  std::vector<std::string> flat;
+  std::vector<bool> flat_v;
+  std::vector<cudf::size_type> offsets{0};
+  for (std::size_t r = 0; r < rows.size(); ++r) {
+    flat.insert(flat.end(), rows[r].begin(), rows[r].end());
+    flat_v.insert(flat_v.end(), valids[r].begin(), valids[r].end());
+    offsets.push_back(static_cast<cudf::size_type>(flat.size()));
+  }
+  cudf::test::strings_column_wrapper leaf(flat.begin(), flat.end(), flat_v.begin());
+  cudf::test::fixed_width_column_wrapper<cudf::size_type> off(offsets.begin(), offsets.end());
+  return cudf::make_lists_column(
+    static_cast<cudf::size_type>(rows.size()), off.release(), leaf.release(), 0, {});
+}
+
+// Drives one set of LIST<STRING> rows through all four (order, null_order) combos, checking the
+// fast path and the comparison path against a per-row host oracle (`host_sorted_row`, unsigned-byte
+// order with `std::string`'s length tie-break -- the same order cudf uses). Each combo folds a
+// distinct polarity into the keys, so a wrong descending byte complement, exhausted-run side, or
+// null side shows up as a mismatch here.
+void expect_string_polarity_matrix(std::vector<std::vector<std::string>> const& rows,
+                                   std::vector<std::vector<bool>> const& valids)
+{
+  constexpr std::array<std::pair<cudf::order, cudf::null_order>, 4> combos{
+    {{cudf::order::ASCENDING, cudf::null_order::AFTER},
+     {cudf::order::DESCENDING, cudf::null_order::AFTER},
+     {cudf::order::ASCENDING, cudf::null_order::BEFORE},
+     {cudf::order::DESCENDING, cudf::null_order::BEFORE}}};
+  auto const input = make_string_lists(rows, valids);
+  for (auto const& [ord, np] : combos) {
+    std::vector<std::vector<std::string>> ex_rows(rows.size());
+    std::vector<std::vector<bool>> ex_valids(rows.size());
+    for (std::size_t r = 0; r < rows.size(); ++r) {
+      auto sorted_row = host_sorted_row(rows[r], valids[r], ord, np);
+      ex_rows[r]      = std::move(sorted_row.first);
+      ex_valids[r]    = std::move(sorted_row.second);
+    }
+    auto const expected = make_string_lists(ex_rows, ex_valids);
+    expect_both_sort_paths_match(cudf::lists_column_view{input->view()}, expected->view(), ord, np);
+  }
+}
+}  // namespace
+
+// ===== graduated-warp string path: per-band polarity coverage (segments within the 64-element cap)
+// The graduated in-warp sort is the default string fast path once every segment fits the largest
+// warp tile, so these drive its bands -- (0,8] one item per lane, (8,16] W8, W16, W32 -- through
+// the full (order, null_order) matrix against the comparison-path oracle. Rows are shuffled so the
+// sort must actively reorder; a bug that left the input order (e.g. a comparator collapsing valid
+// pairs to "equal") shows up as a mismatch.
+
+// Segment sizes pinned at and across every graduated band boundary -- 1..16 (W8), 17..32 (W16),
+// 33..64 (W32) -- including 8/9 (the (0,8]/(8,16] split edge), 15/16/17, 31/32/33, 63/64 and an
+// empty row, all in one column so the bands run side by side. The 16/32/64 rows fill their W*IPT
+// tiles exactly (zero pads), as does the 8 row for the one-item-per-lane band. All-distinct
+// strings, no nulls, so the descending combos exercise the packed-window byte complement across
+// every band.
+TEST_F(SortListsString, GradPolarityMatrixBandBoundarySizes)
+{
+  std::vector<cudf::size_type> const sizes{1, 2, 8, 9, 15, 16, 17, 31, 32, 33, 63, 64, 0};
+  std::mt19937 rng{0xBEEF};
+  std::vector<std::vector<std::string>> rows;
+  std::vector<std::vector<bool>> valids;
+  for (auto const n : sizes) {
+    std::vector<std::string> row(n);
+    for (cudf::size_type i = 0; i < n; ++i) {
+      // Distinct within a row: 97 is coprime to 1000, so the numeric part never repeats for i < 64.
+      row[i] = "k" + std::to_string(i * 97 % 1000) + static_cast<char>('a' + i % 26);
+    }
+    std::shuffle(row.begin(), row.end(), rng);
+    valids.emplace_back(row.size(), true);
+    rows.push_back(std::move(row));
+  }
+  expect_string_polarity_matrix(rows, valids);
+}
+
+// Null handling in every band, and the direct regression for the class-bit polarity resolution: the
+// two nulls-first combos (ASC/BEFORE and DESC/AFTER on this null-bearing column) put the valid
+// class at ordinal 1, so a comparator hardcoding the valid class to 0 would collapse every
+// valid-vs-valid pair to "equal" and leave the shuffled input order -- caught here as a mismatch.
+// Row 0 (W8 band) mixes 10 valids (one duplicate) with 2 nulls; row 1's 17 elements have only 2
+// valid (its W16 tile holds 15 nulls then 15 pad slots, the pad-boundary stressor a pad class
+// failing to rank above tier_null would break); row 5 is all null; rows of 5 and 8 put nulls in the
+// (0,8] one-item-per-lane band.
+TEST_F(SortListsString, GradPolarityMatrixNullsAcrossBands)
+{
+  std::vector<cudf::size_type> const sizes{12, 17, 20, 40, 64, 16, 5, 8};
+  std::mt19937 rng{0xD00D};
+  std::vector<std::vector<std::string>> rows;
+  std::vector<std::vector<bool>> valids;
+  for (std::size_t r = 0; r < sizes.size(); ++r) {
+    auto const n = sizes[r];
+    std::vector<std::pair<std::string, bool>> cells(n);
+    for (cudf::size_type i = 0; i < n; ++i) {
+      // Row 1: only elements 3 and 11 valid (2 valid / 15 null). Row 5: all null. Others: every
+      // (i % 5 == 2) element is null.
+      bool const v = (r == 1) ? (i == 3 || i == 11) : (r == 5 ? false : (i % 5 != 2));
+      cells[i]     = {"v" + std::to_string(i * 97 % 1000), v};
+    }
+    if (n > 1 && cells[0].second && cells[1].second) {
+      cells[1].first = cells[0].first;  // A duplicate among the valids.
+    }
+    std::shuffle(cells.begin(), cells.end(), rng);  // Interleave nulls; don't pre-group them.
+    std::vector<std::string> row(n);
+    std::vector<bool> valid(n);
+    for (cudf::size_type i = 0; i < n; ++i) {
+      row[i]   = cells[i].first;
+      valid[i] = cells[i].second;
+    }
+    rows.push_back(std::move(row));
+    valids.push_back(std::move(valid));
+  }
+  expect_string_polarity_matrix(rows, valids);
+}
+
+// Ties and zero-extension families across bands: exact duplicates, strings colliding on the packed
+// eight-byte window through its zero-fill (`S` vs `S + "\0"`, separable only by the length
+// tie-break
+// -- the exhausted-window case whose side the descending complement flips), embedded NUL bytes
+// ordering before printable bytes, and eight-byte shared prefixes forcing every pair onto the
+// suffix fallback. Row 0 is a W8-band family, row 1 a W16-band shared prefix, row 2 a W32-band
+// shared prefix, row 3 pure duplicates.
+TEST_F(SortListsString, GradPolarityMatrixTiesAndZeroExtension)
+{
+  using namespace std::string_literals;
+  std::mt19937 rng{0xACE5};
+  std::vector<std::string> row0{""s, "a"s, "ab"s, "ab"s, "ab\0"s, "ab\0c"s, "abc"s, "abcd"s, "b"s};
+  std::vector<std::string> row1;
+  for (int i = 0; i < 16; ++i) {
+    row1.push_back("PPPPPPPP" + std::to_string(i));
+  }
+  row1.push_back("PPPPPPPP"s);
+  row1.push_back("PPPPPPPP\0"s);
+  row1.push_back("PPPPPPPP3"s);  // duplicate
+  row1.push_back("PPPPPPPP7"s);  // duplicate
+  std::vector<std::string> row2;
+  for (int i = 0; i < 38; ++i) {
+    row2.push_back("SAMEPREF" + std::string(1, static_cast<char>('0' + (i % 10))) +
+                   std::to_string(i));
+  }
+  row2.push_back("SAMEPREF"s);
+  row2.push_back("SAMEPREF\0"s);
+  std::vector<std::string> row3(10, "dup"s);
+
+  std::vector<std::vector<std::string>> rows;
+  std::vector<std::vector<bool>> valids;
+  for (auto* row : {&row0, &row1, &row2, &row3}) {
+    std::shuffle(row->begin(), row->end(), rng);
+    valids.emplace_back(row->size(), true);
+    rows.push_back(*row);
+  }
+  expect_string_polarity_matrix(rows, valids);
+}
+
+// UTF-8 multibyte ordering: raw unsigned-byte order across the two-, three-, and four-byte lead
+// classes in a W8-band row, and a W32-band row where every string shares a two-byte multibyte
+// prefix so the prekey ties past the lead bytes. Polarity is orthogonal to encoding; the descending
+// pass is a cheap byte-complement sanity check.
+TEST_F(SortListsString, GradPolarityMatrixUtf8Multibyte)
+{
+  std::mt19937 rng{0xFACE};
+  std::vector<std::string> row0{
+    "\xE2\x82\xAC\x75\x72\x6F", "zoo", "\xF0\x9F\x98\x80", "\xC3\xA9\x70\xC3\xA9\x65", "apple"};
+  std::vector<std::string> row1;
+  for (int i = 0; i < 36; ++i) {
+    row1.push_back("\xC3\xA9" + std::to_string(i * 97 % 1000));
+  }
+  std::vector<std::vector<std::string>> rows;
+  std::vector<std::vector<bool>> valids;
+  for (auto* row : {&row0, &row1}) {
+    std::shuffle(row->begin(), row->end(), rng);
+    valids.emplace_back(row->size(), true);
+    rows.push_back(*row);
+  }
+  expect_string_polarity_matrix(rows, valids);
+}
+
+// Nonzero column offset under every combo: slicing off row 0 gives the surviving rows' leaf strings
+// a genuine nonzero offset, which the graduated key builders and comparators must honor through
+// `column_device_view::element` / `is_null`. The null slot carries "x" (never compared); the paired
+// stable_sort_lists assertion re-verifies each hand-built expectation against the comparison path.
+TEST_F(SortListsString, GradSlicedWithNulls)
+{
+  using StrLCW = cudf::test::lists_column_wrapper<cudf::string_view>;
+  StrLCW l{StrLCW{"zz", "aa"},
+           StrLCW{{"banana", "apple", "x", "cherry"}, null_at(2)},  // element 2 ("x") is null
+           StrLCW{"b", "a"},
+           StrLCW{"x"}};
+  auto const sliced = cudf::slice(l, {1, 4})[0];  // drops row 0 -> nonzero child offset
+  {                                               // ASC / AFTER: values ascending, null last
+    StrLCW expected{
+      StrLCW{{"apple", "banana", "cherry", "x"}, null_at(3)}, StrLCW{"a", "b"}, StrLCW{"x"}};
+    expect_both_sort_paths_match(cudf::lists_column_view{sliced}, expected);
+  }
+  {  // ASC / BEFORE: null first, then values ascending
+    StrLCW expected{
+      StrLCW{{"x", "apple", "banana", "cherry"}, null_at(0)}, StrLCW{"a", "b"}, StrLCW{"x"}};
+    expect_both_sort_paths_match(
+      cudf::lists_column_view{sliced}, expected, cudf::order::ASCENDING, cudf::null_order::BEFORE);
+  }
+  {  // DESC / AFTER: the comparator swap places the null first, then values descending
+    StrLCW expected{
+      StrLCW{{"x", "cherry", "banana", "apple"}, null_at(0)}, StrLCW{"b", "a"}, StrLCW{"x"}};
+    expect_both_sort_paths_match(
+      cudf::lists_column_view{sliced}, expected, cudf::order::DESCENDING, cudf::null_order::AFTER);
+  }
+  {  // DESC / BEFORE: values descending, then the null last
+    StrLCW expected{
+      StrLCW{{"cherry", "banana", "apple", "x"}, null_at(3)}, StrLCW{"b", "a"}, StrLCW{"x"}};
+    expect_both_sort_paths_match(
+      cudf::lists_column_view{sliced}, expected, cudf::order::DESCENDING, cudf::null_order::BEFORE);
+  }
+}
+
+// The admission gate's negative side under every combo: one 65-element segment exceeds the
+// 64-element warp cap, disqualifying the whole column, so the graduated path is rejected and the
+// prefix path produces the result. The only observable contract is an unchanged, correct order
+// under each polarity -- which the matrix checks against the comparison-path oracle.
+TEST_F(SortListsString, GradOversizedSegmentFallsThrough)
+{
+  std::mt19937 rng{0xF00D};
+  std::vector<std::string> big(65);
+  for (int i = 0; i < 65; ++i) {
+    big[i] = "q" + std::to_string(i * 97 % 1000);
+  }
+  std::shuffle(big.begin(), big.end(), rng);
+  std::vector<std::vector<std::string>> const rows{big, {"b", "a", "c"}};
+  std::vector<std::vector<bool>> const valids{std::vector<bool>(big.size(), true),
+                                              {true, true, true}};
+  expect_string_polarity_matrix(rows, valids);
 }
 
 // Sign-flip correctness at the signed-integer boundaries: INT_MIN must sort first and INT_MAX last

@@ -350,6 +350,13 @@ std::unique_ptr<column> segmented_sorted_order_common(
         column_order.front() == order::ASCENDING and null_precedence.size() == 1 and
         null_precedence.front() == null_order::AFTER and
         fast_path_offsets_cover_all_rows(segment_offsets, keys.num_rows(), stream)) {
+      // When every segment fits the largest warp tile, the graduated in-warp sort beats the global
+      // prefix-radix machine; an oversized segment falls through to the prefix path. As with the
+      // scalar checks above, this synchronizing size probe runs only after they pass.
+      if (strings_grad_all_segments_fit(segment_offsets, stream)) {
+        return fast_segmented_sorted_order_strings_grad(
+          keys.column(0), segment_offsets, sort_polarity{}, stream, mr);
+      }
       return fast_segmented_sorted_order_strings_prefix(
         keys.column(0), segment_offsets, sort_polarity{}, stream, mr);
     }

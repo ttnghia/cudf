@@ -110,12 +110,13 @@ static std::unique_ptr<cudf::column> apply_shared_prefix(cudf::column_view const
 }
 
 // The list generator forces its final offset to the child size ("always include all elements"), so
-// the last row absorbs every leftover element -- an artifact row often far above `max_list_size`,
-// handing the sweep a shape no axis value asked for. Trimming that one row back to `max_list_size`
-// restores the axis's declared [0, max_list_size] regime; it runs outside the timed region.
-// Returns nullptr when the generated last row already fits, so the caller keeps the original
-// column. The generator purges nonempty nulls, so an oversized last row is never a null row and
-// the trim cannot create a nonempty null.
+// the last row absorbs every leftover element -- an artifact row often far above `max_list_size`
+// that would disqualify the whole column from the graduated-warp path (its gate requires every
+// segment within the 64-element warp tile) and silently demote it to the prefix path. Trimming that
+// one row back to `max_list_size` restores the axis's declared [0, max_list_size] regime; it runs
+// outside the timed region. Returns nullptr when the generated last row already fits, so the caller
+// keeps the original column. The generator purges nonempty nulls, so an oversized last row is never
+// a null row and the trim cannot create a nonempty null.
 static std::unique_ptr<cudf::column> trim_forced_last_row(cudf::column_view const& list_col,
                                                           cudf::size_type max_list_size,
                                                           rmm::cuda_stream_view stream)
@@ -234,7 +235,9 @@ static void bench_sort_list_of_strings(nvbench::state& state)
   state.set_cuda_stream(nvbench::make_cuda_stream_view(stream.value()));
 
   // Trim the generator's forced-last-row artifact (untimed data setup) so the data matches the
-  // declared [0, max_list_size] regime. See `trim_forced_last_row`.
+  // declared [0, max_list_size] regime; otherwise that one oversized row disqualifies the whole
+  // column from the graduated-warp path and silently demotes it to the prefix path. See
+  // `trim_forced_last_row`.
   auto const trimmed  = trim_forced_last_row(table->view().column(0), max_list_size, stream);
   auto const base_col = trimmed ? trimmed->view() : table->view().column(0);
 

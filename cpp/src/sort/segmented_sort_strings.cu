@@ -5,11 +5,13 @@
 
 #include "segmented_sort_fast.cuh"
 #include "segmented_sort_keys.cuh"
+#include "segmented_sort_warp_kernel.cuh"
 
 #include <cudf/column/column_device_view.cuh>
 #include <cudf/column/column_factories.hpp>
 #include <cudf/detail/device_scalar.hpp>
 #include <cudf/detail/labeling/label_segments.cuh>
+#include <cudf/detail/utilities/grid_1d.cuh>
 #include <cudf/strings/string_view.cuh>
 #include <cudf/utilities/error.hpp>
 #include <cudf/utilities/memory_resource.hpp>
@@ -555,6 +557,163 @@ struct prefix_tie_breaker {
   }
 };
 
+// ==========================================================================================
+// Graduated-warp per-segment sort for a single STRING key column.
+//
+// When every segment fits the largest warp tile (`STRINGS_GRAD_WARP_CAP`), sorting each segment in
+// a virtual warp with `cub::WarpMergeSort` beats the global multi-pass prefix-radix machine. The
+// warp width graduates with the segment-size band (W8 for sizes <= 16, W16 for 17-32, W32 for
+// 33-64), so a tiny segment never occupies a full warp. The key style is mixed per band: the 8-byte
+// comparator key drives the bottom bands, where the 16-byte prekey's merge-exchange volume
+// dominates over mostly-pad tiles, and the prekey drives W16/W32, where its packed prefix window
+// amortizes. The (0,8] slice sorts at one item per lane (an 8-slot tile), halving the pad traffic
+// the two-item shape pays at the smallest sizes. The requested (order, null_order) rides the same
+// `sort_polarity` the prefix path uses; a column with any segment above the cap falls through to
+// the prefix path.
+// ==========================================================================================
+
+/// Largest segment size the graduated-warp string path admits: the W32 x 2 register tile.
+constexpr size_type STRINGS_GRAD_WARP_CAP = 64;
+
+/**
+ * @brief Ordering key for the comparator-key bands: the element's global index plus its class
+ *
+ * The comparator reads the string bytes through `gidx`, so the key itself stays eight bytes. `cls`
+ * is a `tiered_element_class` whose ordinal comes from `polarity.element_class`, so nulls collect
+ * on the requested side of a segment's valid elements and the pad slots past a segment's real
+ * elements settle beyond them -- pad must rank strictly above either class for the same reason the
+ * fixed-width tiers require it. `gidx` is dereferenced only for the valid class, so a null or pad
+ * key never reads string data.
+ */
+struct strings_grad_cmp_key {
+  size_type gidx;
+  cuda::std::uint32_t cls;
+};
+static_assert(sizeof(strings_grad_cmp_key) == 8, "strings_grad_cmp_key must stay eight bytes");
+
+/// Builds the comparator key for one element: its global index and polarity-resolved class.
+struct strings_grad_cmp_key_builder {
+  column_device_view d_strings;
+  bool has_nulls;
+  sort_polarity polarity;
+  __device__ strings_grad_cmp_key operator()(size_type idx) const
+  {
+    return strings_grad_cmp_key{idx, polarity.element_class(has_nulls && d_strings.is_null(idx))};
+  }
+};
+
+/**
+ * @brief Strict-weak less for the comparator key: class first, then the full byte comparison
+ *
+ * Two keys in the same non-valid class (both null or both pad) compare equivalent -- the path is
+ * unstable, their order is immaterial, and their bytes are never read. Two valid keys order by
+ * `string_view::compare`, the unsigned-byte-then-shorter-first ordering the shipped prefix path
+ * reproduces. The valid class ordinal follows the polarity (`element_class(false)` is 1
+ * nulls-first, 0 otherwise), so a hardcoded constant would misfire under nulls-first; a descending
+ * sort inverts the comparison's sign, reversing both byte order and the length tie-break as
+ * `prefix_tie_breaker::index_less` does.
+ */
+struct strings_grad_cmp_less {
+  column_device_view d_strings;
+  sort_polarity polarity;
+  __device__ bool operator()(strings_grad_cmp_key const& a, strings_grad_cmp_key const& b) const
+  {
+    if (a.cls != b.cls) { return a.cls < b.cls; }
+    if (a.cls != polarity.element_class(false)) { return false; }
+    auto const cmp =
+      d_strings.element<string_view>(a.gidx).compare(d_strings.element<string_view>(b.gidx));
+    return polarity.descending ? cmp > 0 : cmp < 0;
+  }
+};
+
+/**
+ * @brief Ordering key for the prekey bands: a packed leading-byte prefix over the index
+ *
+ * `prefix` is the element's first eight bytes packed big-endian with a zero-filled tail
+ * (`pack_window` at offset zero), so an unsigned compare reproduces unsigned-byte order over the
+ * window under the shipped shorter-is-less zero-fill convention; a descending sort complements the
+ * window at build time so that order reverses. A prefix tie leaves only two cases -- both strings
+ * genuinely share their first eight bytes, or a shorter string's zero-fill collided with the longer
+ * one's real zero bytes (a zero-extension family such as `S` vs `S + "\0"`) -- and `compare_suffix`
+ * from byte eight orders both exactly: its byte walk covers the first case and its full-length
+ * difference the second, shorter-first.
+ */
+struct strings_grad_prekey {
+  cuda::std::uint64_t prefix;
+  size_type gidx;
+  cuda::std::uint32_t cls;
+};
+static_assert(sizeof(strings_grad_prekey) == 16 and alignof(strings_grad_prekey) == 8,
+              "strings_grad_prekey must stay sixteen bytes with eight-byte alignment");
+
+/// Builds the prekey: packed eight-byte big-endian prefix (complemented when descending), global
+/// index, polarity-resolved class. A null carries a zero prefix and is never inspected past the
+/// class compare.
+struct strings_grad_prekey_builder {
+  column_device_view d_strings;
+  bool has_nulls;
+  sort_polarity polarity;
+  __device__ strings_grad_prekey operator()(size_type idx) const
+  {
+    if (has_nulls && d_strings.is_null(idx)) {
+      return strings_grad_prekey{0, idx, polarity.element_class(true)};
+    }
+    return strings_grad_prekey{
+      pack_window(d_strings.element<string_view>(idx), 0) ^ polarity.value_mask64(),
+      idx,
+      polarity.element_class(false)};
+  }
+};
+
+/**
+ * @brief Strict-weak less for the prekey: class, then packed prefix, bytes only on a tie
+ *
+ * The packed prefix resolves most pairs in registers; it was complemented at build time under a
+ * descending sort, so a plain unsigned compare of it is correct for both directions. The byte
+ * comparison runs only when two valid keys tie on the prefix, starting at `prefix_bytes` since the
+ * tie proves the window equal, and a descending sort inverts its sign as
+ * `prefix_tie_breaker::index_less` does. The valid class follows the polarity, as in the comparator
+ * key.
+ */
+struct strings_grad_prekey_less {
+  column_device_view d_strings;
+  sort_polarity polarity;
+  __device__ bool operator()(strings_grad_prekey const& a, strings_grad_prekey const& b) const
+  {
+    if (a.cls != b.cls) { return a.cls < b.cls; }
+    if (a.cls != polarity.element_class(false)) { return false; }
+    if (a.prefix != b.prefix) { return a.prefix < b.prefix; }
+    auto const cmp = compare_suffix(d_strings.element<string_view>(a.gidx),
+                                    d_strings.element<string_view>(b.gidx),
+                                    size_type{prefix_bytes});
+    return polarity.descending ? cmp > 0 : cmp < 0;
+  }
+};
+
+/// Launches one graduated string band: virtual warps of `W` lanes sort the segments whose size is
+/// in
+/// `(band_lo, band_hi]` with `cub::WarpMergeSort`, self-filtering over the full segment list
+/// exactly as the fixed-width warp bands do.
+template <int W, int IPT, typename KeyT, typename KeyBuilder, typename CompareOp>
+void launch_strings_grad_band(KeyBuilder const& build_key,
+                              CompareOp const& compare_op,
+                              KeyT const pad_key,
+                              size_type const* d_offsets,
+                              size_type const* d_seg_list,
+                              size_type num_segments,
+                              size_type band_lo,
+                              size_type band_hi,
+                              size_type* d_out,
+                              rmm::cuda_stream_view stream)
+{
+  auto const grid =
+    cudf::detail::grid_1d(static_cast<thread_index_type>(num_segments) * W, TIERED_BLOCK_THREADS);
+  tiered_warp_band_kernel<KeyT, KeyBuilder, W, IPT, TIERED_BLOCK_THREADS, CompareOp>
+    <<<grid.num_blocks, grid.num_threads_per_block, 0, stream.value()>>>(
+      d_offsets, d_seg_list, num_segments, band_lo, band_hi, build_key, d_out, compare_op, pad_key);
+  CUDF_CHECK_CUDA(stream.value());
+}
+
 }  // namespace
 
 [[nodiscard]] std::unique_ptr<column> fast_segmented_sorted_order_strings_prefix(
@@ -1074,6 +1233,74 @@ struct prefix_tie_breaker {
                     d_indices_out);
   }
 
+  return sorted_indices;
+}
+
+bool strings_grad_all_segments_fit(column_view const& segment_offsets, rmm::cuda_stream_view stream)
+{
+  auto const num_segments = segment_offsets.size() - 1;
+  auto const d_offsets    = segment_offsets.begin<size_type>();
+  auto const oversized =
+    thrust::count_if(rmm::exec_policy_nosync(stream, cudf::get_current_device_resource_ref()),
+                     cuda::counting_iterator<size_type>{0},
+                     cuda::counting_iterator<size_type>{num_segments},
+                     segment_exceeds_size{d_offsets, STRINGS_GRAD_WARP_CAP});
+  return oversized == 0;
+}
+
+[[nodiscard]] std::unique_ptr<column> fast_segmented_sorted_order_strings_grad(
+  column_view const& input,
+  column_view const& segment_offsets,
+  sort_polarity polarity,
+  rmm::cuda_stream_view stream,
+  rmm::device_async_resource_ref mr)
+{
+  auto const num_elements = input.size();
+  auto const num_segments = segment_offsets.size() - 1;
+  auto const d_input      = column_device_view::create(input, stream);
+  auto const has_nulls    = input.has_nulls();
+  auto const d_offsets    = segment_offsets.begin<size_type>();
+
+  auto sorted_indices = cudf::make_numeric_column(
+    data_type{type_to_id<size_type>()}, num_elements, mask_state::UNALLOCATED, stream, mr);
+  auto* const d_out = sorted_indices->mutable_view().begin<size_type>();
+
+  // The band kernel walks an explicit segment list; this path sorts every segment, so the list is
+  // the identity sequence shared by every band.
+  rmm::device_uvector<size_type> seg_list(num_segments, stream);
+  thrust::sequence(rmm::exec_policy_nosync(stream, cudf::get_current_device_resource_ref()),
+                   seg_list.begin(),
+                   seg_list.end(),
+                   0);
+
+  // The bottom bands take the 8-byte comparator key, the upper bands the 16-byte prekey; both
+  // triples carry the requested `polarity`. The pad class stays fixed at `tier_pad`, which ranks
+  // strictly above either element class regardless of polarity.
+  auto const cmp_build = strings_grad_cmp_key_builder{*d_input, has_nulls, polarity};
+  auto const cmp_less  = strings_grad_cmp_less{*d_input, polarity};
+  auto const cmp_pad   = strings_grad_cmp_key{0, static_cast<cuda::std::uint32_t>(tier_pad)};
+  auto const pre_build = strings_grad_prekey_builder{*d_input, has_nulls, polarity};
+  auto const pre_less  = strings_grad_prekey_less{*d_input, polarity};
+  auto const pre_pad   = strings_grad_prekey{0, 0, static_cast<cuda::std::uint32_t>(tier_pad)};
+
+  // (0,8] sorts at one item per lane in an 8-slot tile; (8,16] at two items; then W16/W32 for the
+  // upper bands. Each band self-filters to its size slice over the shared segment list.
+  launch_strings_grad_band<8, 1>(
+    cmp_build, cmp_less, cmp_pad, d_offsets, seg_list.data(), num_segments, 0, 8, d_out, stream);
+  launch_strings_grad_band<8, 2>(
+    cmp_build, cmp_less, cmp_pad, d_offsets, seg_list.data(), num_segments, 8, 16, d_out, stream);
+  launch_strings_grad_band<16, 2>(
+    pre_build, pre_less, pre_pad, d_offsets, seg_list.data(), num_segments, 16, 32, d_out, stream);
+  launch_strings_grad_band<32, 2>(pre_build,
+                                  pre_less,
+                                  pre_pad,
+                                  d_offsets,
+                                  seg_list.data(),
+                                  num_segments,
+                                  32,
+                                  STRINGS_GRAD_WARP_CAP,
+                                  d_out,
+                                  stream);
   return sorted_indices;
 }
 

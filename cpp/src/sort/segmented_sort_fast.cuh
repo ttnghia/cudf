@@ -212,5 +212,37 @@ fixed_width_sort_path choose_fixed_width_sort_path(column_view const& key,
   rmm::cuda_stream_view stream,
   rmm::device_async_resource_ref mr);
 
+/**
+ * @brief Whether every segment fits the graduated path's largest warp tile
+ * (`STRINGS_GRAD_WARP_CAP`)
+ *
+ * One device count over the segment sizes plus its host synchronization, mirroring
+ * `decimal128_cub_segment_shape_ok`; the caller runs the cheap scalar gate checks first so this
+ * synchronizing probe is paid only for an otherwise-qualifying STRING column.
+ */
+bool strings_grad_all_segments_fit(column_view const& segment_offsets,
+                                   rmm::cuda_stream_view stream);
+
+/**
+ * @brief Segmented sorted-order for a STRING column via graduated in-warp sorts
+ *
+ * One virtual warp sorts each segment with `cub::WarpMergeSort` under a string comparator; the warp
+ * width follows the segment-size band (W8 for sizes <= 16, W16 for 17-32, W32 for 33-64, two items
+ * per lane, except the (0,8] slice at one), so a tiny segment never occupies a full warp. The
+ * bottom bands use the 8-byte comparator key and the upper bands the 16-byte prekey. Every band
+ * launches over the full segment list and self-filters to its size slice; the bands partition [1,
+ * 64], so every output slot is written exactly once (an empty segment has none). The caller
+ * guarantees every segment holds at most `STRINGS_GRAD_WARP_CAP` elements
+ * (`strings_grad_all_segments_fit`) and offsets spanning all rows. `polarity` folds the requested
+ * order and null placement into the keys, matching `fast_segmented_sorted_order_strings_prefix`,
+ * whose output contract this shares: indices mapping the column to its segmented sorted order.
+ */
+[[nodiscard]] std::unique_ptr<column> fast_segmented_sorted_order_strings_grad(
+  column_view const& input,
+  column_view const& segment_offsets,
+  sort_polarity polarity,
+  rmm::cuda_stream_view stream,
+  rmm::device_async_resource_ref mr);
+
 }  // namespace detail
 }  // namespace cudf
