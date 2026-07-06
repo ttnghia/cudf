@@ -37,26 +37,32 @@ struct column_fast_sort_fn {
   /**
    * @brief Run-time check for faster segmented sort on an eligible column
    *
-   * Fast segmented sort can handle integral types including
-   * decimal types if dispatch_storage_type is used but it does not support int128.
+   * Fast segmented sort handles integral types, and the fixed-point reps via
+   * `dispatch_storage_type`. The `__int128` DECIMAL128 rep is admitted for the unstable sort only;
+   * the stable sort keeps the historical set so its behavior stays byte-for-byte identical to
+   * upstream.
    */
   static bool is_fast_sort_supported(column_view const& col)
   {
-    return !col.has_nulls() and
-           (cudf::is_integral(col.type()) ||
-            (cudf::is_fixed_point(col.type()) and (col.type().id() != type_id::DECIMAL128)));
+    auto const decimal128_ok =
+      col.type().id() == type_id::DECIMAL128 and method == sort_method::UNSTABLE;
+    return !col.has_nulls() and (cudf::is_integral(col.type()) ||
+                                 (cudf::is_fixed_point(col.type()) and
+                                  (col.type().id() != type_id::DECIMAL128 or decimal128_ok)));
   }
 
   /**
    * @brief Compile-time check for supporting fast segmented sort for a specific type
    *
-   * The dispatch_storage_type means we can check for integral types to
-   * include fixed-point types but the CUB limitation means we need to exclude int128.
+   * The `dispatch_storage_type` lets the integral check cover the fixed-point reps. The `__int128`
+   * DECIMAL128 rep is admitted for the unstable sort only, matching the run-time gate; the stable
+   * sort excludes it so its instantiations stay byte-for-byte identical to upstream.
    */
   template <typename T>
   static constexpr bool is_fast_sort_supported()
   {
-    return cudf::is_integral<T>() and !std::is_same_v<__int128, T>;
+    return (cudf::is_integral<T>() and !std::is_same_v<__int128, T>) or
+           (std::is_same_v<__int128, T> and method == sort_method::UNSTABLE);
   }
 
   template <typename T>
@@ -284,10 +290,11 @@ std::unique_ptr<column> segmented_sorted_order_common(
 
   // fast-path for a single fixed-width key column sorted ascending with nulls last (unstable only).
   // For a tiered-eligible type, `choose_fixed_width_sort_path` routes a null-bearing column, or a
-  // no-null column with short lists, to an in-register / in-warp tiered sort, and a no-null column
-  // with long enough lists to one global packed-radix sort; a packed-radix-eligible type outside
-  // the tiered set takes the packed-radix sort when null-bearing or when the CUB segmented sort is
-  // not preferred for its shape. Both engines reproduce the comparison sort's ascending /
+  // no-null column with short lists, to an in-register / in-warp tiered sort; a no-null column
+  // with long enough lists to one global packed-radix sort; and a no-null wider-rep column whose
+  // mid-band shape suits it to CUB `DeviceSegmentedSort`. A packed-radix-eligible type outside the
+  // tiered set takes the packed-radix sort when null-bearing or when the CUB segmented sort is
+  // not preferred for its shape. These engines reproduce the comparison sort's ascending /
   // nulls-last order without a cardinality-scaled cost, and any shape the gate declines falls
   // through to the pre-existing CUB-fast-sort-or-comparison decision below. The order and null
   // precedence must be stated explicitly, so any other configuration -- including the
@@ -299,15 +306,18 @@ std::unique_ptr<column> segmented_sorted_order_common(
         column_order.front() == order::ASCENDING and null_precedence.size() == 1 and
         null_precedence.front() == null_order::AFTER and
         fast_path_offsets_cover_all_rows(segment_offsets, keys.num_rows(), stream)) {
-      auto const path =
-        choose_fixed_width_sort_path(keys.column(0), keys.num_rows(), segment_offsets, stream);
-      if (path == fixed_width_sort_path::tiered) {
-        return fast_segmented_sorted_order_tiered(
-          keys.column(0), segment_offsets, sort_polarity{}, stream, mr);
-      }
-      if (path == fixed_width_sort_path::packed_radix) {
-        return fast_segmented_sorted_order_numeric_packed(
-          keys.column(0), segment_offsets, sort_polarity{}, stream, mr);
+      switch (
+        choose_fixed_width_sort_path(keys.column(0), keys.num_rows(), segment_offsets, stream)) {
+        case fixed_width_sort_path::tiered:  // short lists, or any nulls
+          return fast_segmented_sorted_order_tiered(
+            keys.column(0), segment_offsets, sort_polarity{}, stream, mr);
+        case fixed_width_sort_path::packed_radix:  // long no-null lists
+          return fast_segmented_sorted_order_numeric_packed(
+            keys.column(0), segment_offsets, sort_polarity{}, stream, mr);
+        case fixed_width_sort_path::cub_segmented:  // wider-rep no-null mid band
+          return fast_segmented_sorted_order<method>(
+            keys.column(0), segment_offsets, column_order.front(), stream, mr);
+        case fixed_width_sort_path::comparison: break;  // outside the fast envelope; fall through
       }
     }
   }

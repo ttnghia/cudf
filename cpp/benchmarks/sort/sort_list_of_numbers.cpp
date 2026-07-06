@@ -23,13 +23,14 @@
 // lowers to. The type axis spans the integral, floating-point, and decimal128 fixed-width paths.
 // For an explicit ascending / nulls-after sort, the shape axes straddle the fast-path routing's
 // measured crossovers: max_list_size 4 gives tiny lists, which the tiered network / warp tiers
-// claim; 32 the mid-size band the tiered kernel also claims; and 256 the long-list band the packed
-// radix claims. null_frequency 0.1 injects element-level (leaf) nulls, which route every supported
+// claim; 32 the mid-size band where the no-null routing splits by type (some columns to CUB
+// DeviceSegmentedSort, some to the tiered kernel); and 256 the long-list band the packed radix
+// claims. null_frequency 0.1 injects element-level (leaf) nulls, which route every supported
 // column to the tiered kernel (it orders nulls last in-register / in-warp), racing the comparison
-// sort the nullable case would otherwise use; 0 exercises the no-null routing that also weighs the
-// packed radix. DECIMAL128 and every other (order, null_order) combination keep the base routing:
-// CUB for eligible no-null integrals, otherwise the lexicographic comparator over a prepended
-// segment-id column.
+// sort the nullable case would otherwise use; 0 exercises the no-null routing that also weighs
+// DeviceSegmentedSort and the packed radix. Every other (order, null_order) combination keeps the
+// base routing: CUB for eligible no-null fixed-width types, otherwise the lexicographic comparator
+// over a prepended segment-id column.
 template <typename Type>
 void bench_sort_list_of_numbers(nvbench::state& state, nvbench::type_list<Type>)
 {
@@ -85,8 +86,9 @@ void bench_sort_list_of_numbers(nvbench::state& state, nvbench::type_list<Type>)
 }
 
 // Chrono is not on the type axis: its packed key is byte-identical to the int32/int64 rep it
-// extracts to, so those cells already measure it. decimal128 stays on the comparator fallback at
-// this stage and needs its own type-string mapping.
+// extracts to, so those cells already measure it. decimal128 exercises the range-gated DECIMAL128
+// radix keys (dec128_segmented_radix_sort picks an 8-byte min-biased key, a 12-byte prefix_key96,
+// or a two-phase hi64/lo64 sort) and needs its own type-string mapping.
 NVBENCH_DECLARE_TYPE_STRINGS(numeric::decimal128, "decimal128", "decimal128");
 
 NVBENCH_BENCH_TYPES(
@@ -95,8 +97,9 @@ NVBENCH_BENCH_TYPES(
     nvbench::type_list<std::int32_t, std::int64_t, float, double, numeric::decimal128>))
   .set_name("sort_list_of_numbers")
   .add_int64_axis("num_rows", {100'000, 1'000'000})
-  // 4 keeps lists tiny (the tiered network/warp tiers claim them); 32 is the mid band the tiered
-  // kernel also claims; 256 pushes the average past the packed-radix cutoff.
+  // 4 keeps lists tiny (the tiered network/warp tiers claim them); 32 is the mid band where the
+  // no-null routing splits by type between CUB DeviceSegmentedSort and the tiered kernel; 256
+  // pushes the average past the packed-radix cutoff.
   .add_int64_axis("max_list_size", {4, 32, 256})
   // No-null vs a realistic null rate; the null-bearing ascending / nulls-after cells route to the
   // tiered kernel (nulls ordered last in-register / in-warp).

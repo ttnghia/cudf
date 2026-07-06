@@ -146,5 +146,64 @@ __device__ inline void split_prefix(cuda::std::uint64_t packed,
   prefix_lo = static_cast<cuda::std::uint32_t>(packed & 0xFFFF'FFFFu);
 }
 
+/**
+ * @brief Flags the first position of each maximal run of equal keys (1 = head, 0 = continuation)
+ *
+ * Position 0 is always a head. An inclusive sum over these flags yields a dense, one-based run rank
+ * that is monotonic in the current sorted order and identical within a run -- two positions share a
+ * rank exactly when they share a key. The iterative path runs this over its window keys, whose
+ * leading field already carries the prior pass's run rank, so each new rank refines the old
+ * grouping without ever merging elements an earlier pass separated.
+ */
+struct key_head_flag {
+  prefix_key96 const* d_keys;
+  __device__ cuda::std::uint32_t operator()(size_type i) const
+  {
+    if (i == 0) { return 1u; }
+    return keys_equal(d_keys[i - 1], d_keys[i]) ? 0u : 1u;
+  }
+};
+
+/**
+ * @brief Flags positions whose key equals a neighbor, i.e. those in a run of two or more
+ *
+ * A position equal to its left or right neighbor is part of an unresolved prefix tie that later
+ * passes must reorder; a position equal to neither is a singleton already in its final place. Used
+ * to compact the sorted order down to just the still-tied positions so subsequent windows re-sort
+ * only that subset, leaving the resolved singletons and untied segments untouched. A null-classed
+ * position is never counted as tied: nulls are position-final after the first pass, so they are
+ * treated as singletons and left in place (matching `key_tied_flag_packed`). `null_flag` is the
+ * `seg_null` bit-0 value that marks a null -- 1 for the strings path and the numeric nulls-last
+ * polarity (the default), 0 under the numeric nulls-first polarity, whose valid elements carry
+ * bit 1 and must stay tie-detectable.
+ */
+struct key_tied_flag {
+  prefix_key96 const* d_keys;
+  size_type const num_elements;
+  cuda::std::uint32_t const null_flag = 1u;
+  __device__ bool operator()(size_type i) const
+  {
+    auto const cur = d_keys[i];
+    // A null-classed element is position-final, so it is never tied. Defends the loop against a
+    // stray null as the first-pass flag does; the path is unstable so null order is immaterial.
+    if ((cur.seg_null & 1u) == null_flag) { return false; }
+    auto const eq_prev = i > 0 && keys_equal(d_keys[i - 1], cur);
+    auto const eq_next = i + 1 < num_elements && keys_equal(d_keys[i + 1], cur);
+    return eq_prev || eq_next;
+  }
+};
+
+/**
+ * @brief Predicate: segment `i` spans more than `limit` elements
+ */
+struct segment_exceeds_size {
+  size_type const* d_offsets;
+  size_type limit;
+  __device__ bool operator()(size_type i) const
+  {
+    return (d_offsets[i + 1] - d_offsets[i]) > limit;
+  }
+};
+
 }  // namespace detail
 }  // namespace cudf

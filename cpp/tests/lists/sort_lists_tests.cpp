@@ -311,6 +311,63 @@ TEST_F(SortListsInt, NumericPackedTimestamps)
   }
 }
 
+// DECIMAL128 value-ordering at the extremes. Both cases are null-bearing, so both route to the
+// tiered kernel (24-byte tiered_key128); they differ only in segment length and null position. Each
+// covers
+// +/-10^37 reaching the high value words (10^37 ~ 2^123), the sign boundary at zero, a duplicated
+// low extreme, and a null. The __int128 rep is sign-flipped (XOR bit 127) then split big-endian, so
+// +10^37 sorts above every non-negative, -10^37 flips to a small key and sorts first, and the null
+// collects last under AFTER.
+TEST_F(SortListsInt, NumericPackedDecimal128Bounds)
+{
+  auto const pow10_37 = [] {
+    __int128_t v = 1;
+    for (int i = 0; i < 37; ++i) {
+      v *= 10;
+    }
+    return v;
+  }();
+  auto constexpr scale = numeric::scale_type{0};
+
+  {  // A longer row whose null routes it to the tiered kernel. Ascending order of the non-null
+    // values: the low extreme (duplicated), a run crossing zero, and the high extreme.
+    std::vector<__int128_t> ascending{-pow10_37, -pow10_37};
+    for (int i = -5; i <= 25; ++i) {
+      ascending.push_back(i);
+    }
+    ascending.push_back(pow10_37);
+    auto const null_pos = static_cast<cudf::size_type>(ascending.size());
+
+    // Input feeds the values reversed (so the sort does real work) with the leaf null first;
+    // expected is the ascending values with the null last. The null-slot value is ignored.
+    std::vector<__int128_t> in_vals;
+    in_vals.push_back(0);
+    in_vals.insert(in_vals.end(), ascending.rbegin(), ascending.rend());
+    std::vector<__int128_t> ex_vals(ascending.begin(), ascending.end());
+    ex_vals.push_back(0);
+
+    auto input    = as_single_row_list(cudf::test::fixed_point_column_wrapper<__int128_t>(
+                                      in_vals.begin(), in_vals.end(), null_at(0), scale)
+                                      .release());
+    auto expected = as_single_row_list(cudf::test::fixed_point_column_wrapper<__int128_t>(
+                                         ex_vals.begin(), ex_vals.end(), null_at(null_pos), scale)
+                                         .release());
+    expect_both_sort_paths_match(cudf::lists_column_view{input->view()}, expected->view());
+  }
+  {  // A short row whose null again routes it to the tiered kernel, covering the shorter-segment
+    // shape.
+    std::vector<__int128_t> const in{pow10_37, -pow10_37, -1, 0, 1, -pow10_37, 0};
+    std::vector<__int128_t> const ex{-pow10_37, -pow10_37, -1, 0, 1, pow10_37, 0};
+    auto input = as_single_row_list(
+      cudf::test::fixed_point_column_wrapper<__int128_t>(in.begin(), in.end(), null_at(3), scale)
+        .release());
+    auto expected = as_single_row_list(
+      cudf::test::fixed_point_column_wrapper<__int128_t>(ex.begin(), ex.end(), null_at(6), scale)
+        .release());
+    expect_both_sort_paths_match(cudf::lists_column_view{input->view()}, expected->view());
+  }
+}
+
 // Null-bearing BOOL8: `bool` is packed-radix-supported but not tiered, so any null routes it to the
 // packed radix at any list size. Exercises the bool branch of `radix_encode_u32` plus the packed
 // key's null bit, which no other test reaches (the TYPED Null test skips bool and the
@@ -628,6 +685,94 @@ TEST_F(SortListsInt, NumericMidBandChronoNoNull)
   }
 }
 
+// DECIMAL128 no-null mid band, the tiered / CUB / tiered trio: the shortest lists take the tiered
+// kernel, a mid band the lifted CUB `DeviceSegmentedSort` over the __int128 rep (its shape gate
+// passes for a single short segment), and lists above the mid band but below the packed-radix
+// cutoff the tiered kernel again. The CUB block also guards the __int128 fast-sort lift against the
+// comparison oracle. Values are distinct multiples of 10^30, spanning the sign boundary into the
+// high value words.
+TEST_F(SortListsInt, NumericMidBandDecimal128Cub)
+{
+  auto constexpr scale = numeric::scale_type{0};
+  auto const k         = [] {
+    __int128_t v = 1;
+    for (int i = 0; i < 30; ++i) {
+      v *= 10;
+    }
+    return v;
+  }();
+  auto const check_single_row = [&](cudf::size_type n) {
+    std::vector<__int128_t> in(n);
+    for (cudf::size_type i = 0; i < n; ++i) {
+      in[i] = static_cast<__int128_t>(n / 2 - i) * k;
+    }
+    std::vector<__int128_t> ex(in);
+    std::sort(ex.begin(), ex.end());
+    auto input = as_single_row_list(
+      cudf::test::fixed_point_column_wrapper<__int128_t>(in.begin(), in.end(), scale).release());
+    auto expected = as_single_row_list(
+      cudf::test::fixed_point_column_wrapper<__int128_t>(ex.begin(), ex.end(), scale).release());
+    expect_both_sort_paths_match(cudf::lists_column_view{input->view()}, expected->view());
+  };
+  check_single_row(8);   // average four: tiered kernel
+  check_single_row(16);  // average eight: DECIMAL128 mid band -> lifted CUB DeviceSegmentedSort
+  check_single_row(40);  // average twenty: above the CUB band, below packed radix -> tiered kernel
+  // The exact gate cells: average five is the first cell past the tiered tiny gate (avg > 4),
+  // average sixteen the last in-band CUB cell, average seventeen the first above-band tiered cell.
+  check_single_row(10);
+  check_single_row(32);
+  check_single_row(34);
+}
+
+// `decimal128_cub_segment_shape_ok` (the DECIMAL128 mid-band CUB-vs-tiered shape gate) is reached
+// only by NumericMidBandDecimal128Cub above, which always builds a single segment -- so its
+// "oversized segments are sparse" ratio (`oversized * 32 <= num_segments`) is never exercised
+// beyond one segment. This pins both outcomes at the same mid-band average list size (in (4, 16]):
+// a many-small-plus-two-large shape whose ratio holds (-> lifted CUB), and a few-small shape whose
+// ratio fails (-> tiered). Both must match the comparison oracle.
+TEST_F(SortListsInt, NumericMidBandDecimal128CubShapeGate)
+{
+  auto constexpr scale = numeric::scale_type{0};
+  auto const check =
+    [&](int num_small, cudf::size_type small_sz, int num_large, cudf::size_type large_sz) {
+      std::vector<__int128_t> in_vals;
+      std::vector<__int128_t> ex_vals;
+      std::vector<cudf::size_type> offsets{0};
+      auto const add_row = [&](cudf::size_type sz) {
+        std::vector<__int128_t> row(sz);
+        for (cudf::size_type i = 0; i < sz; ++i) {
+          row[i] = static_cast<__int128_t>(sz) - i;
+        }
+        for (auto const v : row) {
+          in_vals.push_back(v);
+        }
+        std::sort(row.begin(), row.end());
+        for (auto const v : row) {
+          ex_vals.push_back(v);
+        }
+        offsets.push_back(static_cast<cudf::size_type>(in_vals.size()));
+      };
+      for (int r = 0; r < num_small; ++r) {
+        add_row(small_sz);
+      }
+      for (int r = 0; r < num_large; ++r) {
+        add_row(large_sz);
+      }
+      auto const num_rows  = static_cast<cudf::size_type>(num_small + num_large);
+      auto const make_list = [&](std::vector<__int128_t> const& vals) {
+        cudf::test::fixed_point_column_wrapper<__int128_t> leaf(vals.begin(), vals.end(), scale);
+        cudf::test::fixed_width_column_wrapper<cudf::size_type> off(offsets.begin(), offsets.end());
+        return cudf::make_lists_column(num_rows, off.release(), leaf.release(), 0, {});
+      };
+      auto const input    = make_list(in_vals);
+      auto const expected = make_list(ex_vals);
+      expect_both_sort_paths_match(cudf::lists_column_view{input->view()}, expected->view());
+    };
+  check(200, 10, 2, 40);  // avg ~10, oversized=2: 2*32=64 <= 202 -> shape OK  -> lifted CUB
+  check(10, 10, 2, 40);   // avg ~15, oversized=2: 2*32=64 >  12  -> shape bad -> tiered
+  check(62, 10, 2, 40);   // exact ratio cell: 2*32=64 == 64 segments -> shape still OK (<=) -> CUB
+}
+
 // The exact average-list-size cells of the packed-radix gate (avg >= 100): a 200-element single row
 // (two offsets -> average exactly 100) is the first packed-radix shape, and a 198-element row
 // (average 99) the last tiered shape. Both must reproduce the comparison order, pinning the gate's
@@ -898,6 +1043,138 @@ TEST_F(SortListsInt, NumericTieredW32x1Nulls)
   };
   run(int32_t{});
   run(int64_t{});
+}
+
+// DECIMAL128 no-null long lists route to the full-column packed radix (Site A), which picks the
+// narrowest lossless key from the value range: a range under 2^32 -> min-biased uint64 (eight
+// passes), fitting int64 -> prefix_key96 (twelve passes), else the two-phase hi64/lo64 sort. One
+// single row of 250 values per regime (avg 125 >= 100 -> Site A), including a wide row engineered
+// with two sign clusters that share a high word so the two-phase second pass fires. Verified
+// against the oracle.
+TEST_F(SortListsInt, NumericDecimal128ComposedSiteA)
+{
+  auto constexpr scale    = numeric::scale_type{0};
+  cudf::size_type const n = 250;  // single row, avg 125 >= 100 -> full-column packed radix (Site A)
+  auto const check        = [&](std::vector<__int128_t> const& in) {
+    std::vector<__int128_t> ex(in);
+    std::sort(ex.begin(), ex.end());
+    auto input = as_single_row_list(
+      cudf::test::fixed_point_column_wrapper<__int128_t>(in.begin(), in.end(), scale).release());
+    auto expected = as_single_row_list(
+      cudf::test::fixed_point_column_wrapper<__int128_t>(ex.begin(), ex.end(), scale).release());
+    expect_both_sort_paths_match(cudf::lists_column_view{input->view()}, expected->view());
+  };
+  {  // small: value range < 2^32 -> min-biased uint64 key
+    std::vector<__int128_t> in(n);
+    for (cudf::size_type i = 0; i < n; ++i) {
+      in[i] = static_cast<__int128_t>(n / 2 - i);
+    }
+    check(in);
+  }
+  {  // fits int64 (range > 2^32) -> prefix_key96 key
+    auto const step = static_cast<__int128_t>(int64_t{1} << 40);  // 2^40 > 2^32
+    std::vector<__int128_t> in(n);
+    for (cudf::size_type i = 0; i < n; ++i) {
+      in[i] = static_cast<__int128_t>(n / 2 - i) * step;
+    }
+    check(in);
+  }
+  {  // wide, distinct high words -> two-phase, phase one resolves (no tie pass)
+    auto const step = static_cast<__int128_t>(1) << 90;  // > int64, distinct hi64
+    std::vector<__int128_t> in(n);
+    for (cudf::size_type i = 0; i < n; ++i) {
+      in[i] = static_cast<__int128_t>(n / 2 - i) * step;
+    }
+    check(in);
+  }
+  {  // wide with shared high words -> two-phase second pass fires (two sign clusters, distinct
+     // lo64)
+    auto const base = static_cast<__int128_t>(1) << 100;
+    std::vector<__int128_t> in;
+    for (int i = 0; i < 125; ++i) {
+      in.push_back(-base + i);
+    }
+    for (int i = 0; i < 125; ++i) {
+      in.push_back(base + i);
+    }  // 250 total -> avg 125 -> Site A
+    check(in);
+  }
+}
+
+// DECIMAL128 with nulls routes to the tiered path; a segment above the warp cap (64) becomes a
+// radix outlier sorted by the compact-large-segment path (Site B), which uses the same range-gated
+// key selection. One single row of 200 elements: null-mixed with a wide two-cluster range
+// (two-phase second pass fires, nulls excluded and placed last), and an all-null row (degenerate
+// range -> the cheapest key, every element a position-final null). Verified against the comparison
+// oracle.
+TEST_F(SortListsInt, NumericDecimal128ComposedSiteB)
+{
+  auto constexpr scale    = numeric::scale_type{0};
+  cudf::size_type const n = 200;  // one segment > 64 -> radix-tier outlier -> compact path (Site B)
+  auto const check        = [&](std::vector<__int128_t> const& in, std::vector<bool> const& valid) {
+    std::vector<__int128_t> nn;
+    for (cudf::size_type i = 0; i < n; ++i) {
+      if (valid[i]) { nn.push_back(in[i]); }
+    }
+    std::sort(nn.begin(), nn.end());
+    std::vector<__int128_t> ex = nn;
+    std::vector<bool> ex_v(nn.size(), true);
+    ex.resize(n, __int128_t{0});
+    ex_v.resize(n, false);
+    auto input = as_single_row_list(
+      cudf::test::fixed_point_column_wrapper<__int128_t>(in.begin(), in.end(), valid.begin(), scale)
+        .release());
+    auto expected = as_single_row_list(
+      cudf::test::fixed_point_column_wrapper<__int128_t>(ex.begin(), ex.end(), ex_v.begin(), scale)
+        .release());
+    expect_both_sort_paths_match(cudf::lists_column_view{input->view()}, expected->view());
+  };
+  {  // null-mixed wide with shared high words: two-phase second pass fires, nulls placed last
+    auto const base = static_cast<__int128_t>(1) << 100;
+    std::vector<__int128_t> in;
+    std::vector<bool> valid;
+    for (int i = 0; i < 100; ++i) {
+      in.push_back(-base + i);
+      valid.push_back(i % 7 != 3);
+    }
+    for (int i = 0; i < 100; ++i) {
+      in.push_back(base + i);
+      valid.push_back(i % 5 != 2);
+    }
+    check(in, valid);
+  }
+  {  // all-null: degenerate range -> cheapest key; every element sorts as a position-final null
+    std::vector<__int128_t> const in(n, __int128_t{0});
+    std::vector<bool> const valid(n, false);
+    check(in, valid);
+  }
+}
+
+// The Site A range gate's 2^32 boundary: a span of exactly 2^32 - 1 takes the min-biased uint64 key
+// (the biased value still fits uint32), exactly 2^32 the wider prefix_key96 (it would overflow).
+// One single row of 250 no-null values (avg 125 >= 100 -> Site A) with min 0 and max at each
+// boundary; both must reproduce the comparison order, proving the biased key is lossless up to the
+// boundary.
+TEST_F(SortListsInt, NumericDecimal128RangeGateBoundary)
+{
+  auto constexpr scale    = numeric::scale_type{0};
+  cudf::size_type const n = 250;  // single row, avg 125 >= 100 -> Site A range gate
+  auto const check        = [&](__int128_t span) {
+    std::vector<__int128_t> in(n);
+    for (cudf::size_type i = 0; i < n; ++i) {
+      in[i] = (span / (n - 1)) * i;
+    }
+    in[n - 1] = span;  // exact max, so the range is [0, span]
+    std::vector<__int128_t> ex(in);
+    std::sort(ex.begin(), ex.end());
+    auto input = as_single_row_list(
+      cudf::test::fixed_point_column_wrapper<__int128_t>(in.begin(), in.end(), scale).release());
+    auto expected = as_single_row_list(
+      cudf::test::fixed_point_column_wrapper<__int128_t>(ex.begin(), ex.end(), scale).release());
+    expect_both_sort_paths_match(cudf::lists_column_view{input->view()}, expected->view());
+  };
+  check((static_cast<__int128_t>(1) << 32) - 1);  // span 2^32 - 1 -> min-biased uint64 (lossless)
+  check(static_cast<__int128_t>(1) << 32);        // span 2^32     -> prefix_key96
 }
 
 TEST_F(SortListsInt, NestedListElement)

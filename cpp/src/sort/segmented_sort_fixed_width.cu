@@ -9,6 +9,7 @@
 
 #include <cudf/column/column_device_view.cuh>
 #include <cudf/column/column_factories.hpp>
+#include <cudf/detail/device_scalar.hpp>
 #include <cudf/detail/labeling/label_segments.cuh>
 #include <cudf/detail/utilities/assert.cuh>
 #include <cudf/detail/utilities/grid_1d.cuh>
@@ -26,6 +27,7 @@
 
 #include <cub/device/device_partition.cuh>
 #include <cub/device/device_radix_sort.cuh>
+#include <cub/device/device_scan.cuh>
 #include <cub/device/device_select.cuh>
 #include <cub/warp/warp_merge_sort.cuh>
 #include <cuda/iterator>
@@ -35,9 +37,11 @@
 #include <cuda/std/cstdint>
 #include <cuda/std/limits>
 #include <cuda/std/type_traits>
+#include <thrust/count.h>
 #include <thrust/scatter.h>
 #include <thrust/sequence.h>
 #include <thrust/transform.h>
+#include <thrust/transform_reduce.h>
 
 namespace cudf {
 namespace detail {
@@ -198,6 +202,524 @@ struct numeric_packed_key_builder64 {
   }
 };
 
+// A DECIMAL128 segment set is sorted by the narrowest lossless radix key its value range admits,
+// rather than an unconditional twenty-pass 160-bit key. One range reduction picks a min-biased
+// `uint64` (range < 2^32, eight passes), a `prefix_key96` (range fits int64, twelve passes), or a
+// two-phase hi64-then-lo64 sort (genuine 128-bit range) -- the machinery below, shared by the
+// full-column and compact-large-segment DECIMAL128 radix sites.
+
+/**
+ * @brief Inclusive value range [min, max] over a set of `__int128` (DECIMAL128) elements
+ *
+ * Reduced across the elements a DECIMAL128 radix site is about to sort so the site can pick the
+ * narrowest key that still encodes every value (the width gate). Nulls contribute the identity and
+ * are skipped: a null is placed by its key class alone, so its value is never compared.
+ */
+struct dec128_value_range {
+  __int128_t min_val;
+  __int128_t max_val;
+};
+
+// Identity for the range reduction: a min seeded to the largest `__int128` and a max to the
+// smallest, so any real value wins both and a null-only (or empty) set leaves the range degenerate.
+__host__ __device__ inline dec128_value_range dec128_value_range_identity()
+{
+  auto constexpr i128_max = static_cast<__int128_t>((static_cast<unsigned __int128>(1) << 127) - 1);
+  return dec128_value_range{i128_max, static_cast<__int128_t>(-i128_max - 1)};
+}
+
+/// Combines two `dec128_value_range`s: min of the minima, max of the maxima. Associative and
+/// commutative, as `thrust::transform_reduce` requires.
+struct dec128_value_range_combine {
+  __device__ dec128_value_range operator()(dec128_value_range const& a,
+                                           dec128_value_range const& b) const
+  {
+    return dec128_value_range{a.min_val < b.min_val ? a.min_val : b.min_val,
+                              a.max_val > b.max_val ? a.max_val : b.max_val};
+  }
+};
+
+/**
+ * @brief Maps an element index to its single-value range; a null contributes the identity
+ *
+ * The index is a global element index -- the full-column path passes the element ordinals, the
+ * compact-large-segment path the radix-tier global indices -- so the same functor reduces either
+ * set.
+ */
+struct dec128_value_range_fn {
+  column_device_view d_input;
+  bool has_nulls;
+  __device__ dec128_value_range operator()(size_type idx) const
+  {
+    if (has_nulls && d_input.is_null(idx)) { return dec128_value_range_identity(); }
+    auto const value = d_input.element<__int128_t>(idx);
+    return dec128_value_range{value, value};
+  }
+};
+
+/**
+ * @brief Builds the single-`uint64` gate key for a DECIMAL128 element whose column-wide value range
+ * spans fewer than 2^32 (the min-biased path)
+ *
+ * Same layout as `numeric_packed_key_builder`: `[segment : S bits][class : 1][value : 32 bits]`.
+ * The value is `v - min_val`, which lies in `[0, range]` with `range < 2^32` and is monotonic in
+ * `v` -- complemented within the 32-bit field when descending, which reverses that order while
+ * staying inside the field -- so an unsigned compare orders by segment, then by the polarity's
+ * null placement, then by value, at eight byte-passes instead of the twenty a full 128-bit key
+ * needs. A null carries a zero value and its class bit one bit above the value field.
+ */
+struct dec128_biased_u64_key_builder {
+  size_type const* d_segment_ids;
+  column_device_view const d_input;
+  bool const has_nulls;
+  int const segment_bits;
+  __int128_t const min_val;
+  sort_polarity const polarity;
+  __device__ cuda::std::uint64_t operator()(size_type idx) const
+  {
+    auto const segment_part = static_cast<cuda::std::uint64_t>(d_segment_ids[idx])
+                              << (64 - segment_bits);
+    if (has_nulls && d_input.is_null(idx)) {
+      return segment_part | (static_cast<cuda::std::uint64_t>(polarity.element_class(true))
+                             << (sizeof(cuda::std::uint32_t) * 8));
+    }
+    auto const biased = static_cast<cuda::std::uint32_t>(
+      static_cast<unsigned __int128>(d_input.element<__int128_t>(idx)) -
+      static_cast<unsigned __int128>(min_val));
+    return segment_part |
+           (static_cast<cuda::std::uint64_t>(polarity.element_class(false))
+            << (sizeof(cuda::std::uint32_t) * 8)) |
+           static_cast<cuda::std::uint64_t>(biased ^ polarity.value_mask32());
+  }
+};
+
+/**
+ * @brief Builds the twelve-byte `prefix_key96` gate key for a DECIMAL128 element whose value fits
+ * `int64` (the fits-int64 path)
+ *
+ * Reuses `numeric_packed_key_builder64`'s layout but sources the value from the 128-bit rep
+ * narrowed to `int64` and re-encoded at 64 bits, so tied segments order by the full
+ * (int64-representable) value at twelve byte-passes instead of twenty. The caller guarantees every
+ * non-null value is `int64`-representable, so the narrowing is lossless.
+ */
+struct dec128_int64_key_builder {
+  size_type const* d_segment_ids;
+  column_device_view const d_input;
+  bool const has_nulls;
+  sort_polarity const polarity;
+  __device__ prefix_key96 operator()(size_type idx) const
+  {
+    auto const segment = static_cast<cuda::std::uint32_t>(d_segment_ids[idx]);
+    if (has_nulls && d_input.is_null(idx)) {
+      return prefix_key96{pack_seg_null(segment, polarity.element_class(true)), 0u, 0u};
+    }
+    prefix_key96 key{pack_seg_null(segment, polarity.element_class(false)), 0u, 0u};
+    split_prefix(radix_encode_u64<int64_t>(static_cast<int64_t>(d_input.element<__int128_t>(idx))) ^
+                   polarity.value_mask64(),
+                 key.prefix_hi,
+                 key.prefix_lo);
+    return key;
+  }
+};
+
+/**
+ * @brief Phase-one key of the two-phase DECIMAL128 sort: `prefix_key96` {seg_null, high 64 bits}
+ *
+ * The value words carry the high 64 bits of the sign-flipped 128-bit encoding (the bit-127 flip
+ * lands on bit 63 of that word), complemented when descending -- equal high words stay equal, so
+ * the phase-two tie set is polarity-independent while the resolved order reverses. A first radix
+ * over (segment, class, hi64) thus orders every element whose hi64 differs and leaves only exact
+ * hi64 ties for the low-64 phase. A null sets its class bit and leaves the words zero, sorting on
+ * the polarity's side.
+ */
+struct dec128_hi64_key_builder {
+  size_type const* d_segment_ids;
+  column_device_view const d_input;
+  bool const has_nulls;
+  sort_polarity const polarity;
+  __device__ prefix_key96 operator()(size_type idx) const
+  {
+    auto const segment = static_cast<cuda::std::uint32_t>(d_segment_ids[idx]);
+    if (has_nulls && d_input.is_null(idx)) {
+      return prefix_key96{pack_seg_null(segment, polarity.element_class(true)), 0u, 0u};
+    }
+    prefix_key96 key{pack_seg_null(segment, polarity.element_class(false)), 0u, 0u};
+    auto const encoded = radix_encode_u128<__int128_t>(d_input.element<__int128_t>(idx));
+    split_prefix(static_cast<cuda::std::uint64_t>(encoded >> 64) ^ polarity.value_mask64(),
+                 key.prefix_hi,
+                 key.prefix_lo);
+    return key;
+  }
+};
+
+/**
+ * @brief Phase-two key of the two-phase DECIMAL128 sort: `prefix_key96` {run rank, low 64 bits}
+ *
+ * Applied only to the elements still tied after phase one (equal segment and hi64), which are all
+ * non-null. `d_run_ids` is a dense one-based rank over those tied elements, so the run rank
+ * dominates and keeps distinct (segment, hi64) runs apart while the low 64 bits -- unaffected by
+ * the bit-127 flip, hence equal to the raw low word, and complemented when descending so equal
+ * high words resolve in reversed value order -- order within a run. `d_child` maps each tied slot
+ * to its element's global index.
+ */
+struct dec128_lo64_key_builder {
+  cuda::std::uint32_t const* d_run_ids;
+  size_type const* d_child;
+  column_device_view const d_input;
+  sort_polarity const polarity;
+  __device__ prefix_key96 operator()(size_type i) const
+  {
+    prefix_key96 key{pack_seg_null(d_run_ids[i], 0u), 0u, 0u};
+    auto const value = static_cast<unsigned __int128>(d_input.element<__int128_t>(d_child[i]));
+    split_prefix(static_cast<cuda::std::uint64_t>(value) ^ polarity.value_mask64(),
+                 key.prefix_hi,
+                 key.prefix_lo);
+    return key;
+  }
+};
+
+/**
+ * @brief Two-phase DECIMAL128 sort: order by the high 64 value bits, then resolve exact hi64 ties
+ * by the low 64 bits
+ *
+ * `global_indices` lists the elements' global indices and is the paired sort value, so `d_order[j]`
+ * receives the global index of the j-th smallest element. Phase one radix-sorts a twelve-byte key
+ * {segment, null, hi64}; on data whose high words differ this alone is the order. Only elements
+ * sharing (segment, hi64) with a neighbor -- nulls excluded, being position-final -- take phase
+ * two, which re-sorts just those by {dense run rank, lo64} and scatters the refined order back into
+ * their (ascending) slots. Correct because the sign-flipped 128-bit encoding compares
+ * lexicographically hi64 then lo64, so the two passes together reproduce full value order at
+ * twelve-byte keys. Each phase trims the radix end bit to the significant width of its leading
+ * field -- the segment field in phase one, the run-rank field in phase two -- whose higher bits are
+ * constant zero across every key.
+ */
+inline void dec128_two_phase_sort(column_device_view const& d_input,
+                                  size_type const* d_segment_ids,
+                                  bool has_nulls,
+                                  sort_polarity polarity,
+                                  size_type const* global_indices,
+                                  size_type num_elements,
+                                  int segment_bits,
+                                  size_type* d_order,
+                                  rmm::cuda_stream_view stream)
+{
+  // The run rank rides seg_null's high 31 bits and phase two's null flag (always zero) its bit 0,
+  // the same (label << 1) | flag packing the shipped keys use, so the shift must fit a uint32.
+  static_assert(2ull * cuda::std::numeric_limits<size_type>::max() + 1ull <=
+                  cuda::std::numeric_limits<cuda::std::uint32_t>::max(),
+                "size_type run rank does not fit prefix_key96::seg_null after the shift");
+  auto const alloc      = cudf::get_current_device_resource_ref();
+  auto const counting   = cuda::counting_iterator<size_type>{0};
+  auto const decomposer = prefix_decomposer{};
+  // Phase one's leading field is seg_null = (segment << 1) | flag, significant to segment_bits + 1
+  // bits (capped at the 32-bit field); the constant-zero high bits are dropped from the radix.
+  auto const phase1_end = cuda::std::min(static_cast<int>(sizeof(prefix_key96) * 8),
+                                         64 + cuda::std::min(32, segment_bits + 1));
+
+  // Phase one: sort by (segment, null, hi64). `d_order` gets the sorted global indices; `k1` the
+  // sorted keys, read below to find exact hi64 ties.
+  rmm::device_uvector<prefix_key96> k1(num_elements, stream);
+  {
+    rmm::device_uvector<prefix_key96> keys_in(num_elements, stream);
+    thrust::transform(rmm::exec_policy_nosync(stream, alloc),
+                      global_indices,
+                      global_indices + num_elements,
+                      keys_in.begin(),
+                      dec128_hi64_key_builder{d_segment_ids, d_input, has_nulls, polarity});
+    rmm::device_buffer d_temp_storage;
+    size_t temp_storage_bytes = 0;
+    cub::DeviceRadixSort::SortPairs(d_temp_storage.data(),
+                                    temp_storage_bytes,
+                                    keys_in.data(),
+                                    k1.data(),
+                                    global_indices,
+                                    d_order,
+                                    num_elements,
+                                    decomposer,
+                                    0,
+                                    phase1_end,
+                                    stream.value());
+    d_temp_storage = rmm::device_buffer{temp_storage_bytes, stream};
+    cub::DeviceRadixSort::SortPairs(d_temp_storage.data(),
+                                    temp_storage_bytes,
+                                    keys_in.data(),
+                                    k1.data(),
+                                    global_indices,
+                                    d_order,
+                                    num_elements,
+                                    decomposer,
+                                    0,
+                                    phase1_end,
+                                    stream.value());
+  }
+
+  // Zero-tie gate: only elements sharing (segment, hi64) with a neighbor need the low-64 phase;
+  // nulls are position-final and excluded. On distinct-hi64 data nothing is tied, so phase one is
+  // the order.
+  auto const any_tied =
+    thrust::count_if(rmm::exec_policy_nosync(stream, alloc),
+                     counting,
+                     counting + num_elements,
+                     key_tied_flag{k1.data(), num_elements, polarity.element_class(true)}) > 0;
+  if (not any_tied) { return; }
+
+  // Compact the still-tied slots' output positions, global indices, and phase-one keys.
+  rmm::device_uvector<bool> tied_flags(num_elements, stream);
+  thrust::transform(rmm::exec_policy_nosync(stream, alloc),
+                    counting,
+                    counting + num_elements,
+                    tied_flags.begin(),
+                    key_tied_flag{k1.data(), num_elements, polarity.element_class(true)});
+  auto const num_tied = static_cast<size_type>(thrust::count(
+    rmm::exec_policy_nosync(stream, alloc), tied_flags.begin(), tied_flags.end(), true));
+
+  rmm::device_uvector<size_type> comp_pos(num_tied, stream);
+  rmm::device_uvector<size_type> child(num_tied, stream);
+  rmm::device_uvector<prefix_key96> tied_keys(num_tied, stream);
+  cudf::detail::device_scalar<size_type> d_num_tied(stream);
+  auto const select_flagged = [&](auto d_in, auto* d_out) {
+    rmm::device_buffer d_temp_storage;
+    size_t temp_storage_bytes = 0;
+    cub::DeviceSelect::Flagged(d_temp_storage.data(),
+                               temp_storage_bytes,
+                               d_in,
+                               tied_flags.data(),
+                               d_out,
+                               d_num_tied.data(),
+                               num_elements,
+                               stream.value());
+    d_temp_storage = rmm::device_buffer{temp_storage_bytes, stream};
+    cub::DeviceSelect::Flagged(d_temp_storage.data(),
+                               temp_storage_bytes,
+                               d_in,
+                               tied_flags.data(),
+                               d_out,
+                               d_num_tied.data(),
+                               num_elements,
+                               stream.value());
+  };
+  select_flagged(counting, comp_pos.data());
+  select_flagged(d_order, child.data());
+  select_flagged(k1.data(), tied_keys.data());
+
+  // Dense one-based run rank over the tied subset: one rank per (segment, hi64) run.
+  rmm::device_uvector<cuda::std::uint32_t> run_ids(num_tied, stream);
+  thrust::transform(rmm::exec_policy_nosync(stream, alloc),
+                    counting,
+                    counting + num_tied,
+                    run_ids.begin(),
+                    key_head_flag{tied_keys.data()});
+  {
+    rmm::device_buffer d_temp_storage;
+    size_t temp_storage_bytes = 0;
+    cub::DeviceScan::InclusiveSum(d_temp_storage.data(),
+                                  temp_storage_bytes,
+                                  run_ids.data(),
+                                  run_ids.data(),
+                                  num_tied,
+                                  stream.value());
+    d_temp_storage = rmm::device_buffer{temp_storage_bytes, stream};
+    cub::DeviceScan::InclusiveSum(d_temp_storage.data(),
+                                  temp_storage_bytes,
+                                  run_ids.data(),
+                                  run_ids.data(),
+                                  num_tied,
+                                  stream.value());
+  }
+
+  // Phase two: sort the tied subset by {run rank, lo64}. The run rank is bounded by the tied count,
+  // so its packed field (rank << 1) needs at most bit_width(num_tied) + 1 bits; the end bit trims
+  // to that, matching phase one's trim on its own leading field.
+  auto const run_field_bits = cuda::std::min(
+    32, static_cast<int>(cuda::std::bit_width(static_cast<cuda::std::uint64_t>(num_tied))) + 1);
+  auto const phase2_end =
+    cuda::std::min(static_cast<int>(sizeof(prefix_key96) * 8), 64 + run_field_bits);
+  rmm::device_uvector<prefix_key96> p2_in(num_tied, stream);
+  rmm::device_uvector<prefix_key96> p2_out(num_tied, stream);
+  rmm::device_uvector<size_type> child_sorted(num_tied, stream);
+  thrust::transform(rmm::exec_policy_nosync(stream, alloc),
+                    counting,
+                    counting + num_tied,
+                    p2_in.begin(),
+                    dec128_lo64_key_builder{run_ids.data(), child.data(), d_input, polarity});
+  {
+    rmm::device_buffer d_temp_storage;
+    size_t temp_storage_bytes = 0;
+    cub::DeviceRadixSort::SortPairs(d_temp_storage.data(),
+                                    temp_storage_bytes,
+                                    p2_in.data(),
+                                    p2_out.data(),
+                                    child.data(),
+                                    child_sorted.data(),
+                                    num_tied,
+                                    decomposer,
+                                    0,
+                                    phase2_end,
+                                    stream.value());
+    d_temp_storage = rmm::device_buffer{temp_storage_bytes, stream};
+    cub::DeviceRadixSort::SortPairs(d_temp_storage.data(),
+                                    temp_storage_bytes,
+                                    p2_in.data(),
+                                    p2_out.data(),
+                                    child.data(),
+                                    child_sorted.data(),
+                                    num_tied,
+                                    decomposer,
+                                    0,
+                                    phase2_end,
+                                    stream.value());
+  }
+  thrust::scatter(rmm::exec_policy_nosync(stream, alloc),
+                  child_sorted.begin(),
+                  child_sorted.end(),
+                  comp_pos.begin(),
+                  d_order);
+}
+
+/**
+ * @brief Sorts a DECIMAL128 element set within its segments, picking the narrowest lossless radix
+ * key from the value range
+ *
+ * `global_indices` lists the elements' global indices -- the full-column path passes a dense
+ * sequence, the compact-large-segment path the radix-tier indices -- and doubles as the paired sort
+ * value, so `d_order[j]` receives the global index of the j-th smallest element. A single range
+ * reduction (nulls skipped, one D->H sync) picks the key: a range under 2^32 takes a min-biased
+ * `uint64` (eight passes), a range fitting `int64` a `prefix_key96` (twelve passes, end bit
+ * trimmed), and a genuine 128-bit range the two-phase hi64-then-lo64 sort -- replacing the
+ * twenty-pass 160-bit key the width never needs. The reduction is bandwidth-bound and small against
+ * the radix it narrows.
+ */
+inline void dec128_segmented_radix_sort(column_device_view const& d_input,
+                                        size_type const* d_segment_ids,
+                                        bool has_nulls,
+                                        sort_polarity polarity,
+                                        int segment_bits,
+                                        size_type const* global_indices,
+                                        size_type num_elements,
+                                        size_type* d_order,
+                                        rmm::cuda_stream_view stream)
+{
+  // The segment ordinal rides seg_null's high 31 bits and the null flag its bit 0, the same
+  // (label << 1) | flag packing the shipped keys use, so the shift must fit a uint32.
+  static_assert(2ull * cuda::std::numeric_limits<size_type>::max() + 1ull <=
+                  cuda::std::numeric_limits<cuda::std::uint32_t>::max(),
+                "size_type segment label does not fit the packed key's seg_null after the shift");
+  auto const alloc = cudf::get_current_device_resource_ref();
+
+  // Range reduction over the sign-preserving raw values, nulls skipped; returns to the host.
+  auto const range = thrust::transform_reduce(rmm::exec_policy_nosync(stream, alloc),
+                                              global_indices,
+                                              global_indices + num_elements,
+                                              dec128_value_range_fn{d_input, has_nulls},
+                                              dec128_value_range_identity(),
+                                              dec128_value_range_combine{});
+
+  enum class key_width { u64_biased, key96, twophase };
+  auto width         = key_width::twophase;
+  __int128_t min_val = 0;
+  if (range.max_val < range.min_val) {
+    // No non-null value in the set: the null-only order is width-independent, so take the cheapest.
+    width = key_width::u64_biased;
+  } else {
+    auto const span =
+      static_cast<unsigned __int128>(range.max_val) - static_cast<unsigned __int128>(range.min_val);
+    auto constexpr i64_min = static_cast<__int128_t>(cuda::std::numeric_limits<int64_t>::min());
+    auto constexpr i64_max = static_cast<__int128_t>(cuda::std::numeric_limits<int64_t>::max());
+    if ((span >> 32) == 0) {
+      width   = key_width::u64_biased;
+      min_val = range.min_val;
+    } else if (range.min_val >= i64_min and range.max_val <= i64_max) {
+      width = key_width::key96;
+    } else {
+      width = key_width::twophase;
+    }
+  }
+
+  if (width == key_width::u64_biased) {
+    // Min-biased 32-bit value in a single uint64 key: eight byte-passes. The segment rides the high
+    // bits, so its end bit cannot be tightened, unlike the wider decomposer key.
+    rmm::device_uvector<cuda::std::uint64_t> keys_in(num_elements, stream);
+    rmm::device_uvector<cuda::std::uint64_t> keys_out(num_elements, stream);
+    thrust::transform(rmm::exec_policy_nosync(stream, alloc),
+                      global_indices,
+                      global_indices + num_elements,
+                      keys_in.begin(),
+                      dec128_biased_u64_key_builder{
+                        d_segment_ids, d_input, has_nulls, segment_bits, min_val, polarity});
+    rmm::device_buffer d_temp_storage;
+    size_t temp_storage_bytes = 0;
+    cub::DeviceRadixSort::SortPairs(d_temp_storage.data(),
+                                    temp_storage_bytes,
+                                    keys_in.data(),
+                                    keys_out.data(),
+                                    global_indices,
+                                    d_order,
+                                    num_elements,
+                                    0,
+                                    static_cast<int>(sizeof(cuda::std::uint64_t) * 8),
+                                    stream.value());
+    d_temp_storage = rmm::device_buffer{temp_storage_bytes, stream};
+    cub::DeviceRadixSort::SortPairs(d_temp_storage.data(),
+                                    temp_storage_bytes,
+                                    keys_in.data(),
+                                    keys_out.data(),
+                                    global_indices,
+                                    d_order,
+                                    num_elements,
+                                    0,
+                                    static_cast<int>(sizeof(cuda::std::uint64_t) * 8),
+                                    stream.value());
+  } else if (width == key_width::key96) {
+    // Value fits int64: prefix_key96, twelve byte-passes, end bit trimmed to seg_null's width.
+    auto const key96_end = cuda::std::min(static_cast<int>(sizeof(prefix_key96) * 8),
+                                          64 + cuda::std::min(32, segment_bits + 1));
+    rmm::device_uvector<prefix_key96> keys_in(num_elements, stream);
+    rmm::device_uvector<prefix_key96> keys_out(num_elements, stream);
+    thrust::transform(rmm::exec_policy_nosync(stream, alloc),
+                      global_indices,
+                      global_indices + num_elements,
+                      keys_in.begin(),
+                      dec128_int64_key_builder{d_segment_ids, d_input, has_nulls, polarity});
+    auto const decomposer = prefix_decomposer{};
+    rmm::device_buffer d_temp_storage;
+    size_t temp_storage_bytes = 0;
+    cub::DeviceRadixSort::SortPairs(d_temp_storage.data(),
+                                    temp_storage_bytes,
+                                    keys_in.data(),
+                                    keys_out.data(),
+                                    global_indices,
+                                    d_order,
+                                    num_elements,
+                                    decomposer,
+                                    0,
+                                    key96_end,
+                                    stream.value());
+    d_temp_storage = rmm::device_buffer{temp_storage_bytes, stream};
+    cub::DeviceRadixSort::SortPairs(d_temp_storage.data(),
+                                    temp_storage_bytes,
+                                    keys_in.data(),
+                                    keys_out.data(),
+                                    global_indices,
+                                    d_order,
+                                    num_elements,
+                                    decomposer,
+                                    0,
+                                    key96_end,
+                                    stream.value());
+  } else {
+    // Genuine 128-bit range: two-phase hi64-then-lo64, cheaper than the full 160-bit key.
+    dec128_two_phase_sort(d_input,
+                          d_segment_ids,
+                          has_nulls,
+                          polarity,
+                          global_indices,
+                          num_elements,
+                          segment_bits,
+                          d_order,
+                          stream);
+  }
+}
+
 /**
  * @brief Sorts a single fixed-width key column within its segments by one global radix sort
  *
@@ -216,12 +738,13 @@ struct numeric_packed_sort_fn {
   // Compile-time counterpart of the runtime gate `is_numeric_packed_radix_supported`: it must
   // accept exactly the same types, so widen the two together. Every fixed-width type the packed key
   // encodes losslessly -- integrals (incl. bool), floating point, timestamps/durations, and the
-  // DECIMAL32/64 storage reps (int32/int64). The non-fixed-width types (string, list, struct,
-  // dictionary) take the failing overload; the 16-byte DECIMAL128 rep is fenced off at run time.
+  // DECIMAL32/64/128 storage reps (int32/int64/__int128). The non-fixed-width types (string, list,
+  // struct, dictionary) take the failing overload.
   template <typename T>
   static constexpr bool is_supported()
   {
-    return cudf::is_integral<T>() or cudf::is_floating_point<T>() or cudf::is_chrono<T>();
+    return cudf::is_integral<T>() or cudf::is_floating_point<T>() or cudf::is_chrono<T>() or
+           cuda::std::is_same_v<__int128, T>;
   }
 
   template <typename T, CUDF_ENABLE_IF(is_supported<T>())>
@@ -336,10 +859,18 @@ struct numeric_packed_sort_fn {
                                         stream.value());
       }
     } else {
-      // The sixteen-byte DECIMAL128 (`__int128`) rep is out of this stage's scope: the run-time
-      // gate `is_numeric_packed_radix_supported` excludes it, so this branch is an unreached
-      // fail-safe until the DECIMAL128 engine lands.
-      CUDF_FAIL("Column type cannot be used with the numeric packed-radix segmented sort");
+      // Sixteen-byte value (the DECIMAL128 rep): pick the narrowest lossless radix key from the
+      // value range instead of an unconditional twenty-pass 160-bit key. `indices_in` is the dense
+      // global-index sequence, the key-build source and the paired sort value.
+      dec128_segmented_radix_sort(d_input,
+                                  d_segment_ids,
+                                  has_nulls,
+                                  polarity,
+                                  segment_bits,
+                                  indices_in.data(),
+                                  num_elements,
+                                  d_indices_out,
+                                  stream);
     }
   }
 
@@ -360,18 +891,17 @@ struct numeric_packed_sort_fn {
 /**
  * @brief Run-time predicate for the numeric packed-radix fast path on a key column's type
  *
- * True for every fixed-width type the path encodes losslessly: integrals (including `bool`), the
- * `DECIMAL32/64` fixed-point reps, floating point, and timestamps/durations. `DECIMAL128` (16-byte
- * rep) and the non-fixed-width types (string, list, struct, dictionary) are excluded.
+ * True for every fixed-width type the path encodes losslessly: integrals (including `bool`), all
+ * fixed-point types (`DECIMAL32/64/128`), floating point, and timestamps/durations.
+ * Only the non-fixed-width types (string, list, struct, dictionary) are excluded.
  *
  * @param type The key column's data type
  * @return true if the type is eligible for the packed-radix fast path
  */
 inline bool is_numeric_packed_radix_supported(data_type type)
 {
-  return cudf::is_integral(type) or
-         (cudf::is_fixed_point(type) and type.id() != type_id::DECIMAL128) or
-         cudf::is_floating_point(type) or cudf::is_chrono(type);
+  return cudf::is_integral(type) or cudf::is_fixed_point(type) or cudf::is_floating_point(type) or
+         cudf::is_chrono(type);
 }
 
 // ==========================================================================================
@@ -406,6 +936,12 @@ struct tiered_key128 {
   cuda::std::uint64_t hi;
   cuda::std::uint64_t lo;
   cuda::std::uint32_t flag;
+  __device__ bool operator<(tiered_key128 const& o) const
+  {
+    if (flag != o.flag) { return flag < o.flag; }
+    if (hi != o.hi) { return hi < o.hi; }
+    return lo < o.lo;
+  }
 };
 static_assert(sizeof(tiered_key128) == 24 and alignof(tiered_key128) == 8,
               "tiered_key128 must stay 24 bytes with 8-byte alignment");
@@ -1041,10 +1577,10 @@ void launch_bitonic_band(column_device_view const& d_input,
 /**
  * @brief Run-time predicate for the tiered fast path on a key column's type
  *
- * True for the reps the path instantiates: int32 / int64, plus FLOAT32 / FLOAT64 and every
- * TIMESTAMP / DURATION (whose int32 / int64 rep flows through the same width-keyed path via
- * `radix_encode_*`). DECIMAL128, DECIMAL32/64, the narrower integrals, and the non-fixed-width
- * types are excluded and fall through to the paths below.
+ * True for the reps the path instantiates: int32 / int64 and the DECIMAL128 `__int128` rep, plus
+ * FLOAT32 / FLOAT64 and every TIMESTAMP / DURATION (whose int32 / int64 rep flows through the same
+ * width-keyed path via `radix_encode_*`). DECIMAL32/64, the narrower integrals, and the
+ * non-fixed-width types are excluded and fall through to the paths below.
  *
  * @param type The key column's data type
  * @return true if the type is eligible for the tiered fast path
@@ -1052,7 +1588,7 @@ void launch_bitonic_band(column_device_view const& d_input,
 inline bool is_tiered_sort_supported(data_type type)
 {
   return type.id() == type_id::INT32 or type.id() == type_id::INT64 or
-         cudf::is_floating_point(type) or cudf::is_chrono(type);
+         type.id() == type_id::DECIMAL128 or cudf::is_floating_point(type) or cudf::is_chrono(type);
 }
 
 /**
@@ -1160,10 +1696,19 @@ void radix_sort_large_segments(column_device_view const& d_input,
                                     key_bits,
                                     stream.value());
   } else {
-    // The sixteen-byte DECIMAL128 (`__int128`) rep is out of this stage's scope: the run-time
-    // gate `is_tiered_sort_supported` excludes it, so this branch is an unreached fail-safe
-    // until the DECIMAL128 engine lands.
-    CUDF_FAIL("Column type cannot be used with the tiered segmented sort");
+    // Sixteen-byte value (the DECIMAL128 rep): pick the narrowest lossless radix key from the range
+    // over the compacted radix-tier indices, instead of an unconditional twenty-pass 160-bit key.
+    // `d_large_gidx` is the key-build source and paired value; `sorted_gidx` receives the subset's
+    // sorted order, which the scatter below places into the output.
+    dec128_segmented_radix_sort(d_input,
+                                d_segment_ids,
+                                has_nulls,
+                                polarity,
+                                segment_bits,
+                                d_large_gidx,
+                                num_large_elems,
+                                sorted_gidx.data(),
+                                stream);
   }
 
   // The j-th compacted (ascending) radix-tier index is the j-th radix-tier output slot;
@@ -1191,7 +1736,8 @@ struct tiered_sort_fn {
   static constexpr bool is_supported()
   {
     return cuda::std::is_same_v<T, int32_t> or cuda::std::is_same_v<T, int64_t> or
-           cudf::is_floating_point<T>() or cudf::is_chrono<T>();
+           cuda::std::is_same_v<T, __int128_t> or cudf::is_floating_point<T>() or
+           cudf::is_chrono<T>();
   }
 
   template <typename T, CUDF_ENABLE_IF(is_supported<T>())>
@@ -1400,6 +1946,41 @@ struct tiered_sort_fn {
   }
 };
 
+// Measured crossover below which the tiered kernel beats CUB and the packed radix for every type.
+constexpr size_type TIERED_MAX_TINY_AVG_LIST_SIZE{4};
+
+// Measured top of the DECIMAL128 no-null CUB band; above it the tiered kernel wins.
+constexpr size_type DECIMAL128_CUB_MAX_AVG_LIST_SIZE{16};
+
+// Measured cap of CUB's 16-byte-pair merge tile; longer segments fall to a costly per-block radix.
+constexpr size_type DECIMAL128_CUB_MAX_SEGMENT_SIZE{32};
+
+/**
+ * @brief Whether a `DECIMAL128` mid-band column's segment shape favors CUB `DeviceSegmentedSort`
+ *
+ * CUB degrades on long segments, so the mid band takes it only when long segments are sparse: the
+ * count of segments longer than `DECIMAL128_CUB_MAX_SEGMENT_SIZE`, scaled by that length, must stay
+ * within the segment count. Runs a single device count -- and so adds one host synchronization --
+ * only on the narrow `DECIMAL128` mid-band branch that calls it. The product is formed in 64-bit to
+ * avoid overflow when many segments are long.
+ *
+ * @param segment_offsets The segment offsets (segment count plus one)
+ * @param stream CUDA stream used for the device count
+ * @return true if the segment shape favors CUB `DeviceSegmentedSort`
+ */
+inline bool decimal128_cub_segment_shape_ok(column_view const& segment_offsets,
+                                            rmm::cuda_stream_view stream)
+{
+  auto const num_segments = segment_offsets.size() - 1;
+  auto const d_offsets    = segment_offsets.begin<size_type>();
+  auto const oversized =
+    thrust::count_if(rmm::exec_policy_nosync(stream, cudf::get_current_device_resource_ref()),
+                     cuda::counting_iterator<size_type>{0},
+                     cuda::counting_iterator<size_type>{num_segments},
+                     segment_exceeds_size{d_offsets, DECIMAL128_CUB_MAX_SEGMENT_SIZE});
+  return static_cast<int64_t>(oversized) * DECIMAL128_CUB_MAX_SEGMENT_SIZE <= num_segments;
+}
+
 }  // namespace
 
 [[nodiscard]] std::unique_ptr<column> fast_segmented_sorted_order_numeric_packed(
@@ -1480,7 +2061,7 @@ struct tiered_sort_fn {
 fixed_width_sort_path choose_fixed_width_sort_path(column_view const& key,
                                                    size_type num_rows,
                                                    column_view const& segment_offsets,
-                                                   [[maybe_unused]] rmm::cuda_stream_view stream)
+                                                   rmm::cuda_stream_view stream)
 {
   auto const type = key.type();
   // String / nested keys have no fixed-width fast path.
@@ -1501,6 +2082,16 @@ fixed_width_sort_path choose_fixed_width_sort_path(column_view const& key,
   // Long lists amortize the global packed-key radix's bandwidth-bound pass.
   if (avg_list_size >= MAX_AVG_LIST_SIZE_FOR_FAST_SORT) {
     return fixed_width_sort_path::packed_radix;
+  }
+
+  // DECIMAL128 no-null: tiny -> tiered, sparse-large mid band -> lifted CUB, longer -> tiered.
+  if (type.id() == type_id::DECIMAL128) {
+    if (avg_list_size <= TIERED_MAX_TINY_AVG_LIST_SIZE) { return fixed_width_sort_path::tiered; }
+    if (avg_list_size <= DECIMAL128_CUB_MAX_AVG_LIST_SIZE and
+        decimal128_cub_segment_shape_ok(segment_offsets, stream)) {
+      return fixed_width_sort_path::cub_segmented;
+    }
+    return fixed_width_sort_path::tiered;
   }
   // Floating point no-null short: tiered across the range.
   if (cudf::is_floating_point(type)) { return fixed_width_sort_path::tiered; }
