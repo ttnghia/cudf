@@ -430,6 +430,48 @@ TEST_F(SegmentedSortInt, FastPathPartialOffsetsPackedRadix)
   CUDF_TEST_EXPECT_TABLES_EQUAL(result->view(), cudf::table_view{{expected}});
 }
 
+// The descending analogue of FastPathPartialOffsetsPackedRadix: the packed-radix fast path also
+// folds every explicit (order, null_order) into its key, so the offsets-coverage guard must gate
+// its descending combos too. {100, 300} over 400 rows (average 200) would take the packed-radix
+// fast path; with the guard it sorts only [100, 300) descending and leaves the rest in place.
+TEST_F(SegmentedSortInt, FastPathPartialOffsetsPackedRadixDescending)
+{
+  using T                 = int;
+  cudf::size_type const n = 400;
+  std::vector<T> vals(n);
+  std::vector<T> ex(n);
+  for (cudf::size_type i = 0; i < n; ++i) {
+    vals[i] = i;  // strictly ascending, distinct
+    // [100, 300) sorts descending (299..100); the rest stay identity.
+    ex[i] = (i < 100 or i >= 300) ? vals[i] : (399 - i);
+  }
+  column_wrapper<T> col(vals.begin(), vals.end());
+  column_wrapper<T> expected(ex.begin(), ex.end());
+  column_wrapper<int> segments{{100, 300}};
+  cudf::table_view input{{col}};
+  auto result = cudf::segmented_sort_by_key(
+    input, input, segments, {cudf::order::DESCENDING}, {cudf::null_order::AFTER});
+  CUDF_TEST_EXPECT_TABLES_EQUAL(result->view(), cudf::table_view{{expected}});
+}
+
+// The descending analogue of FastPathPartialOffsetsNumeric: the fixed-width fast paths now accept
+// every explicit (order, null_order), so the offsets-coverage guard must gate those combos too.
+// With the guard, partial offsets {3, 7} take the comparison/CUB path, which sorts only [3, 7)
+// descending and leaves the out-of-segment rows in place; an unguarded fast path would relabel
+// the whole column.
+TEST_F(SegmentedSortInt, FastPathPartialOffsetsDescending)
+{
+  using T = int;
+  column_wrapper<T> col{{50, 51, 52, 40, 10, 30, 20, 57, 58, 59}};
+  column_wrapper<int> segments{{3, 7}};
+  cudf::table_view input{{col}};
+  // Rows 0-2 and 7-9 stay identity; [3, 7) = {40, 10, 30, 20} sorts descending to {40, 30, 20, 10}.
+  column_wrapper<T> expected{{50, 51, 52, 40, 30, 20, 10, 57, 58, 59}};
+  auto result = cudf::segmented_sort_by_key(
+    input, input, segments, {cudf::order::DESCENDING}, {cudf::null_order::AFTER});
+  CUDF_TEST_EXPECT_TABLES_EQUAL(result->view(), cudf::table_view{{expected}});
+}
+
 // Partial-coverage offsets {3, 7} on a STRING column route to the STRING prefix fast path when the
 // guard is absent; with the guard they take the comparison path, which sorts only [3, 7).
 TEST_F(SegmentedSortInt, FastPathPartialOffsetsStrings)
@@ -442,6 +484,23 @@ TEST_F(SegmentedSortInt, FastPathPartialOffsetsStrings)
   auto const input = cudf::table_view{{col}};
   auto result      = cudf::segmented_sort_by_key(
     input, input, segments, {cudf::order::ASCENDING}, {cudf::null_order::AFTER});
+  CUDF_TEST_EXPECT_TABLES_EQUAL(result->view(), cudf::table_view{{expected}});
+}
+
+// The descending analogue of FastPathPartialOffsetsStrings: the STRING prefix path now folds every
+// explicit (order, null_order) into its keys, so the offsets-coverage guard must gate the
+// descending combos too. With the guard, partial offsets {3, 7} take the comparison path, which
+// sorts only [3, 7) descending and leaves the out-of-segment rows in place.
+TEST_F(SegmentedSortInt, FastPathPartialOffsetsStringsDescending)
+{
+  cudf::test::strings_column_wrapper col{
+    "a0", "a1", "a2", "banana", "apple", "cherry", "date", "z7", "z8", "z9"};
+  cudf::test::strings_column_wrapper expected{
+    "a0", "a1", "a2", "date", "cherry", "banana", "apple", "z7", "z8", "z9"};
+  column_wrapper<int> segments{{3, 7}};
+  auto const input = cudf::table_view{{col}};
+  auto result      = cudf::segmented_sort_by_key(
+    input, input, segments, {cudf::order::DESCENDING}, {cudf::null_order::AFTER});
   CUDF_TEST_EXPECT_TABLES_EQUAL(result->view(), cudf::table_view{{expected}});
 }
 

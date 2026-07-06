@@ -21,16 +21,15 @@
 
 // Benchmark for cudf::lists::sort_lists on a LIST<numeric> column -- the operation Spark array_sort
 // lowers to. The type axis spans the integral, floating-point, and decimal128 fixed-width paths.
-// For an explicit ascending / nulls-after sort, the shape axes straddle the fast-path routing's
-// measured crossovers: max_list_size 4 gives tiny lists, which the tiered network / warp tiers
-// claim; 32 the mid-size band where the no-null routing splits by type (some columns to CUB
-// DeviceSegmentedSort, some to the tiered kernel); and 256 the long-list band the packed radix
-// claims. null_frequency 0.1 injects element-level (leaf) nulls, which route every supported
-// column to the tiered kernel (it orders nulls last in-register / in-warp), racing the comparison
-// sort the nullable case would otherwise use; 0 exercises the no-null routing that also weighs
-// DeviceSegmentedSort and the packed radix. Every other (order, null_order) combination keeps the
-// base routing: CUB for eligible no-null fixed-width types, otherwise the lexicographic comparator
-// over a prepended segment-id column.
+// The shape axes straddle the fast-path routing's measured crossovers: max_list_size 4 gives tiny
+// lists, which the tiered network / warp tiers claim; 32 the mid-size band where the no-null
+// routing splits by type (some columns to CUB DeviceSegmentedSort, some to the tiered kernel); and
+// 256 the long-list band the packed radix claims. null_frequency 0.1 injects element-level (leaf)
+// nulls, which route every supported column to the tiered kernel (it orders nulls last in-register
+// / in-warp), racing the comparison sort the nullable case would otherwise use; 0 exercises the
+// no-null routing that also weighs DeviceSegmentedSort and the packed radix. The order and
+// null_order axes complete the sort-parameter matrix: the fixed-width fast path folds the requested
+// (order, null_order) into its keys, so all four combinations exercise it.
 template <typename Type>
 void bench_sort_list_of_numbers(nvbench::state& state, nvbench::type_list<Type>)
 {
@@ -101,10 +100,10 @@ NVBENCH_BENCH_TYPES(
   // no-null routing splits by type between CUB DeviceSegmentedSort and the tiered kernel; 256
   // pushes the average past the packed-radix cutoff.
   .add_int64_axis("max_list_size", {4, 32, 256})
-  // No-null vs a realistic null rate; the null-bearing ascending / nulls-after cells route to the
+  // No-null vs a realistic null rate; the null-bearing case routes every supported type to the
   // tiered kernel (nulls ordered last in-register / in-warp).
   .add_float64_axis("null_frequency", {0, 0.1})
-  // Full (order, null_order) matrix: the fast-path gate engages only for explicit ascending /
-  // nulls-after; the other combinations measure the base routing.
+  // Full (order, null_order) matrix: the fixed-width fast path folds the requested polarity into
+  // its keys, so every combination exercises it.
   .add_string_axis("order", {"ASC", "DESC"})
   .add_string_axis("null_order", {"AFTER", "BEFORE"});

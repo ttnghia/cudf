@@ -288,32 +288,31 @@ std::unique_ptr<column> segmented_sorted_order_common(
                  "Mismatch between number of columns and null_precedence size.");
   }
 
-  // fast-path for a single fixed-width key column sorted ascending with nulls last (unstable only).
-  // For a tiered-eligible type, `choose_fixed_width_sort_path` routes a null-bearing column, or a
-  // no-null column with short lists, to an in-register / in-warp tiered sort; a no-null column
-  // with long enough lists to one global packed-radix sort; and a no-null wider-rep column whose
-  // mid-band shape suits it to CUB `DeviceSegmentedSort`. A packed-radix-eligible type outside the
-  // tiered set takes the packed-radix sort when null-bearing or when the CUB segmented sort is
-  // not preferred for its shape. These engines reproduce the comparison sort's ascending /
-  // nulls-last order without a cardinality-scaled cost, and any shape the gate declines falls
-  // through to the pre-existing CUB-fast-sort-or-comparison decision below. The order and null
-  // precedence must be stated explicitly, so any other configuration -- including the
-  // defaulted-argument cases -- falls through unchanged.
+  // fast-path for a single fixed-width key column with explicit order and null precedence
+  // (unstable only). `choose_fixed_width_sort_path` picks, per type class and list shape, among
+  // three fast paths that all reproduce the comparison sort's order without a cardinality-scaled
+  // cost: the tiered register/warp kernel (short lists, and any null-bearing column), CUB
+  // `DeviceSegmentedSort` over the packed rep (a mid band of the wider reps), and one global
+  // packed-radix sort (long lists). All four explicit (order, null_order) combinations are
+  // accepted -- the requested polarity is folded into the fast-path sort keys, and the CUB band
+  // (reached only null-free) takes the order directly -- while the defaulted-argument cases fall
+  // through unchanged.
   if constexpr (method == sort_method::UNSTABLE) {
-    // The constant-time order / null-precedence checks run first: the offsets-coverage probe
-    // synchronizes the stream, so only inputs already known to be ascending / nulls-after pay it.
+    // The constant-time explicitness checks run first: the offsets-coverage probe synchronizes the
+    // stream, so only explicitly-configured single-key inputs pay it.
     if (keys.num_columns() == 1 and segment_offsets.size() > 0 and column_order.size() == 1 and
-        column_order.front() == order::ASCENDING and null_precedence.size() == 1 and
-        null_precedence.front() == null_order::AFTER and
+        null_precedence.size() == 1 and
         fast_path_offsets_cover_all_rows(segment_offsets, keys.num_rows(), stream)) {
+      auto const polarity = resolve_sort_polarity(
+        keys.column(0).has_nulls(), column_order.front(), null_precedence.front());
       switch (
         choose_fixed_width_sort_path(keys.column(0), keys.num_rows(), segment_offsets, stream)) {
         case fixed_width_sort_path::tiered:  // short lists, or any nulls
           return fast_segmented_sorted_order_tiered(
-            keys.column(0), segment_offsets, sort_polarity{}, stream, mr);
+            keys.column(0), segment_offsets, polarity, stream, mr);
         case fixed_width_sort_path::packed_radix:  // long no-null lists
           return fast_segmented_sorted_order_numeric_packed(
-            keys.column(0), segment_offsets, sort_polarity{}, stream, mr);
+            keys.column(0), segment_offsets, polarity, stream, mr);
         case fixed_width_sort_path::cub_segmented:  // wider-rep no-null mid band
           return fast_segmented_sorted_order<method>(
             keys.column(0), segment_offsets, column_order.front(), stream, mr);
@@ -336,29 +335,33 @@ std::unique_ptr<column> segmented_sorted_order_common(
       keys.column(0), segment_offsets, col_order, stream, mr);
   }
 
-  // fast-path for a single STRING key column sorted ascending with nulls last (unstable only).
-  // A radix sort over a packed key of each element's leading bytes orders them, and the rare prefix
-  // ties are resolved by successive byte windows and a final byte comparison of the remainder,
-  // replacing the lexicographic comparison sort without any cost that scales with key cardinality.
-  // The order and null precedence must be stated explicitly so any other configuration -- including
-  // the defaulted-argument cases -- falls through to the comparison path below with its order
-  // unchanged.
+  // fast-path for a single STRING key column with explicit order and null precedence (unstable
+  // only). One of two engines is chosen by segment size. When every segment fits the 64-element
+  // warp tile (`strings_grad_all_segments_fit`), graduated per-segment `cub::WarpMergeSort` bands
+  // sort under string comparators -- a direct `string_view` compare for the smallest bands, an
+  // eight-byte packed prefix with a byte-suffix fallback above. Otherwise a radix sort over a
+  // packed key of each element's leading bytes orders them, with the rare prefix ties resolved by
+  // successive byte windows and a final byte comparison of the remainder. All four explicit
+  // (order, null_order) combinations are accepted -- the requested polarity is folded into both
+  // engines' keys -- while the defaulted-argument cases fall through to the comparison path below
+  // with their order unchanged.
   if constexpr (method == sort_method::UNSTABLE) {
     // As at the fixed-width gate: the cheap scalar checks precede the synchronizing coverage probe.
     if (keys.num_columns() == 1 and keys.column(0).type().id() == type_id::STRING and
         (segment_offsets.size() > 0) and column_order.size() == 1 and
-        column_order.front() == order::ASCENDING and null_precedence.size() == 1 and
-        null_precedence.front() == null_order::AFTER and
+        null_precedence.size() == 1 and
         fast_path_offsets_cover_all_rows(segment_offsets, keys.num_rows(), stream)) {
+      auto const polarity = resolve_sort_polarity(
+        keys.column(0).has_nulls(), column_order.front(), null_precedence.front());
       // When every segment fits the largest warp tile, the graduated in-warp sort beats the global
       // prefix-radix machine; an oversized segment falls through to the prefix path. As with the
       // scalar checks above, this synchronizing size probe runs only after they pass.
       if (strings_grad_all_segments_fit(segment_offsets, stream)) {
         return fast_segmented_sorted_order_strings_grad(
-          keys.column(0), segment_offsets, sort_polarity{}, stream, mr);
+          keys.column(0), segment_offsets, polarity, stream, mr);
       }
       return fast_segmented_sorted_order_strings_prefix(
-        keys.column(0), segment_offsets, sort_polarity{}, stream, mr);
+        keys.column(0), segment_offsets, polarity, stream, mr);
     }
   }
 

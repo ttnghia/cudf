@@ -39,9 +39,7 @@ constexpr int TIERED_BLOCK_THREADS = 128;
  * requested side of a segment's valid elements. cudf's `null_order` is comparator-level -- a
  * DESCENDING sort swaps the comparison operands, inverting null placement too -- so the caller
  * resolves `nulls_first = (null_order == BEFORE) XOR descending` and relaxes a zero-null column to
- * the shipped nulls-last polarity. The only current caller constructs the default polarity, gated
- * to an explicit ascending / nulls-after request; the non-default states are exercised once that
- * gate widens to the full matrix. The default `{false, false}` state reproduces the shipped
+ * the shipped nulls-last polarity. The default `{false, false}` state reproduces the shipped
  * ascending / nulls-last keys bit for bit.
  */
 struct sort_polarity {
@@ -65,6 +63,19 @@ struct sort_polarity {
     return descending ? ~cuda::std::uint64_t{0} : cuda::std::uint64_t{0};
   }
 };
+
+/// Resolves the sort_polarity for one explicit-order key column: null_order is comparator-level
+/// and a descending sort swaps the comparison operands, inverting null placement, so nulls land
+/// first exactly when (BEFORE) != (DESCENDING); a zero-null column relaxes to nulls-last, keeping
+/// its keys bit-identical to the shipped ascending / nulls-after configuration.
+inline sort_polarity resolve_sort_polarity(bool has_nulls,
+                                           order column_order,
+                                           null_order null_precedence)
+{
+  auto const descending  = column_order == order::DESCENDING;
+  auto const nulls_first = has_nulls and ((null_precedence == null_order::BEFORE) != descending);
+  return sort_polarity{descending, nulls_first};
+}
 
 /**
  * @brief Fixed-width radix key ordering runs still tied after the single-`uint64` first pass

@@ -190,7 +190,8 @@ static std::unique_ptr<cudf::column> trim_forced_last_row(cudf::column_view cons
 // array_sort(array<string>) lowers to and which a plain table sort does not exercise. The axes span
 // the shape space a reviewer needs to see the whole picture of the string fast path: list-length
 // regimes, string width, and -- the tie-break stressor -- how many leading bytes the elements
-// share. The order and null_order axes complete the sort-parameter matrix.
+// share. The order and null_order axes complete the sort-parameter matrix: the string fast path
+// folds the requested (order, null_order) into its keys, so all four combinations exercise it.
 static void bench_sort_list_of_strings(nvbench::state& state)
 {
   auto const num_rows       = static_cast<cudf::size_type>(state.get_int64("num_rows"));
@@ -271,7 +272,7 @@ NVBENCH_BENCH(bench_sort_list_of_strings)
   .add_int64_axis("shared_prefix_len", {0, 8, 32})
   // No-null vs a realistic null rate to exercise the leaf null ordering.
   .add_float64_axis("null_frequency", {0, 0.1})
-  // Full (order, null_order) matrix: the fallback sort takes the requested polarity as sort
-  // parameters, so every combination exercises the column.
+  // Full (order, null_order) matrix: the string fast path folds the requested polarity into its
+  // keys, so every combination exercises it.
   .add_string_axis("order", {"ASC", "DESC"})
   .add_string_axis("null_order", {"AFTER", "BEFORE"});
