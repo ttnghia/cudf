@@ -670,10 +670,11 @@ aggregate_reader_metadata::collect_keyval_metadata() const
                  std::back_inserter(kv_maps),
                  [](auto const& pfm) {
                    std::unordered_map<std::string, std::string> kv_map;
-                   std::transform(pfm.key_value_metadata.cbegin(),
-                                  pfm.key_value_metadata.cend(),
-                                  std::inserter(kv_map, kv_map.end()),
-                                  [](auto const& kv) { return std::pair{kv.key, kv.value}; });
+                   std::transform(
+                     pfm.key_value_metadata.cbegin(),
+                     pfm.key_value_metadata.cend(),
+                     std::inserter(kv_map, kv_map.end()),
+                     [](auto const& kv) { return std::pair{kv.key, kv.value.value_or("")}; });
                    return kv_map;
                  });
 
