@@ -236,6 +236,44 @@ struct IntType {
 };
 
 /**
+ * @brief Struct that describes the variant logical type annotation
+ *
+ * The optional `specification_version` field is kept so a round-tripped footer preserves the
+ * variant's declared logical-type version; it must stay trivially copyable for device use.
+ */
+struct VariantType {
+  /// Version of the Variant logical type specification
+  cuda::std::optional<int8_t> specification_version;
+};
+
+/**
+ * @brief Algorithms for the interpolation between references of geographical coordinates
+ *
+ * Uses an explicit `int32_t` base so an out-of-range wire value round-trips numerically instead
+ * of being truncated into a different enumerator.
+ */
+enum class EdgeInterpolationAlgorithm : int32_t {
+  SPHERICAL = 0,
+  VINCENTY  = 1,
+  THOMAS    = 2,
+  ANDOYER   = 3,
+  KARNEY    = 4,
+};
+
+/**
+ * @brief Struct that describes the geography logical type annotation
+ *
+ * The optional `algorithm` field (thrift id 2) is kept so a round-tripped footer preserves the
+ * geography's interpolation algorithm. The thrift `crs` string (id 1) is NOT modeled — it cannot
+ * live in the trivially-copyable `LogicalType` (device use), so its VALUE is dropped on round
+ * trip (documented lossy, mirroring GEOMETRY).
+ */
+struct GeographyType {
+  /// Interpolation algorithm between geographical coordinates (thrift id 2)
+  cuda::std::optional<EdgeInterpolationAlgorithm> algorithm;
+};
+
+/**
  * @brief Struct that describes the logical type annotation
  */
 struct LogicalType {
@@ -255,7 +293,15 @@ struct LogicalType {
     UNKNOWN,
     JSON,
     BSON,
+    UUID    = 14,
+    FLOAT16 = 15,
     VARIANT = 16,
+    // GEOMETRY (17) round-trips tag-only: its thrift `crs` string payload cannot live in the
+    // trivially-copyable `LogicalType` (device use), so the VALUE is dropped on round trip.
+    GEOMETRY = 17,
+    // 18 is GEOGRAPHY
+    GEOGRAPHY = 18,
+    FILE      = 19,
   };
 
   /// Logical type
@@ -268,6 +314,10 @@ struct LogicalType {
   cuda::std::optional<TimestampType> timestamp_type;
   /// Integer type
   cuda::std::optional<IntType> int_type;
+  /// Variant type (VARIANT only)
+  cuda::std::optional<VariantType> variant_type;
+  /// Geography type (GEOGRAPHY only)
+  cuda::std::optional<GeographyType> geography_type;
 
   /**
    * @brief Default constructor
@@ -407,7 +457,12 @@ struct LogicalType {
  */
 struct ColumnOrder {
   /// Available column order types
-  enum Type : uint8_t { UNDEFINED, TYPE_ORDER };
+  enum Type : uint8_t {
+    UNDEFINED,
+    TYPE_ORDER,
+    IEEE_754_TOTAL_ORDER  = 2,
+    INT96_TIMESTAMP_ORDER = 3,
+  };
   /// Column order type
   Type type;
 };

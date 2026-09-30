@@ -773,7 +773,35 @@ void CompactProtocolReader::read(LogicalType* l)
     parquet_field_union_enumerator(11, l->type),
     parquet_field_union_enumerator(12, l->type),
     parquet_field_union_enumerator(13, l->type),
-    parquet_field_union_enumerator(16, l->type));
+    parquet_field_union_enumerator(14, l->type),  // UUID
+    parquet_field_union_enumerator(15, l->type),  // FLOAT16
+    parquet_field_union_struct<LogicalType::Type, VariantType>(16, l->type, l->variant_type),
+    // GEOMETRY is tag-only: its string `crs` payload cannot live in the trivially-copyable
+    // LogicalType, so it is dropped (documented lossy).
+    parquet_field_union_enumerator(17, l->type),
+    parquet_field_union_struct<LogicalType::Type, GeographyType>(18, l->type, l->geography_type),
+    parquet_field_union_enumerator(19, l->type));  // FILE
+  function_builder(this, op);
+}
+
+void CompactProtocolReader::read(VariantType* v)
+{
+  using optional_version =
+    parquet_field_optional<int8_t, parquet_field_int8, cuda::std::optional<int8_t>>;
+  auto op = std::make_tuple(optional_version(1, v->specification_version));
+  function_builder(this, op);
+}
+
+void CompactProtocolReader::read(GeographyType* g)
+{
+  using optional_algorithm =
+    parquet_field_optional<EdgeInterpolationAlgorithm,
+                           parquet_field_enum<EdgeInterpolationAlgorithm>,
+                           cuda::std::optional<EdgeInterpolationAlgorithm>>;
+  // Thrift field 1 is the `crs` string; it is deliberately unbound (the trivially-copyable
+  // LogicalType cannot hold std::string), so function_builder skips it — the VALUE is dropped
+  // (documented lossy), while `algorithm` (id 2) round-trips.
+  auto op = std::make_tuple(optional_algorithm(2, g->algorithm));
   function_builder(this, op);
 }
 
@@ -1000,7 +1028,9 @@ void CompactProtocolReader::read(Statistics* s)
 
 void CompactProtocolReader::read(ColumnOrder* c)
 {
-  auto op = std::make_tuple(parquet_field_union_enumerator<ColumnOrder::Type>(1, c->type));
+  auto op = std::make_tuple(parquet_field_union_enumerator(1, c->type),
+                            parquet_field_union_enumerator(2, c->type),
+                            parquet_field_union_enumerator(3, c->type));
   function_builder(this, op);
 }
 

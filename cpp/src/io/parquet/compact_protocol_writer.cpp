@@ -73,6 +73,26 @@ size_t CompactProtocolWriter::write(IntType const& integer)
   return c.value();
 }
 
+size_t CompactProtocolWriter::write(VariantType const& variant)
+{
+  CompactProtocolFieldWriter c(*this);
+  if (variant.specification_version.has_value()) {
+    c.field_int8(1, variant.specification_version.value());
+  }
+  return c.value();
+}
+
+size_t CompactProtocolWriter::write(GeographyType const& geography)
+{
+  CompactProtocolFieldWriter c(*this);
+  // Thrift field 1 (`crs`) is not retained (see GeographyType), so the writer never emits it;
+  // `algorithm` (thrift id 2) is written when engaged.
+  if (geography.algorithm.has_value()) {
+    c.field_int(2, static_cast<int32_t>(geography.algorithm.value()));
+  }
+  return c.value();
+}
+
 size_t CompactProtocolWriter::write(LogicalType const& logical_type)
 {
   CompactProtocolFieldWriter c(*this);
@@ -84,7 +104,13 @@ size_t CompactProtocolWriter::write(LogicalType const& logical_type)
     case LogicalType::DATE:
     case LogicalType::UNKNOWN:
     case LogicalType::JSON:
-    case LogicalType::BSON: c.field_empty_struct(static_cast<int>(logical_type.type)); break;
+    case LogicalType::BSON:
+    case LogicalType::UUID:
+    case LogicalType::FLOAT16:
+    // GEOMETRY is written tag-only: its string `crs` payload cannot live in the
+    // trivially-copyable LogicalType, so it is dropped (documented lossy).
+    case LogicalType::GEOMETRY:
+    case LogicalType::FILE: c.field_empty_struct(static_cast<int>(logical_type.type)); break;
     case LogicalType::DECIMAL:
       c.field_struct(static_cast<int>(LogicalType::DECIMAL), logical_type.decimal_type.value());
       break;
@@ -96,6 +122,24 @@ size_t CompactProtocolWriter::write(LogicalType const& logical_type)
       break;
     case LogicalType::INTEGER:
       c.field_struct(static_cast<int>(LogicalType::INTEGER), logical_type.int_type.value());
+      break;
+    case LogicalType::VARIANT:
+      // A disengaged payload is a valid thrift value (all fields optional), so it writes an empty
+      // struct rather than throwing bad_optional_access.
+      if (logical_type.variant_type.has_value()) {
+        c.field_struct(static_cast<int>(LogicalType::VARIANT), logical_type.variant_type.value());
+      } else {
+        c.field_empty_struct(static_cast<int>(LogicalType::VARIANT));
+      }
+      break;
+    case LogicalType::GEOGRAPHY:
+      // Same as VARIANT: a disengaged payload writes an empty struct, not `.value()`.
+      if (logical_type.geography_type.has_value()) {
+        c.field_struct(static_cast<int>(LogicalType::GEOGRAPHY),
+                       logical_type.geography_type.value());
+      } else {
+        c.field_empty_struct(static_cast<int>(LogicalType::GEOGRAPHY));
+      }
       break;
     default:
       CUDF_FAIL("Trying to write an invalid LogicalType " + std::to_string(logical_type.type));
@@ -237,7 +281,9 @@ size_t CompactProtocolWriter::write(ColumnOrder const& co)
 {
   CompactProtocolFieldWriter c(*this);
   switch (co.type) {
-    case ColumnOrder::TYPE_ORDER: c.field_empty_struct(static_cast<int>(co.type)); break;
+    case ColumnOrder::TYPE_ORDER:
+    case ColumnOrder::IEEE_754_TOTAL_ORDER:
+    case ColumnOrder::INT96_TIMESTAMP_ORDER: c.field_empty_struct(static_cast<int>(co.type)); break;
     default:
       CUDF_FAIL("Trying to write an invalid ColumnOrder " +
                 std::to_string(static_cast<int>(co.type)));
