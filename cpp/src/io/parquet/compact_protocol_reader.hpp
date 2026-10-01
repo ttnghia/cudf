@@ -157,6 +157,7 @@ class CompactProtocolReader {
   void read(TimeUnit* u);
   void read(TimestampType* t);
   void read(IntType* t);
+  void read(GeometryType* g);
   void read(VariantType* v);
   void read(GeographyType* g);
   void read(RowGroup* r);

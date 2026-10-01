@@ -776,12 +776,22 @@ void CompactProtocolReader::read(LogicalType* l)
     parquet_field_union_enumerator(14, l->type),  // UUID
     parquet_field_union_enumerator(15, l->type),  // FLOAT16
     parquet_field_union_struct<LogicalType::Type, VariantType>(16, l->type, l->variant_type),
-    // GEOMETRY is tag-only: its string `crs` payload cannot live in the trivially-copyable
-    // LogicalType, so it is dropped (documented lossy).
-    parquet_field_union_enumerator(17, l->type),
+    parquet_field_union_struct<LogicalType::Type, GeometryType>(17, l->type, l->geometry_type),
     parquet_field_union_struct<LogicalType::Type, GeographyType>(18, l->type, l->geography_type),
     parquet_field_union_enumerator(19, l->type));  // FILE
   function_builder(this, op);
+}
+
+void CompactProtocolReader::read(GeometryType* g)
+{
+  // Thrift field 1 is the `crs` string; the trivially-copyable LogicalType cannot hold it, so
+  // only its PRESENCE is recorded (lossy) — mirroring GeographyType.
+  cuda::std::optional<std::string> crs;
+  auto op = std::make_tuple(
+    parquet_field_optional<std::string, parquet_field_string, cuda::std::optional<std::string>>(
+      1, crs));
+  function_builder(this, op);
+  g->has_crs = crs.has_value();
 }
 
 void CompactProtocolReader::read(VariantType* v)

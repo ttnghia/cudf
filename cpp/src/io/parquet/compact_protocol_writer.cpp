@@ -110,9 +110,6 @@ size_t CompactProtocolWriter::write(LogicalType const& logical_type)
     case LogicalType::BSON:
     case LogicalType::UUID:
     case LogicalType::FLOAT16:
-    // GEOMETRY is written tag-only: its string `crs` payload cannot live in the
-    // trivially-copyable LogicalType, so it is dropped (documented lossy).
-    case LogicalType::GEOMETRY:
     case LogicalType::FILE: c.field_empty_struct(static_cast<int>(logical_type.type)); break;
     case LogicalType::DECIMAL:
       c.field_struct(static_cast<int>(LogicalType::DECIMAL), logical_type.decimal_type.value());
@@ -143,6 +140,15 @@ size_t CompactProtocolWriter::write(LogicalType const& logical_type)
       } else {
         c.field_empty_struct(static_cast<int>(LogicalType::GEOGRAPHY));
       }
+      break;
+    case LogicalType::GEOMETRY:
+      // Refuse to silently rewrite a footer whose `crs` value was dropped (mirrors GEOGRAPHY);
+      // the wire shape is always the empty struct.
+      if (logical_type.geometry_type.has_value()) {
+        CUDF_EXPECTS(not logical_type.geometry_type.value().has_crs,
+                     "Cannot round-trip a GeometryType with a non-empty crs value");
+      }
+      c.field_empty_struct(static_cast<int>(LogicalType::GEOMETRY));
       break;
     default:
       CUDF_FAIL("Trying to write an invalid LogicalType " + std::to_string(logical_type.type));
