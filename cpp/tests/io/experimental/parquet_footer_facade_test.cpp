@@ -889,6 +889,34 @@ TEST_F(ParquetFooterFacadeTest, PayloadLogicalTypeArmsRoundTrip)
   EXPECT_THROW((void)experimental::write_parquet_footer_bytes(crs_parsed), cudf::logic_error);
 }
 
+// Mirror of the GEOGRAPHY crs test for arm 17: a conforming external footer carrying a GEOMETRY
+// `crs` string parses with `has_crs` set and the writer refuses the rewrite.
+TEST_F(ParquetFooterFacadeTest, GeometryCrsRefusesRewrite)
+{
+  // Hand-built leaf carrying a GeometryType field 1 (BINARY "EPSG:4326"); field 17 uses the
+  // long-form id encoding (delta 0 + zigzag varint 34) inside LogicalType.
+  // clang-format off
+  std::vector<uint8_t> const crs_footer{
+    0x15, 0x02,        // field 1 (version) i32 = 1
+    0x19, 0x1c,        // field 2 (schema): LIST, 1 element, STRUCT
+    0x48, 0x01, 0x61,  //   SchemaElement field 4 (name): BINARY len 1 "a"
+    0x6c,              //   field 10 (logical_type): STRUCT
+    0x0c, 0x22,        //     field 17 (GEOMETRY) STRUCT: long-form id, GeometryType body
+    0x18, 0x09, 'E', 'P', 'S', 'G', ':', '4', '3', '2', '6',  // field 1 (crs) BINARY len 9
+    0x00,              //   GeometryType STOP
+    0x00,              //   LogicalType STOP
+    0x00,              //   SchemaElement STOP
+    0x00};             // FileMetaData STOP
+  // clang-format on
+  auto const crs_parsed = experimental::read_parquet_footer_bytes(crs_footer);
+  ASSERT_TRUE(crs_parsed.schema[0].logical_type.has_value());
+  EXPECT_EQ(crs_parsed.schema[0].logical_type->type, LogicalType::GEOMETRY);
+  ASSERT_TRUE(crs_parsed.schema[0].logical_type->geometry_type.has_value());
+  EXPECT_TRUE(crs_parsed.schema[0].logical_type->geometry_type->has_crs);
+
+  EXPECT_THROW((void)experimental::write_parquet_footer_bytes(crs_parsed), cudf::logic_error);
+}
+
 // Optional payloads keep presence exactly: an absent field stays absent, and a zero value stays
 // present (not conflated with absence). An out-of-range algorithm value round-trips numerically --
 // the enum binding reads the raw i32 with no validation, by design.
