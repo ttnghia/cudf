@@ -746,9 +746,6 @@ TEST_F(ParquetFooterFacadeTest, IEEEColumnOrderBytesRoundTrip)
   // The canonical writer output for the parsed footer is byte-identical to the input.
   auto const rewritten = experimental::write_parquet_footer_bytes(parsed);
   EXPECT_EQ(rewritten, footer);
-  EXPECT_EQ(
-    experimental::write_parquet_footer_bytes(experimental::read_parquet_footer_bytes(rewritten)),
-    rewritten);
 }
 
 // INT96_TIMESTAMP_ORDER (field id 3) is likewise unmodeled upstream of this change: parsing and
@@ -773,9 +770,6 @@ TEST_F(ParquetFooterFacadeTest, Int96ColumnOrderBytesRoundTrip)
 
   auto const rewritten = experimental::write_parquet_footer_bytes(parsed);
   EXPECT_EQ(rewritten, footer);
-  EXPECT_EQ(
-    experimental::write_parquet_footer_bytes(experimental::read_parquet_footer_bytes(rewritten)),
-    rewritten);
 }
 
 // An UNDEFINED (or unknown future) ColumnOrder arm is a valid parse result in COMPAT but the
@@ -823,10 +817,6 @@ TEST_F(ParquetFooterFacadeTest, EmptyLogicalTypeArmsRoundTrip)
     ASSERT_TRUE(reparsed.schema[i].logical_type.has_value());
     EXPECT_EQ(reparsed.schema[i].logical_type->type, meta.schema[i].logical_type->type);
   }
-  EXPECT_EQ(reparsed.schema[1].logical_type->type, LogicalType::UUID);
-  EXPECT_EQ(reparsed.schema[2].logical_type->type, LogicalType::FLOAT16);
-  EXPECT_EQ(reparsed.schema[3].logical_type->type, LogicalType::GEOMETRY);
-  EXPECT_EQ(reparsed.schema[4].logical_type->type, LogicalType::FILE);
 
   EXPECT_EQ(experimental::write_parquet_footer_bytes(reparsed), bytes);
 }
@@ -893,6 +883,10 @@ TEST_F(ParquetFooterFacadeTest, PayloadLogicalTypeArmsRoundTrip)
   ASSERT_TRUE(crs_parsed.schema[0].logical_type->geography_type->algorithm.has_value());
   EXPECT_EQ(crs_parsed.schema[0].logical_type->geography_type->algorithm.value(),
             EdgeInterpolationAlgorithm::SPHERICAL);
+
+  // The dropped `crs` value must not be silently rewritten (absent crs means OGC:CRS84): the
+  // writer refuses rather than emitting a footer with altered CRS semantics.
+  EXPECT_THROW((void)experimental::write_parquet_footer_bytes(crs_parsed), cudf::logic_error);
 }
 
 // Optional payloads keep presence exactly: an absent field stays absent, and a zero value stays

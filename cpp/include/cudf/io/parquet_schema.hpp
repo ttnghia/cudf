@@ -264,11 +264,15 @@ enum class EdgeInterpolationAlgorithm : int32_t {
  * @brief Struct that describes the geography logical type annotation
  *
  * The optional `algorithm` field (thrift id 2) is kept so a round-tripped footer preserves the
- * geography's interpolation algorithm. The thrift `crs` string (id 1) is NOT modeled — it cannot
- * live in the trivially-copyable `LogicalType` (device use), so its VALUE is dropped on round
- * trip (documented lossy, mirroring GEOMETRY).
+ * geography's interpolation algorithm. The thrift `crs` string (id 1) cannot live in the
+ * trivially-copyable `LogicalType` (device use), so only its PRESENCE is tracked; the writer
+ * refuses to rewrite a footer whose `crs` value was dropped (absent `crs` means OGC:CRS84).
  */
 struct GeographyType {
+  /// Set when the thrift `crs` string (field id 1) was present in the source footer. The string
+  /// itself cannot live in this trivially-copyable struct (device use), so its VALUE is not
+  /// retained; the writer refuses to silently rewrite a footer whose `crs` was dropped.
+  bool has_crs{false};
   /// Interpolation algorithm between geographical coordinates (thrift id 2)
   cuda::std::optional<EdgeInterpolationAlgorithm> algorithm;
 };
@@ -298,8 +302,7 @@ struct LogicalType {
     VARIANT = 16,
     // GEOMETRY (17) round-trips tag-only: its thrift `crs` string payload cannot live in the
     // trivially-copyable `LogicalType` (device use), so the VALUE is dropped on round trip.
-    GEOMETRY = 17,
-    // 18 is GEOGRAPHY
+    GEOMETRY  = 17,
     GEOGRAPHY = 18,
     FILE      = 19,
   };

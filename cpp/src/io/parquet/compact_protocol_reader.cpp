@@ -798,11 +798,15 @@ void CompactProtocolReader::read(GeographyType* g)
     parquet_field_optional<EdgeInterpolationAlgorithm,
                            parquet_field_enum<EdgeInterpolationAlgorithm>,
                            cuda::std::optional<EdgeInterpolationAlgorithm>>;
-  // Thrift field 1 is the `crs` string; it is deliberately unbound (the trivially-copyable
-  // LogicalType cannot hold std::string), so function_builder skips it — the VALUE is dropped
-  // (documented lossy), while `algorithm` (id 2) round-trips.
-  auto op = std::make_tuple(optional_algorithm(2, g->algorithm));
+  // Thrift field 1 is the `crs` string; the trivially-copyable LogicalType cannot hold it, so
+  // only its PRESENCE is recorded (lossy) while `algorithm` (id 2) round-trips.
+  cuda::std::optional<std::string> crs;
+  auto op = std::make_tuple(
+    parquet_field_optional<std::string, parquet_field_string, cuda::std::optional<std::string>>(
+      1, crs),
+    optional_algorithm(2, g->algorithm));
   function_builder(this, op);
+  g->has_crs = crs.has_value();
 }
 
 void CompactProtocolReader::read(DecimalType* d)

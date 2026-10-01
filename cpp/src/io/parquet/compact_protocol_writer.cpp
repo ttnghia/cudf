@@ -85,8 +85,11 @@ size_t CompactProtocolWriter::write(VariantType const& variant)
 size_t CompactProtocolWriter::write(GeographyType const& geography)
 {
   CompactProtocolFieldWriter c(*this);
-  // Thrift field 1 (`crs`) is not retained (see GeographyType), so the writer never emits it;
-  // `algorithm` (thrift id 2) is written when engaged.
+  // A present `crs` string cannot be retained in the trivially-copyable LogicalType; silently
+  // rewriting the footer would flip the CRS semantics (absent means OGC:CRS84), so refuse.
+  CUDF_EXPECTS(not geography.has_crs,
+               "Cannot round-trip a GeographyType with a non-empty crs value");
+  // Thrift field 1 (`crs`) is not emitted; `algorithm` (thrift id 2) is written when engaged.
   if (geography.algorithm.has_value()) {
     c.field_int(2, static_cast<int32_t>(geography.algorithm.value()));
   }
