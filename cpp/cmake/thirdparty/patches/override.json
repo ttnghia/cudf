@@ -11,8 +11,8 @@
           "issue": "https://github.com/apache/arrow/pull/49993"
         },
         {
-          "file": "${current_json_dir}/arrow_thrift_0_23_0.diff",
-          "issue": "https://github.com/NVIDIA/cudf/issues/23454"
+          "file": "${current_json_dir}/arrow_thrift_0_25_0.diff",
+          "issue": "https://github.com/NVIDIA/cudf-spark-jni/issues/5235"
         }
       ],
       "source_subdir": "cpp"
