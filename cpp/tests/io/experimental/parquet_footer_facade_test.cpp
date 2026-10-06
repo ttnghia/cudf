@@ -299,6 +299,29 @@ TEST_F(ParquetFooterFacadeTest, EmptyKeyValueValueRoundTrip)
   EXPECT_EQ(reparsed.key_value_metadata[1].value.value(), "");
 }
 
+// An empty value read from a file surfaces as "" and serializes back as present-empty; the
+// map<string, string> API cannot express absence, so present-empty is the intended round trip.
+TEST_F(ParquetFooterFacadeTest, EmptyKeyValueValueWritePath)
+{
+  FileMetaData meta;
+  meta.version            = 2;
+  meta.num_rows           = 1;
+  meta.key_value_metadata = {
+    {"key.empty", std::string("")},
+    {"key.value", std::string("v")},
+  };
+
+  auto const bytes    = experimental::write_parquet_footer_bytes(meta);
+  auto const reparsed = experimental::read_parquet_footer_bytes(bytes);
+  ASSERT_EQ(reparsed.key_value_metadata.size(), 2);
+  EXPECT_EQ(reparsed.key_value_metadata[0].key, "key.empty");
+  ASSERT_TRUE(reparsed.key_value_metadata[0].value.has_value());
+  EXPECT_EQ(reparsed.key_value_metadata[0].value.value(), "");
+  EXPECT_EQ(reparsed.key_value_metadata[1].key, "key.value");
+  ASSERT_TRUE(reparsed.key_value_metadata[1].value.has_value());
+  EXPECT_EQ(reparsed.key_value_metadata[1].value.value(), "v");
+}
+
 // A footer with no schema or row groups round-trips; an absent column_orders stays absent.
 TEST_F(ParquetFooterFacadeTest, EmptyFooterRoundTrip)
 {
