@@ -102,9 +102,9 @@ enum class Compression : uint8_t {
   SNAPPY       = 1,
   GZIP         = 2,
   LZO          = 3,
-  BROTLI       = 4,  // Added in 2.3.2
+  BROTLI       = 4,  // Added in 2.4
   LZ4          = 5,  // deprecated; based on LZ4, but with an additional undocumented framing scheme
-  ZSTD         = 6,  // Added in 2.3.2
+  ZSTD         = 6,  // Added in 2.4
   LZ4_RAW      = 7,  // "standard" LZ4 block format
 };
 
@@ -263,30 +263,22 @@ enum class EdgeInterpolationAlgorithm : int32_t {
 /**
  * @brief Struct that describes the geometry logical type annotation
  *
- * The thrift `crs` string (field id 1) cannot live in the trivially-copyable `LogicalType`
- * (device use), so only its PRESENCE is tracked; the writer refuses to rewrite a footer whose
- * `crs` value was dropped (absent `crs` means OGC:CRS84).
+ * Only the presence of the thrift `crs` string is kept since `LogicalType` must stay trivially
+ * copyable.
  */
 struct GeometryType {
-  /// Set when the thrift `crs` string (field id 1) was present in the source footer; see
-  /// `GeographyType::has_crs` for the rationale.
-  bool has_crs{false};
+  bool has_crs{false};  ///< Whether the thrift `crs` string (field id 1) was present
 };
 
 /**
  * @brief Struct that describes the geography logical type annotation
  *
- * The optional `algorithm` field (thrift id 2) is kept so a round-tripped footer preserves the
- * geography's interpolation algorithm. The thrift `crs` string (id 1) cannot live in the
- * trivially-copyable `LogicalType` (device use), so only its PRESENCE is tracked; the writer
- * refuses to rewrite a footer whose `crs` value was dropped (absent `crs` means OGC:CRS84).
+ * Only the presence of the thrift `crs` string is kept since `LogicalType` must stay trivially
+ * copyable.
  */
 struct GeographyType {
-  /// Set when the thrift `crs` string (field id 1) was present in the source footer. The string
-  /// itself cannot live in this trivially-copyable struct (device use), so its VALUE is not
-  /// retained; the writer refuses to silently rewrite a footer whose `crs` was dropped.
-  bool has_crs{false};
-  /// Interpolation algorithm between geographical coordinates (thrift id 2)
+  bool has_crs{false};  ///< Whether the thrift `crs` string (field id 1) was present
+  /// Edge interpolation algorithm (thrift id 2); SPHERICAL if unset
   cuda::std::optional<EdgeInterpolationAlgorithm> algorithm;
 };
 
@@ -296,20 +288,20 @@ struct GeographyType {
 struct LogicalType {
   /// Logical type annotations to replace ConvertedType.
   enum Type : uint8_t {
-    UNDEFINED,
-    STRING,
-    MAP,
-    LIST,
-    ENUM,
-    DECIMAL,
-    DATE,
-    TIME,
-    TIMESTAMP,
+    UNDEFINED = 0,
+    STRING    = 1,
+    MAP       = 2,
+    LIST      = 3,
+    ENUM      = 4,
+    DECIMAL   = 5,
+    DATE      = 6,
+    TIME      = 7,
+    TIMESTAMP = 8,
     // 9 is reserved
-    INTEGER = 10,
-    UNKNOWN,
-    JSON,
-    BSON,
+    INTEGER   = 10,
+    UNKNOWN   = 11,
+    JSON      = 12,
+    BSON      = 13,
     UUID      = 14,
     FLOAT16   = 15,
     VARIANT   = 16,
@@ -474,8 +466,8 @@ struct LogicalType {
 struct ColumnOrder {
   /// Available column order types
   enum Type : uint8_t {
-    UNDEFINED,
-    TYPE_ORDER,
+    UNDEFINED             = 0,
+    TYPE_ORDER            = 1,
     IEEE_754_TOTAL_ORDER  = 2,
     INT96_TIMESTAMP_ORDER = 3,
   };
