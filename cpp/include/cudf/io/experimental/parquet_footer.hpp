@@ -57,9 +57,9 @@ enum class thrift_mismatch_policy : bool { THROW, COMPAT };
  *
  * @param metadata The `FileMetaData` (footer) to serialize
  *
- * @note Non-optional string fields (`created_by`, `ColumnChunk::file_path`) conflate empty with
- * absent: an empty value is not written and reads back as `""`. Only fields with presence
- * (`std::optional`) round-trip faithfully.
+ * @note Fields that the writer omits when default-valued cannot distinguish the default from
+ * absent on re-read (e.g., `created_by` and `ColumnChunk::file_path` read back as `""`). Fields
+ * modeled with presence (`std::optional`) round-trip faithfully.
  *
  * @return The Thrift-compact-encoded bytes
  */
